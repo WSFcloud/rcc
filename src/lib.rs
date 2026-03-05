@@ -1,5 +1,6 @@
 pub mod common;
 pub mod driver;
+pub mod frontend;
 
 use crate::driver::cli;
 
