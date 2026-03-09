@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 logos = "0.16.1"
 ariadne = "0.6.0"
-chumsky = "0.12.0"
+chumsky = { version = "0.12.0", features = ["pratt"] }
 clap = { version = "4.5.60", features = ["derive"] }
 cranelift-codegen = "0.129.1"
 cranelift-frontend = "0.129.1"
