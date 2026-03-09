@@ -99,17 +99,17 @@ pub enum TokenKind {
     #[regex(r"(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)[uU][lL][lL]", |lex| parse_int_literal(lex.slice(), true,  true,  true))]
     #[regex(r"(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)[lL][lL][uU]", |lex| parse_int_literal(lex.slice(), true,  true,  true))]
     ULongLongLiteral(u64), // ull/ULL suffix (unsigned long long, always 64-bit)
-    #[regex(r"(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)[lL][lL]",     |lex| parse_int_literal(lex.slice(), false, true,  true).map(|v| v as i64))]
-    LongLongLiteral(i64), // ll/LL suffix (signed long long, always 64-bit)
+    #[regex(r"(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)[lL][lL]",     |lex| parse_int_literal(lex.slice(), false, true,  true))]
+    LongLongLiteral(u64), // ll/LL suffix (signedness validated in semantic analysis)
     #[regex(r"(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)[uU][lL]",     |lex| parse_int_literal(lex.slice(), true,  true,  false))]
     #[regex(r"(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)[lL][uU]",     |lex| parse_int_literal(lex.slice(), true,  true,  false))]
     ULongLiteral(u64), // ul/UL suffix (unsigned long)
-    #[regex(r"(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)[lL]",         |lex| parse_int_literal(lex.slice(), false, true,  false).map(|v| v as i64))]
-    LongLiteral(i64), // l/L suffix (signed long)
+    #[regex(r"(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)[lL]",         |lex| parse_int_literal(lex.slice(), false, true,  false))]
+    LongLiteral(u64), // l/L suffix (signedness validated in semantic analysis)
     #[regex(r"(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)[uU]",         |lex| parse_int_literal(lex.slice(), true,  false, false))]
     UIntLiteral(u64), // u/U suffix
-    #[regex(r"0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*",               |lex| parse_int_literal(lex.slice(), false, false, false).map(|v| v as i64))]
-    IntLiteral(i64), // no suffix
+    #[regex(r"0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*",               |lex| parse_int_literal(lex.slice(), false, false, false))]
+    IntLiteral(u64), // no suffix
 
     // Float: decimal with optional fractional / exponent parts, optional f/F suffix
     // Patterns cover: 1.0  1.  .5  1e3  1.5e-2  etc.
