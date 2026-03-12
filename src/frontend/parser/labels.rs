@@ -14,7 +14,10 @@ pub enum ParserLabel {
     ReturnStatement,
     IfStatement,
     WhileStatement,
+    DoWhileStatement,
     ForStatement,
+    BreakStatement,
+    ContinueStatement,
     Statement,
 }
 
@@ -31,7 +34,10 @@ impl ParserLabel {
             Self::ReturnStatement => "return statement",
             Self::IfStatement => "if statement",
             Self::WhileStatement => "while statement",
+            Self::DoWhileStatement => "do-while statement",
             Self::ForStatement => "for statement",
+            Self::BreakStatement => "break statement",
+            Self::ContinueStatement => "continue statement",
             Self::Statement => "statement",
         }
     }
@@ -48,7 +54,10 @@ impl ParserLabel {
             "return statement" => Some(Self::ReturnStatement),
             "if statement" => Some(Self::IfStatement),
             "while statement" => Some(Self::WhileStatement),
+            "do-while statement" => Some(Self::DoWhileStatement),
             "for statement" => Some(Self::ForStatement),
+            "break statement" => Some(Self::BreakStatement),
+            "continue statement" => Some(Self::ContinueStatement),
             "statement" => Some(Self::Statement),
             _ => None,
         }
@@ -72,7 +81,10 @@ mod tests {
             ParserLabel::ReturnStatement,
             ParserLabel::IfStatement,
             ParserLabel::WhileStatement,
+            ParserLabel::DoWhileStatement,
             ParserLabel::ForStatement,
+            ParserLabel::BreakStatement,
+            ParserLabel::ContinueStatement,
             ParserLabel::Statement,
         ];
 

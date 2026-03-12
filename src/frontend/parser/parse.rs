@@ -771,6 +771,29 @@ where
         .labelled(ParserLabel::WhileStatement.as_str())
 }
 
+/// Parse `do stmt while (cond);`.
+fn do_while_statement_parser<'tokens, I, S>(
+    statement: S,
+) -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+{
+    just(TokenKind::Do)
+        .ignore_then(statement)
+        .then_ignore(just(TokenKind::While))
+        .then(
+            expr_parser::<'tokens, I, true>()
+                .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
+        )
+        .then_ignore(just(TokenKind::Semicolon))
+        .map(|(body, cond)| Stmt::DoWhile {
+            body: Box::new(body),
+            cond,
+        })
+        .labelled(ParserLabel::DoWhileStatement.as_str())
+}
+
 /// Parse `for (init; cond; step) stmt`.
 fn for_statement_parser<'tokens, I, S>(
     statement: S,
@@ -797,6 +820,30 @@ where
         .labelled(ParserLabel::ForStatement.as_str())
 }
 
+/// Parse `break;`.
+fn break_statement_parser<'tokens, I>()
+-> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    just(TokenKind::Break)
+        .then_ignore(just(TokenKind::Semicolon))
+        .to(Stmt::Break)
+        .labelled(ParserLabel::BreakStatement.as_str())
+}
+
+/// Parse `continue;`.
+fn continue_statement_parser<'tokens, I>()
+-> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    just(TokenKind::Continue)
+        .then_ignore(just(TokenKind::Semicolon))
+        .to(Stmt::Continue)
+        .labelled(ParserLabel::ContinueStatement.as_str())
+}
+
 /// Parse the currently supported statement subset.
 fn statement_parser<'tokens, I>()
 -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
@@ -811,7 +858,10 @@ where
             return_statement_parser(),
             if_statement_parser(statement.clone()),
             while_statement_parser(statement.clone()),
+            do_while_statement_parser(statement.clone()),
             for_statement_parser(statement.clone()),
+            break_statement_parser(),
+            continue_statement_parser(),
             expression_statement_parser(),
         ))
     })
@@ -1260,6 +1310,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_do_while_statement() {
+        let stmt = parse_statement_source("do x++; while (x < 10);");
+        assert_eq!(
+            stmt,
+            Stmt::DoWhile {
+                body: Box::new(Stmt::Expr(Expr::post_inc(Expr::var("x".to_string())))),
+                cond: Expr::binary(Expr::var("x".to_string()), BinaryOp::Lt, Expr::int(10)),
+            }
+        );
+    }
+
+    #[test]
     fn parses_for_statement_with_expression_init() {
         let stmt = parse_statement_source("for (i = 0; i < 10; i++) i;");
         assert_eq!(
@@ -1380,5 +1442,15 @@ mod tests {
                 ),
             ))
         );
+    }
+
+    #[test]
+    fn parses_break_statement() {
+        assert_eq!(parse_statement_source("break;"), Stmt::Break);
+    }
+
+    #[test]
+    fn parses_continue_statement() {
+        assert_eq!(parse_statement_source("continue;"), Stmt::Continue);
     }
 }
