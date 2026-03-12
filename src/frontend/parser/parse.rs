@@ -820,6 +820,83 @@ where
         .labelled(ParserLabel::ForStatement.as_str())
 }
 
+/// Parse `switch (expr) stmt`.
+fn switch_statement_parser<'tokens, I, S>(
+    statement: S,
+) -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+{
+    just(TokenKind::Switch)
+        .ignore_then(
+            expr_parser::<'tokens, I, true>()
+                .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
+        )
+        .then(statement)
+        .map(|(expr, body)| Stmt::Switch {
+            expr,
+            body: Box::new(body),
+        })
+        .labelled(ParserLabel::SwitchStatement.as_str())
+}
+
+/// Parse `case expr: stmt`.
+fn case_statement_parser<'tokens, I, S>(
+    statement: S,
+) -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+{
+    just(TokenKind::Case)
+        .ignore_then(expr_parser::<'tokens, I, true>())
+        .then_ignore(just(TokenKind::Colon))
+        .then(statement)
+        .map(|(expr, stmt)| Stmt::Case {
+            expr,
+            stmt: Box::new(stmt),
+        })
+        .labelled(ParserLabel::CaseStatement.as_str())
+}
+
+/// Parse `default: stmt`.
+fn default_statement_parser<'tokens, I, S>(
+    statement: S,
+) -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+{
+    just(TokenKind::Default)
+        .ignore_then(just(TokenKind::Colon))
+        .ignore_then(statement)
+        .map(|stmt| Stmt::Default {
+            stmt: Box::new(stmt),
+        })
+        .labelled(ParserLabel::DefaultStatement.as_str())
+}
+
+/// Parse `label: stmt`.
+fn label_statement_parser<'tokens, I, S>(
+    statement: S,
+) -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+{
+    select! {
+        TokenKind::Identifier(name) => name,
+    }
+    .then_ignore(just(TokenKind::Colon))
+    .then(statement)
+    .map(|(label, stmt)| Stmt::Label {
+        label,
+        stmt: Box::new(stmt),
+    })
+    .labelled(ParserLabel::LabelStatement.as_str())
+}
+
 /// Parse `break;`.
 fn break_statement_parser<'tokens, I>()
 -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
@@ -844,6 +921,21 @@ where
         .labelled(ParserLabel::ContinueStatement.as_str())
 }
 
+/// Parse `goto identifier;`.
+fn goto_statement_parser<'tokens, I>()
+-> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    just(TokenKind::Goto)
+        .ignore_then(select! {
+            TokenKind::Identifier(name) => name,
+        })
+        .then_ignore(just(TokenKind::Semicolon))
+        .map(Stmt::Goto)
+        .labelled(ParserLabel::GotoStatement.as_str())
+}
+
 /// Parse the currently supported statement subset.
 fn statement_parser<'tokens, I>()
 -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
@@ -860,6 +952,12 @@ where
             while_statement_parser(statement.clone()),
             do_while_statement_parser(statement.clone()),
             for_statement_parser(statement.clone()),
+            switch_statement_parser(statement.clone()),
+            case_statement_parser(statement.clone()),
+            default_statement_parser(statement.clone()),
+            // Must appear before expression statement to parse `label: ...` correctly.
+            label_statement_parser(statement.clone()),
+            goto_statement_parser(),
             break_statement_parser(),
             continue_statement_parser(),
             expression_statement_parser(),
@@ -1319,6 +1417,63 @@ mod tests {
                 cond: Expr::binary(Expr::var("x".to_string()), BinaryOp::Lt, Expr::int(10)),
             }
         );
+    }
+
+    #[test]
+    fn parses_switch_statement() {
+        let stmt = parse_statement_source("switch (x) break;");
+        assert_eq!(
+            stmt,
+            Stmt::Switch {
+                expr: Expr::var("x".to_string()),
+                body: Box::new(Stmt::Break),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_case_statement() {
+        let stmt = parse_statement_source("case 1: break;");
+        assert_eq!(
+            stmt,
+            Stmt::Case {
+                expr: Expr::int(1),
+                stmt: Box::new(Stmt::Break),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_default_statement() {
+        let stmt = parse_statement_source("default: continue;");
+        assert_eq!(
+            stmt,
+            Stmt::Default {
+                stmt: Box::new(Stmt::Continue),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_label_statement() {
+        let stmt = parse_statement_source("entry: x = 1;");
+        assert_eq!(
+            stmt,
+            Stmt::Label {
+                label: "entry".to_string(),
+                stmt: Box::new(Stmt::Expr(Expr::assign(
+                    Expr::var("x".to_string()),
+                    AssignOp::Assign,
+                    Expr::int(1),
+                ))),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_goto_statement() {
+        let stmt = parse_statement_source("goto entry;");
+        assert_eq!(stmt, Stmt::Goto("entry".to_string()));
     }
 
     #[test]
