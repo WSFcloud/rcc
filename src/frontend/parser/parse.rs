@@ -49,6 +49,13 @@ enum PostfixExprOp {
     PostDec,
     /// Function call postfix: `callee(args...)`.
     Call(Vec<Expr>),
+    /// Array subscript postfix: `base[index]`.
+    Index(Expr),
+    /// Member access postfix: `base.field` or `base->field`.
+    Member {
+        field: String,
+        deref: bool,
+    },
 }
 
 impl PostfixExprOp {
@@ -58,6 +65,8 @@ impl PostfixExprOp {
             Self::PostInc => Expr::post_inc(lhs),
             Self::PostDec => Expr::post_dec(lhs),
             Self::Call(args) => Expr::call(lhs, args),
+            Self::Index(index) => Expr::index(lhs, index),
+            Self::Member { field, deref } => Expr::member(lhs, field, deref),
         }
     }
 }
@@ -284,6 +293,38 @@ where
         .map(|args| PostfixExprOp::Call(args.unwrap_or_default()))
 }
 
+/// Parse array subscript postfix operator: `[index_expr]`.
+fn index_postfix_expr_op_parser<'tokens, I, P>(
+    index_expr: P,
+) -> impl Parser<'tokens, I, PostfixExprOp, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    P: Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone,
+{
+    index_expr
+        .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
+        .map(PostfixExprOp::Index)
+}
+
+/// Parse member access postfix operators: `.field` and `->field`.
+fn member_postfix_expr_op_parser<'tokens, I>()
+-> impl Parser<'tokens, I, PostfixExprOp, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    choice((
+        just(TokenKind::Dot)
+            .ignore_then(select! { TokenKind::Identifier(name) => name })
+            .map(|field| PostfixExprOp::Member {
+                field,
+                deref: false,
+            }),
+        just(TokenKind::Arrow)
+            .ignore_then(select! { TokenKind::Identifier(name) => name })
+            .map(|field| PostfixExprOp::Member { field, deref: true }),
+    ))
+}
+
 /// Build `conditional-expression` and assignment chain on top of Pratt expressions.
 fn assignment_core_expr_parser<'tokens, I, P, Q, R>(
     pratt: P,
@@ -342,9 +383,16 @@ where
     let assignment = recursive(|assignment| {
         // In C, call arguments are assignment-expressions separated by commas.
         // `foo(1, x = 2)` is valid; `foo((1, 2))` still works via parenthesized expr.
+        let subscript_expr = comma_sequence_parser(
+            assignment.clone(),
+            "array subscript requires one expression",
+        );
+
         let postfix_op = choice((
             basic_postfix_expr_op_parser(),
             call_postfix_expr_op_parser(assignment.clone()),
+            index_postfix_expr_op_parser(subscript_expr),
+            member_postfix_expr_op_parser(),
         ));
 
         // Pratt parsing handles the regular precedence ladder.
@@ -1594,6 +1642,72 @@ mod tests {
                 Expr::call(
                     Expr::var("f".to_string()),
                     vec![Expr::comma(Expr::int(1), Expr::int(2))],
+                ),
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_array_subscript_expression_statement() {
+        let stmt = parse_statement_source("value = arr[i + 1];");
+        assert_eq!(
+            stmt,
+            Stmt::Expr(Expr::assign(
+                Expr::var("value".to_string()),
+                AssignOp::Assign,
+                Expr::index(
+                    Expr::var("arr".to_string()),
+                    Expr::binary(Expr::var("i".to_string()), BinaryOp::Add, Expr::int(1)),
+                ),
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_member_access_expression_statement() {
+        let stmt = parse_statement_source("value = point.x;");
+        assert_eq!(
+            stmt,
+            Stmt::Expr(Expr::assign(
+                Expr::var("value".to_string()),
+                AssignOp::Assign,
+                Expr::member(Expr::var("point".to_string()), "x".to_string(), false),
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_pointer_member_access_expression_statement() {
+        let stmt = parse_statement_source("value = node->next;");
+        assert_eq!(
+            stmt,
+            Stmt::Expr(Expr::assign(
+                Expr::var("value".to_string()),
+                AssignOp::Assign,
+                Expr::member(Expr::var("node".to_string()), "next".to_string(), true),
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_chained_postfix_access_expression_statement() {
+        let stmt = parse_statement_source("value = factory().items[i].count;");
+        assert_eq!(
+            stmt,
+            Stmt::Expr(Expr::assign(
+                Expr::var("value".to_string()),
+                AssignOp::Assign,
+                Expr::member(
+                    Expr::index(
+                        Expr::member(
+                            Expr::call(Expr::var("factory".to_string()), vec![]),
+                            "items".to_string(),
+                            false,
+                        ),
+                        Expr::var("i".to_string()),
+                    ),
+                    "count".to_string(),
+                    false,
                 ),
             ))
         );

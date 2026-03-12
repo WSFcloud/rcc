@@ -332,6 +332,21 @@ impl Expr {
         })
     }
 
+    pub fn index(base: Self, index: Self) -> Self {
+        Self::new(ExprKind::Index {
+            base: Box::new(base),
+            index: Box::new(index),
+        })
+    }
+
+    pub fn member(base: Self, field: String, deref: bool) -> Self {
+        Self::new(ExprKind::Member {
+            base: Box::new(base),
+            field,
+            deref,
+        })
+    }
+
     pub fn comma(left: Self, right: Self) -> Self {
         Self::new(ExprKind::Comma {
             left: Box::new(left),
