@@ -689,40 +689,49 @@ fn declarator_parser<'tokens, I>()
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
-    let direct_ident = select! {
-        TokenKind::Identifier(name) => DirectDeclarator::Ident(name),
-    }
-    .labelled(ParserLabel::IdentifierDeclarator.as_str());
+    recursive(|declarator| {
+        let direct_ident = select! {
+            TokenKind::Identifier(name) => DirectDeclarator::Ident(name),
+        }
+        .labelled(ParserLabel::IdentifierDeclarator.as_str());
 
-    let direct = direct_ident
-        .then(
-            direct_declarator_suffix_parser()
-                .repeated()
-                .collect::<Vec<_>>(),
-        )
-        .map(|(base, suffixes)| {
-            suffixes
-                .into_iter()
-                .fold(base, |inner, suffix| match suffix {
-                    DirectDeclaratorSuffix::Function(params) => DirectDeclarator::Function {
-                        inner: Box::new(inner),
-                        params,
-                    },
-                    DirectDeclaratorSuffix::Array(size) => DirectDeclarator::Array {
-                        inner: Box::new(inner),
-                        qualifiers: Vec::new(),
-                        is_static: false,
-                        size: Box::new(size),
-                    },
-                })
-        });
+        let direct_grouped = declarator
+            .clone()
+            .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+            .map(|decl| DirectDeclarator::Grouped(Box::new(decl)));
 
-    pointer_layers_parser()
-        .then(direct)
-        .map(|(pointers, direct)| Declarator {
-            pointers,
-            direct: Box::new(direct),
-        })
+        let direct_base = choice((direct_ident, direct_grouped));
+
+        let direct = direct_base
+            .then(
+                direct_declarator_suffix_parser()
+                    .repeated()
+                    .collect::<Vec<_>>(),
+            )
+            .map(|(base, suffixes)| {
+                suffixes
+                    .into_iter()
+                    .fold(base, |inner, suffix| match suffix {
+                        DirectDeclaratorSuffix::Function(params) => DirectDeclarator::Function {
+                            inner: Box::new(inner),
+                            params,
+                        },
+                        DirectDeclaratorSuffix::Array(size) => DirectDeclarator::Array {
+                            inner: Box::new(inner),
+                            qualifiers: Vec::new(),
+                            is_static: false,
+                            size: Box::new(size),
+                        },
+                    })
+            });
+
+        pointer_layers_parser()
+            .then(direct)
+            .map(|(pointers, direct)| Declarator {
+                pointers,
+                direct: Box::new(direct),
+            })
+    })
 }
 
 /// Parse scalar initializer syntax: `= assignment-expression`.
@@ -1546,6 +1555,32 @@ mod tests {
             .as_ref()
             .expect("second parameter declarator expected");
         assert_direct_ident(second.direct.as_ref(), "count");
+    }
+
+    #[test]
+    fn parses_grouped_function_pointer_declaration() {
+        let unit = parse_source("int (*fp)(int);");
+        let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+            panic!("expected declaration item");
+        };
+
+        let direct = decl.declarators[0].declarator.direct.as_ref();
+        let DirectDeclarator::Function { inner, params } = direct else {
+            panic!("expected function declarator");
+        };
+
+        let DirectDeclarator::Grouped(grouped_decl) = inner.as_ref() else {
+            panic!("expected grouped declarator as function inner");
+        };
+        assert_eq!(grouped_decl.pointers.len(), 1);
+        assert_direct_ident(grouped_decl.direct.as_ref(), "fp");
+
+        let FunctionParams::Prototype { params, variadic } = params else {
+            panic!("expected prototype parameters");
+        };
+        assert!(!variadic);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].specifiers.ty, vec![TypeSpecifier::Int]);
     }
 
     #[test]
