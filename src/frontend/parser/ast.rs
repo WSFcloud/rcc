@@ -119,6 +119,8 @@ pub struct Pointer {
 pub enum DirectDeclarator {
     /// Plain identifier declarator.
     Ident(String),
+    /// Abstract declarator without an identifier (e.g. unnamed parameter declarator).
+    Abstract,
     /// Parenthesized declarator `(declarator)`.
     Grouped(Box<Declarator>),
     /// Array declarator `inner[...]`.
@@ -163,7 +165,8 @@ pub enum FunctionParams {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParameterDecl {
     pub specifiers: DeclSpec,
-    /// `declarator = None`: Parameter name omitted, e.g. `int f(int, char *);`
+    /// `declarator = None`: No declarator present (e.g. `int`).
+    /// Unnamed but structured declarators like `char *` use `DirectDeclarator::Abstract`.
     pub declarator: Option<Box<Declarator>>,
 }
 
@@ -319,6 +322,13 @@ impl Expr {
             cond: Box::new(cond),
             then_expr: Box::new(then_expr),
             else_expr: Box::new(else_expr),
+        })
+    }
+
+    pub fn call(callee: Self, args: Vec<Self>) -> Self {
+        Self::new(ExprKind::Call {
+            callee: Box::new(callee),
+            args,
         })
     }
 

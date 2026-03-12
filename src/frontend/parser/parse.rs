@@ -1,5 +1,10 @@
 use crate::common::token::TokenKind;
-use crate::frontend::parser::ast::*;
+use crate::frontend::parser::ast::{
+    AssignOp, BinaryOp, BlockItem, CompoundStmt, DeclSpec, Declaration, Declarator,
+    DirectDeclarator, Expr, ExternalDecl, ForInit, FunctionDef, FunctionParams, FunctionSpecifier,
+    InitDeclarator, Initializer, InitializerKind, IntLiteralBase, ParameterDecl, Pointer, Stmt,
+    StorageClass, TranslationUnit, TypeQualifier, TypeSpecifier, UnaryOp,
+};
 use crate::frontend::parser::labels::ParserLabel;
 use chumsky::{
     error::Rich,
@@ -11,6 +16,10 @@ use chumsky::{
 
 pub type Span = SimpleSpan<usize>;
 pub type ParseError<'tokens> = Rich<'tokens, TokenKind, Span>;
+
+// ============================
+// Expression parsing
+// ============================
 
 /// Prefix operators represented before binding to a concrete RHS expression.
 #[derive(Clone, Copy)]
@@ -34,10 +43,12 @@ impl PrefixExprOp {
 }
 
 /// Postfix operators represented before binding to a concrete LHS expression.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum PostfixExprOp {
     PostInc,
     PostDec,
+    /// Function call postfix: `callee(args...)`.
+    Call(Vec<Expr>),
 }
 
 impl PostfixExprOp {
@@ -46,10 +57,12 @@ impl PostfixExprOp {
         match self {
             Self::PostInc => Expr::post_inc(lhs),
             Self::PostDec => Expr::post_dec(lhs),
+            Self::Call(args) => Expr::call(lhs, args),
         }
     }
 }
 
+/// Fold `a, b, c` into nested comma AST: `((a, b), c)`.
 fn fold_comma_expr(exprs: Vec<Expr>, context: &'static str) -> Expr {
     exprs.into_iter().reduce(Expr::comma).expect(context)
 }
@@ -107,7 +120,7 @@ where
     ))
 }
 
-fn postfix_expr_op_parser<'tokens, I>()
+fn basic_postfix_expr_op_parser<'tokens, I>()
 -> impl Parser<'tokens, I, PostfixExprOp, extra::Err<ParseError<'tokens>>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
@@ -138,17 +151,17 @@ where
     ))
 }
 
-fn pratt_expr_parser<'tokens, I, P>(
+fn pratt_expr_parser<'tokens, I, P, PO>(
     atom: P,
+    postfix_op: PO,
 ) -> impl Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
     P: Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone,
+    PO: Parser<'tokens, I, PostfixExprOp, extra::Err<ParseError<'tokens>>> + Clone,
 {
     atom.pratt((
-        postfix(15, postfix_expr_op_parser(), |lhs, op: PostfixExprOp, _| {
-            op.apply(lhs)
-        }),
+        postfix(15, postfix_op, |lhs, op: PostfixExprOp, _| op.apply(lhs)),
         prefix(14, prefix_expr_op_parser(), |op: PrefixExprOp, rhs, _| {
             op.apply(rhs)
         }),
@@ -238,6 +251,79 @@ where
         .map(move |exprs| fold_comma_expr(exprs, context))
 }
 
+/// Parse expression atoms: literals, identifiers, and parenthesized expressions.
+fn expr_atom_parser<'tokens, I, P>(
+    grouped_expr: P,
+) -> impl Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    P: Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone,
+{
+    choice((
+        literal_expr_parser(),
+        identifier_expr_parser(),
+        grouped_expr.delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
+    ))
+    .labelled(ParserLabel::Expr.as_str())
+}
+
+/// Parse function call postfix operator: `(arg0, arg1, ...)`.
+fn call_postfix_expr_op_parser<'tokens, I, P>(
+    assignment: P,
+) -> impl Parser<'tokens, I, PostfixExprOp, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    P: Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone,
+{
+    assignment
+        .separated_by(just(TokenKind::Comma))
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .or_not()
+        .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+        .map(|args| PostfixExprOp::Call(args.unwrap_or_default()))
+}
+
+/// Build `conditional-expression` and assignment chain on top of Pratt expressions.
+fn assignment_core_expr_parser<'tokens, I, P, Q, R>(
+    pratt: P,
+    assignment: Q,
+    assign_op: R,
+) -> impl Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    P: Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone,
+    Q: Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone,
+    R: Parser<'tokens, I, AssignOp, extra::Err<ParseError<'tokens>>> + Clone,
+{
+    // In `cond ? then : else`, the then-branch is an `expression`
+    // (comma expressions are allowed), while else-branch is assignment-expression.
+    let then_expr = comma_sequence_parser(
+        assignment.clone(),
+        "then-branch requires at least one expression",
+    );
+
+    let conditional = pratt
+        .then(
+            just(TokenKind::Question)
+                .ignore_then(then_expr)
+                .then_ignore(just(TokenKind::Colon))
+                .then(assignment.clone())
+                .or_not(),
+        )
+        .map(|(cond, branch)| match branch {
+            Some((then_expr, else_expr)) => Expr::conditional(cond, then_expr, else_expr),
+            None => cond,
+        });
+
+    conditional
+        .then(assign_op.then(assignment).or_not())
+        .map(|(left, assign)| match assign {
+            Some((op, right)) => Expr::assign(left, op, right),
+            None => left,
+        })
+}
+
 /// Parse C expressions.
 ///
 /// `ALLOW_COMMA` controls whether top-level comma expressions are accepted.
@@ -250,50 +336,22 @@ where
     // This parser is used by parenthesized expressions and must always allow commas.
     let mut grouped_expr = Recursive::declare();
 
-    // Atoms are the leaves of the expression tree:
-    // literals, identifiers, parenthesized sub-expressions.
-    let atom = choice((
-        literal_expr_parser(),
-        identifier_expr_parser(),
-        grouped_expr
-            .clone()
-            .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
-    ))
-    .labelled(ParserLabel::Expr.as_str());
-    // Pratt parsing handles the regular precedence ladder.
-    // Larger binding power means tighter binding.
-    let pratt = pratt_expr_parser(atom);
+    let atom = expr_atom_parser(grouped_expr.clone());
     let assign_op = assignment_op_parser();
 
     let assignment = recursive(|assignment| {
-        // In `cond ? then : else`, the then-branch is an `expression`
-        // (comma expressions are allowed), while else-branch is assignment-expression.
-        let then_expr = comma_sequence_parser(
-            assignment.clone(),
-            "then-branch requires at least one expression",
-        );
+        // In C, call arguments are assignment-expressions separated by commas.
+        // `foo(1, x = 2)` is valid; `foo((1, 2))` still works via parenthesized expr.
+        let postfix_op = choice((
+            basic_postfix_expr_op_parser(),
+            call_postfix_expr_op_parser(assignment.clone()),
+        ));
 
-        let conditional = pratt
-            .clone()
-            .then(
-                just(TokenKind::Question)
-                    .ignore_then(then_expr)
-                    .then_ignore(just(TokenKind::Colon))
-                    .then(assignment.clone())
-                    .or_not(),
-            )
-            .map(|(cond, branch)| match branch {
-                Some((then_expr, else_expr)) => Expr::conditional(cond, then_expr, else_expr),
-                None => cond,
-            });
+        // Pratt parsing handles the regular precedence ladder.
+        // Larger binding power means tighter binding.
+        let pratt = pratt_expr_parser(atom.clone(), postfix_op);
 
-        conditional
-            .clone()
-            .then(assign_op.clone().then(assignment).or_not())
-            .map(|(left, assign)| match assign {
-                Some((op, right)) => Expr::assign(left, op, right),
-                None => left,
-            })
+        assignment_core_expr_parser(pratt, assignment, assign_op.clone())
     });
 
     let comma_expr = comma_sequence_parser(
@@ -321,6 +379,10 @@ where
     expr_parser::<'tokens, I, false>()
 }
 
+// ============================
+// Declaration parsing
+// ============================
+
 /// Parse one type qualifier token.
 fn type_qualifier_parser<'tokens, I>()
 -> impl Parser<'tokens, I, TypeQualifier, extra::Err<ParseError<'tokens>>> + Clone
@@ -332,6 +394,30 @@ where
         just(TokenKind::Volatile).to(TypeQualifier::Volatile),
         just(TokenKind::Restrict).to(TypeQualifier::Restrict),
     ))
+}
+
+/// Parse a single pointer layer: `*` with optional qualifiers.
+fn pointer_layer_parser<'tokens, I>()
+-> impl Parser<'tokens, I, Pointer, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    just(TokenKind::Star)
+        .ignore_then(
+            type_qualifier_parser()
+                .repeated()
+                .collect::<Vec<TypeQualifier>>(),
+        )
+        .map(|qualifiers| Pointer { qualifiers })
+}
+
+/// Parse zero-or-more pointer layers for declarators.
+fn pointer_layers_parser<'tokens, I>()
+-> impl Parser<'tokens, I, Vec<Pointer>, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    pointer_layer_parser().repeated().collect::<Vec<_>>()
 }
 
 #[derive(Clone)]
@@ -406,6 +492,86 @@ where
         .labelled(ParserLabel::DeclarationSpecifier.as_str())
 }
 
+/// `(void)` means an empty prototype parameter list in C.
+fn is_void_parameter_decl(param: &ParameterDecl) -> bool {
+    param.declarator.is_none()
+        && param.specifiers.storage.is_empty()
+        && param.specifiers.qualifiers.is_empty()
+        && param.specifiers.function.is_empty()
+        && param.specifiers.ty == vec![TypeSpecifier::Void]
+}
+
+/// Parse an optional parameter declarator:
+/// - `x`
+/// - `*p`
+/// - omitted name for forms like `int f(int, char *)`.
+///
+/// Returns:
+/// - `None` when there is no declarator at all (e.g. parameter is just `int`).
+/// - `Some(Declarator { direct: Abstract, .. })` for unnamed abstract forms like `char *`.
+fn parameter_declarator_parser<'tokens, I>()
+-> impl Parser<'tokens, I, Option<Declarator>, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    pointer_layers_parser()
+        .then(
+            select! {
+                TokenKind::Identifier(name) => name,
+            }
+            .or_not(),
+        )
+        .map(|(pointers, name)| match (name, pointers.is_empty()) {
+            (Some(name), _) => Some(Declarator {
+                pointers,
+                direct: Box::new(DirectDeclarator::Ident(name)),
+            }),
+            (None, false) => Some(Declarator {
+                pointers,
+                direct: Box::new(DirectDeclarator::Abstract),
+            }),
+            (None, true) => None,
+        })
+}
+
+/// Parse function parameter list forms:
+/// - `()` as old-style non-prototype
+/// - `(void)` as empty prototype
+/// - `(int x, char *p)` as named prototype
+fn function_params_parser<'tokens, I>()
+-> impl Parser<'tokens, I, FunctionParams, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    let parameter =
+        decl_spec_parser()
+            .then(parameter_declarator_parser())
+            .map(|(specifiers, declarator)| ParameterDecl {
+                specifiers,
+                declarator: declarator.map(Box::new),
+            });
+
+    parameter
+        .separated_by(just(TokenKind::Comma))
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .or_not()
+        .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+        .map(|params| match params {
+            None => FunctionParams::NonPrototype,
+            Some(params) if params.len() == 1 && is_void_parameter_decl(&params[0]) => {
+                FunctionParams::Prototype {
+                    params: Vec::new(),
+                    variadic: false,
+                }
+            }
+            Some(params) => FunctionParams::Prototype {
+                params,
+                variadic: false,
+            },
+        })
+}
+
 /// Parse the currently supported declarator subset:
 /// zero-or-more pointer stars followed by an identifier direct declarator.
 fn declarator_parser<'tokens, I>()
@@ -413,22 +579,22 @@ fn declarator_parser<'tokens, I>()
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
-    let pointer = just(TokenKind::Star)
-        .ignore_then(
-            type_qualifier_parser()
-                .repeated()
-                .collect::<Vec<TypeQualifier>>(),
-        )
-        .map(|qualifiers| Pointer { qualifiers });
-
-    let direct = select! {
+    let direct_ident = select! {
         TokenKind::Identifier(name) => DirectDeclarator::Ident(name),
     }
     .labelled(ParserLabel::IdentifierDeclarator.as_str());
 
-    pointer
-        .repeated()
-        .collect::<Vec<_>>()
+    let direct = direct_ident
+        .then(function_params_parser().or_not())
+        .map(|(direct, params)| match params {
+            Some(params) => DirectDeclarator::Function {
+                inner: Box::new(direct),
+                params,
+            },
+            None => direct,
+        });
+
+    pointer_layers_parser()
         .then(direct)
         .map(|(pointers, direct)| Declarator {
             pointers,
@@ -476,6 +642,62 @@ where
         .labelled(ParserLabel::Declaration.as_str())
 }
 
+// ============================
+// Statement parsing
+// ============================
+
+/// Build a `block-item` parser from an existing statement parser.
+///
+/// A block item is either:
+/// - a declaration, or
+/// - a statement.
+fn block_item_with_statement_parser<'tokens, I, S>(
+    statement: S,
+) -> impl Parser<'tokens, I, BlockItem, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+{
+    choice((
+        declaration_parser().map(BlockItem::Decl),
+        statement.map(BlockItem::Stmt),
+    ))
+    .labelled(ParserLabel::BlockItem.as_str())
+}
+
+/// Parse a compound statement (`{ ... }`) from a statement parser.
+fn compound_statement_parser<'tokens, I, S>(
+    statement: S,
+) -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+{
+    block_item_with_statement_parser(statement)
+        .repeated()
+        .collect::<Vec<_>>()
+        .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
+        .map(|items| Stmt::Compound(CompoundStmt { items }))
+        .labelled(ParserLabel::CompoundStatement.as_str())
+}
+
+/// Parse `for` initializer clause:
+/// - declaration form: `int i = 0;`
+/// - expression form: `i = 0;` or empty `;`
+fn for_init_parser<'tokens, I>()
+-> impl Parser<'tokens, I, Option<ForInit>, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    choice((
+        declaration_parser().map(|decl| Some(ForInit::Decl(decl))),
+        expr_parser::<'tokens, I, true>()
+            .or_not()
+            .then_ignore(just(TokenKind::Semicolon))
+            .map(|expr| expr.map(ForInit::Expr)),
+    ))
+}
+
 /// Parse an expression statement: either `;` or `expression;`.
 fn expression_statement_parser<'tokens, I>()
 -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
@@ -492,6 +714,89 @@ where
         .labelled(ParserLabel::ExpressionStatement.as_str())
 }
 
+/// Parse `return;` and `return expr;`.
+fn return_statement_parser<'tokens, I>()
+-> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    just(TokenKind::Return)
+        .ignore_then(expr_parser::<'tokens, I, true>().or_not())
+        .then_ignore(just(TokenKind::Semicolon))
+        .map(Stmt::Return)
+        .labelled(ParserLabel::ReturnStatement.as_str())
+}
+
+/// Parse `if (cond) stmt` with optional `else stmt`.
+fn if_statement_parser<'tokens, I, S>(
+    statement: S,
+) -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+{
+    just(TokenKind::If)
+        .ignore_then(
+            expr_parser::<'tokens, I, true>()
+                .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
+        )
+        .then(statement.clone())
+        .then(just(TokenKind::Else).ignore_then(statement).or_not())
+        .map(|((cond, then_branch), else_branch)| Stmt::If {
+            cond,
+            then_branch: Box::new(then_branch),
+            else_branch: else_branch.map(Box::new),
+        })
+        .labelled(ParserLabel::IfStatement.as_str())
+}
+
+/// Parse `while (cond) stmt`.
+fn while_statement_parser<'tokens, I, S>(
+    statement: S,
+) -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+{
+    just(TokenKind::While)
+        .ignore_then(
+            expr_parser::<'tokens, I, true>()
+                .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
+        )
+        .then(statement)
+        .map(|(cond, body)| Stmt::While {
+            cond,
+            body: Box::new(body),
+        })
+        .labelled(ParserLabel::WhileStatement.as_str())
+}
+
+/// Parse `for (init; cond; step) stmt`.
+fn for_statement_parser<'tokens, I, S>(
+    statement: S,
+) -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+{
+    just(TokenKind::For)
+        .ignore_then(
+            for_init_parser()
+                .then(expr_parser::<'tokens, I, true>().or_not())
+                .then_ignore(just(TokenKind::Semicolon))
+                .then(expr_parser::<'tokens, I, true>().or_not())
+                .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
+        )
+        .then(statement)
+        .map(|(((init, cond), step), body)| Stmt::For {
+            init,
+            cond,
+            step,
+            body: Box::new(body),
+        })
+        .labelled(ParserLabel::ForStatement.as_str())
+}
+
 /// Parse the currently supported statement subset.
 fn statement_parser<'tokens, I>()
 -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
@@ -499,86 +804,14 @@ where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
     recursive(|statement| {
-        let block_item = choice((
-            declaration_parser().map(BlockItem::Decl),
-            statement.clone().map(BlockItem::Stmt),
-        ))
-        .labelled(ParserLabel::BlockItem.as_str());
-
-        let compound_stmt = block_item
-            .repeated()
-            .collect::<Vec<_>>()
-            .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
-            .map(|items| Stmt::Compound(CompoundStmt { items }))
-            .labelled(ParserLabel::CompoundStatement.as_str());
-
-        let return_stmt = just(TokenKind::Return)
-            .ignore_then(expr_parser::<'tokens, I, true>().or_not())
-            .then_ignore(just(TokenKind::Semicolon))
-            .map(Stmt::Return)
-            .labelled(ParserLabel::ReturnStatement.as_str());
-
-        let if_stmt = just(TokenKind::If)
-            .ignore_then(
-                expr_parser::<'tokens, I, true>()
-                    .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
-            )
-            .then(statement.clone())
-            .then(
-                just(TokenKind::Else)
-                    .ignore_then(statement.clone())
-                    .or_not(),
-            )
-            .map(|((cond, then_branch), else_branch)| Stmt::If {
-                cond,
-                then_branch: Box::new(then_branch),
-                else_branch: else_branch.map(Box::new),
-            })
-            .labelled(ParserLabel::IfStatement.as_str());
-
-        let while_stmt = just(TokenKind::While)
-            .ignore_then(
-                expr_parser::<'tokens, I, true>()
-                    .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
-            )
-            .then(statement.clone())
-            .map(|(cond, body)| Stmt::While {
-                cond,
-                body: Box::new(body),
-            })
-            .labelled(ParserLabel::WhileStatement.as_str());
-
-        let for_init = choice((
-            declaration_parser().map(|decl| Some(ForInit::Decl(decl))),
-            expr_parser::<'tokens, I, true>()
-                .or_not()
-                .then_ignore(just(TokenKind::Semicolon))
-                .map(|expr| expr.map(ForInit::Expr)),
-        ));
-
-        let for_stmt = just(TokenKind::For)
-            .ignore_then(
-                for_init
-                    .then(expr_parser::<'tokens, I, true>().or_not())
-                    .then_ignore(just(TokenKind::Semicolon))
-                    .then(expr_parser::<'tokens, I, true>().or_not())
-                    .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
-            )
-            .then(statement.clone())
-            .map(|(((init, cond), step), body)| Stmt::For {
-                init,
-                cond,
-                step,
-                body: Box::new(body),
-            })
-            .labelled(ParserLabel::ForStatement.as_str());
+        let compound_stmt = compound_statement_parser(statement.clone());
 
         choice((
             compound_stmt,
-            return_stmt,
-            if_stmt,
-            while_stmt,
-            for_stmt,
+            return_statement_parser(),
+            if_statement_parser(statement.clone()),
+            while_statement_parser(statement.clone()),
+            for_statement_parser(statement.clone()),
             expression_statement_parser(),
         ))
     })
@@ -591,11 +824,36 @@ fn block_item_parser<'tokens, I>()
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
-    choice((
-        declaration_parser().map(BlockItem::Decl),
-        statement_parser().map(BlockItem::Stmt),
-    ))
-    .labelled(ParserLabel::BlockItem.as_str())
+    block_item_with_statement_parser(statement_parser())
+}
+
+// ============================
+// Translation unit parsing
+// ============================
+
+fn function_definition_parser<'tokens, I>()
+-> impl Parser<'tokens, I, FunctionDef, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    decl_spec_parser()
+        .then(declarator_parser())
+        // Lookahead: only treat as function definition when a body starts here.
+        // The leading `{` is preserved for `statement_parser`.
+        .then_ignore(just(TokenKind::LBrace).rewind())
+        .then(statement_parser())
+        .map(|((specifiers, declarator), stmt)| {
+            let Stmt::Compound(body) = stmt else {
+                unreachable!("function body must start with '{{'");
+            };
+
+            FunctionDef {
+                specifiers,
+                declarator,
+                declarations: Vec::new(),
+                body,
+            }
+        })
 }
 
 /// Parse the whole translation unit as a sequence of external declarations.
@@ -604,16 +862,16 @@ fn parser<'tokens, I>()
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
-    declaration_parser()
-        .repeated()
-        .collect::<Vec<_>>()
-        .then_ignore(end())
-        .map(|declarations| TranslationUnit {
-            items: declarations
-                .into_iter()
-                .map(ExternalDecl::Declaration)
-                .collect(),
-        })
+    // Try function definition first, then declaration.
+    // Both start with declaration-specifiers + declarator, so order matters.
+    choice((
+        function_definition_parser().map(ExternalDecl::FunctionDef),
+        declaration_parser().map(ExternalDecl::Declaration),
+    ))
+    .repeated()
+    .collect::<Vec<_>>()
+    .then_ignore(end())
+    .map(|items| TranslationUnit { items })
 }
 
 /// Entry point for parser consumers.
@@ -677,11 +935,15 @@ mod tests {
         parse_block_item(stream).expect("block item should parse")
     }
 
-    fn assert_ident_declarator(init_declarator: &InitDeclarator, expected: &str) {
-        match init_declarator.declarator.direct.as_ref() {
+    fn assert_direct_ident(direct: &DirectDeclarator, expected: &str) {
+        match direct {
             DirectDeclarator::Ident(name) => assert_eq!(name, expected),
             other => panic!("expected identifier declarator, got {other:?}"),
         }
+    }
+
+    fn assert_ident_declarator(init_declarator: &InitDeclarator, expected: &str) {
+        assert_direct_ident(init_declarator.declarator.direct.as_ref(), expected);
     }
 
     #[test]
@@ -821,6 +1083,113 @@ mod tests {
     }
 
     #[test]
+    fn parses_function_declaration_with_void_params() {
+        let unit = parse_source("int main(void);");
+        let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+            panic!("expected declaration item");
+        };
+
+        let direct = decl.declarators[0].declarator.direct.as_ref();
+        let DirectDeclarator::Function { inner, params } = direct else {
+            panic!("expected function declarator");
+        };
+        assert_direct_ident(inner.as_ref(), "main");
+        assert_eq!(
+            params,
+            &FunctionParams::Prototype {
+                params: Vec::new(),
+                variadic: false
+            }
+        );
+    }
+
+    #[test]
+    fn parses_function_declaration_with_named_params() {
+        let unit = parse_source("int sum(int x, char *p);");
+        let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+            panic!("expected declaration item");
+        };
+
+        let direct = decl.declarators[0].declarator.direct.as_ref();
+        let DirectDeclarator::Function { inner, params } = direct else {
+            panic!("expected function declarator");
+        };
+        assert_direct_ident(inner.as_ref(), "sum");
+
+        let FunctionParams::Prototype { params, variadic } = params else {
+            panic!("expected prototype params");
+        };
+        assert!(!variadic);
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].specifiers.ty, vec![TypeSpecifier::Int]);
+        assert_eq!(params[1].specifiers.ty, vec![TypeSpecifier::Char]);
+
+        let first = params[0]
+            .declarator
+            .as_ref()
+            .expect("first parameter should have declarator");
+        assert_direct_ident(first.direct.as_ref(), "x");
+
+        let second = params[1]
+            .declarator
+            .as_ref()
+            .expect("second parameter should have declarator");
+        assert_eq!(second.pointers.len(), 1);
+        assert_direct_ident(second.direct.as_ref(), "p");
+    }
+
+    #[test]
+    fn preserves_pointer_layers_for_unnamed_parameter_declarator() {
+        let unit = parse_source("int sum(int, char *);");
+        let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+            panic!("expected declaration item");
+        };
+
+        let direct = decl.declarators[0].declarator.direct.as_ref();
+        let DirectDeclarator::Function { params, .. } = direct else {
+            panic!("expected function declarator");
+        };
+
+        let FunctionParams::Prototype { params, variadic } = params else {
+            panic!("expected prototype params");
+        };
+        assert!(!variadic);
+        assert_eq!(params.len(), 2);
+
+        assert!(
+            params[0].declarator.is_none(),
+            "plain unnamed `int` parameter should have no declarator"
+        );
+
+        let second = params[1]
+            .declarator
+            .as_ref()
+            .expect("unnamed `char *` should keep declarator");
+        assert_eq!(second.pointers.len(), 1);
+        assert_eq!(second.direct.as_ref(), &DirectDeclarator::Abstract);
+    }
+
+    #[test]
+    fn parses_function_definition_with_compound_body() {
+        let unit = parse_source("int main(void) { return 0; }");
+        let ExternalDecl::FunctionDef(def) = &unit.items[0] else {
+            panic!("expected function definition");
+        };
+
+        assert_eq!(def.specifiers.ty, vec![TypeSpecifier::Int]);
+        let DirectDeclarator::Function { inner, .. } = def.declarator.direct.as_ref() else {
+            panic!("expected function declarator");
+        };
+        assert_direct_ident(inner.as_ref(), "main");
+        assert!(def.declarations.is_empty());
+        assert_eq!(def.body.items.len(), 1);
+        assert_eq!(
+            def.body.items[0],
+            BlockItem::Stmt(Stmt::Return(Some(Expr::int(0))))
+        );
+    }
+
+    #[test]
     fn parses_compound_statement_with_decl_and_expr_stmt() {
         let stmt = parse_statement_source("{ int x; x = 1; }");
         let Stmt::Compound(compound) = stmt else {
@@ -950,5 +1319,66 @@ mod tests {
         );
         assert_eq!(step, Some(Expr::post_inc(Expr::var("i".to_string()))));
         assert_eq!(*body, Stmt::Empty);
+    }
+
+    #[test]
+    fn parses_function_call_expression_statement() {
+        let stmt = parse_statement_source("result = add(1, 2);");
+        assert_eq!(
+            stmt,
+            Stmt::Expr(Expr::assign(
+                Expr::var("result".to_string()),
+                AssignOp::Assign,
+                Expr::call(
+                    Expr::var("add".to_string()),
+                    vec![Expr::int(1), Expr::int(2)]
+                ),
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_empty_argument_function_call() {
+        let stmt = parse_statement_source("result = get();");
+        assert_eq!(
+            stmt,
+            Stmt::Expr(Expr::assign(
+                Expr::var("result".to_string()),
+                AssignOp::Assign,
+                Expr::call(Expr::var("get".to_string()), vec![]),
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_chained_function_call() {
+        let stmt = parse_statement_source("result = factory()(42);");
+        assert_eq!(
+            stmt,
+            Stmt::Expr(Expr::assign(
+                Expr::var("result".to_string()),
+                AssignOp::Assign,
+                Expr::call(
+                    Expr::call(Expr::var("factory".to_string()), vec![]),
+                    vec![Expr::int(42)],
+                ),
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_grouped_comma_expression_as_single_call_argument() {
+        let stmt = parse_statement_source("result = f((1, 2));");
+        assert_eq!(
+            stmt,
+            Stmt::Expr(Expr::assign(
+                Expr::var("result".to_string()),
+                AssignOp::Assign,
+                Expr::call(
+                    Expr::var("f".to_string()),
+                    vec![Expr::comma(Expr::int(1), Expr::int(2))],
+                ),
+            ))
+        );
     }
 }

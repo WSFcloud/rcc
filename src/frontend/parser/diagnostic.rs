@@ -31,6 +31,14 @@ fn is_declaration_label(pattern: &RichPattern<'_, TokenKind>) -> bool {
     )
 }
 
+fn is_declaration_specifier_label(pattern: &RichPattern<'_, TokenKind>) -> bool {
+    matches!(
+        pattern,
+        RichPattern::Label(label)
+            if ParserLabel::from_str(label.as_ref()) == Some(ParserLabel::DeclarationSpecifier)
+    )
+}
+
 fn is_end_of_input(pattern: &RichPattern<'_, TokenKind>) -> bool {
     matches!(pattern, RichPattern::EndOfInput)
 }
@@ -85,8 +93,11 @@ fn is_statement_at_file_scope(error: &ParseError<'_>) -> bool {
     let mut has_unrelated_expected = false;
 
     for expected in error.expected() {
-        if is_declaration_label(expected) || is_end_of_input(expected) {
-            if is_declaration_label(expected) {
+        if is_declaration_label(expected)
+            || is_declaration_specifier_label(expected)
+            || is_end_of_input(expected)
+        {
+            if is_declaration_label(expected) || is_declaration_specifier_label(expected) {
                 has_declaration_label = true;
             }
             continue;
