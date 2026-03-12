@@ -143,7 +143,7 @@ pub enum ArraySize {
     Unspecified,
     /// `[expr]`
     Expr(Expr),
-    /// `[*]` in prototype scope
+    /// `[*]` in prototype scope (reserved; currently not produced by parser)
     Variable,
 }
 

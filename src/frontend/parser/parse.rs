@@ -1,6 +1,6 @@
 use crate::common::token::TokenKind;
 use crate::frontend::parser::ast::{
-    AssignOp, BinaryOp, BlockItem, CompoundStmt, DeclSpec, Declaration, Declarator,
+    ArraySize, AssignOp, BinaryOp, BlockItem, CompoundStmt, DeclSpec, Declaration, Declarator,
     DirectDeclarator, Expr, ExternalDecl, ForInit, FunctionDef, FunctionParams, FunctionSpecifier,
     InitDeclarator, Initializer, InitializerKind, IntLiteralBase, ParameterDecl, Pointer, Stmt,
     StorageClass, TranslationUnit, TypeQualifier, TypeSpecifier, UnaryOp,
@@ -562,6 +562,16 @@ fn parameter_declarator_parser<'tokens, I>()
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
+    let array_size = assignment_expression_parser()
+        .map(ArraySize::Expr)
+        .or_not()
+        .map(|size| size.unwrap_or(ArraySize::Unspecified));
+
+    let array_suffixes = array_size
+        .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
+        .repeated()
+        .collect::<Vec<_>>();
+
     pointer_layers_parser()
         .then(
             select! {
@@ -569,16 +579,32 @@ where
             }
             .or_not(),
         )
-        .map(|(pointers, name)| match (name, pointers.is_empty()) {
-            (Some(name), _) => Some(Declarator {
-                pointers,
-                direct: Box::new(DirectDeclarator::Ident(name)),
-            }),
-            (None, false) => Some(Declarator {
-                pointers,
-                direct: Box::new(DirectDeclarator::Abstract),
-            }),
-            (None, true) => None,
+        .then(array_suffixes)
+        .map(|((pointers, name), suffixes)| {
+            let direct_base = match name {
+                Some(name) => Some(DirectDeclarator::Ident(name)),
+                None if !suffixes.is_empty() || !pointers.is_empty() => {
+                    Some(DirectDeclarator::Abstract)
+                }
+                None => None,
+            };
+
+            direct_base.map(|base| {
+                let direct =
+                    suffixes
+                        .into_iter()
+                        .fold(base, |inner, size| DirectDeclarator::Array {
+                            inner: Box::new(inner),
+                            qualifiers: Vec::new(),
+                            is_static: false,
+                            size: Box::new(size),
+                        });
+
+                Declarator {
+                    pointers,
+                    direct: Box::new(direct),
+                }
+            })
         })
 }
 
@@ -620,8 +646,44 @@ where
         })
 }
 
+#[derive(Clone)]
+enum DirectDeclaratorSuffix {
+    /// Function suffix: `(params...)`
+    Function(FunctionParams),
+    /// Array suffix: `[...]`
+    Array(ArraySize),
+}
+
+/// Parse one direct-declarator suffix.
+///
+/// This parser is intentionally suffix-only so declarator parsing can build:
+/// `base-ident + suffix*` and fold left-to-right.
+fn direct_declarator_suffix_parser<'tokens, I>()
+-> impl Parser<'tokens, I, DirectDeclaratorSuffix, extra::Err<ParseError<'tokens>>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    let function_suffix = function_params_parser().map(DirectDeclaratorSuffix::Function);
+
+    // Current minimal array-size support:
+    // `[e]` -> expression size
+    // `[]`  -> unspecified size
+    //
+    // `[*]` (VLA marker in prototype scope) is intentionally unsupported.
+    let array_size = assignment_expression_parser()
+        .map(ArraySize::Expr)
+        .or_not()
+        .map(|size| size.unwrap_or(ArraySize::Unspecified));
+
+    let array_suffix = array_size
+        .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
+        .map(DirectDeclaratorSuffix::Array);
+
+    choice((function_suffix, array_suffix))
+}
+
 /// Parse the currently supported declarator subset:
-/// zero-or-more pointer stars followed by an identifier direct declarator.
+/// zero-or-more pointer stars, then identifier and postfix direct-declarator suffixes.
 fn declarator_parser<'tokens, I>()
 -> impl Parser<'tokens, I, Declarator, extra::Err<ParseError<'tokens>>> + Clone
 where
@@ -633,13 +695,26 @@ where
     .labelled(ParserLabel::IdentifierDeclarator.as_str());
 
     let direct = direct_ident
-        .then(function_params_parser().or_not())
-        .map(|(direct, params)| match params {
-            Some(params) => DirectDeclarator::Function {
-                inner: Box::new(direct),
-                params,
-            },
-            None => direct,
+        .then(
+            direct_declarator_suffix_parser()
+                .repeated()
+                .collect::<Vec<_>>(),
+        )
+        .map(|(base, suffixes)| {
+            suffixes
+                .into_iter()
+                .fold(base, |inner, suffix| match suffix {
+                    DirectDeclaratorSuffix::Function(params) => DirectDeclarator::Function {
+                        inner: Box::new(inner),
+                        params,
+                    },
+                    DirectDeclaratorSuffix::Array(size) => DirectDeclarator::Array {
+                        inner: Box::new(inner),
+                        qualifiers: Vec::new(),
+                        is_static: false,
+                        size: Box::new(size),
+                    },
+                })
         });
 
     pointer_layers_parser()
@@ -1239,6 +1314,73 @@ mod tests {
     }
 
     #[test]
+    fn parses_array_declaration_with_constant_size() {
+        let unit = parse_source("int arr[10];");
+        let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+            panic!("expected declaration item");
+        };
+
+        let direct = decl.declarators[0].declarator.direct.as_ref();
+        let DirectDeclarator::Array {
+            inner,
+            qualifiers,
+            is_static,
+            size,
+        } = direct
+        else {
+            panic!("expected array declarator");
+        };
+        assert!(qualifiers.is_empty());
+        assert!(!is_static);
+        assert_eq!(size.as_ref(), &ArraySize::Expr(Expr::int(10)));
+        assert_direct_ident(inner.as_ref(), "arr");
+    }
+
+    #[test]
+    fn parses_multi_dimensional_array_declaration() {
+        let unit = parse_source("int matrix[2][3];");
+        let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+            panic!("expected declaration item");
+        };
+
+        let direct = decl.declarators[0].declarator.direct.as_ref();
+        let DirectDeclarator::Array {
+            inner: outer_inner,
+            size: outer_size,
+            ..
+        } = direct
+        else {
+            panic!("expected outer array declarator");
+        };
+        assert_eq!(outer_size.as_ref(), &ArraySize::Expr(Expr::int(3)));
+
+        let DirectDeclarator::Array {
+            inner: inner_inner,
+            size: inner_size,
+            ..
+        } = outer_inner.as_ref()
+        else {
+            panic!("expected inner array declarator");
+        };
+        assert_eq!(inner_size.as_ref(), &ArraySize::Expr(Expr::int(2)));
+        assert_direct_ident(inner_inner.as_ref(), "matrix");
+    }
+
+    #[test]
+    fn rejects_vla_marker_array_declaration() {
+        let src = "int arr[*];";
+        let tokens = lexer_from_source(src);
+        let stream = Stream::from_iter(tokens)
+            .map((src.len()..src.len()).into(), |(token, span)| (token, span));
+
+        let errors = parse(stream).expect_err("VLA marker should be rejected");
+        assert!(
+            !errors.is_empty(),
+            "expected at least one parser error for VLA marker syntax"
+        );
+    }
+
+    #[test]
     fn parses_empty_expression_statement() {
         let stmt = parse_statement_source(";");
         assert_eq!(stmt, Stmt::Empty);
@@ -1332,6 +1474,78 @@ mod tests {
             .expect("second parameter should have declarator");
         assert_eq!(second.pointers.len(), 1);
         assert_direct_ident(second.direct.as_ref(), "p");
+    }
+
+    #[test]
+    fn parses_function_declaration_with_array_param() {
+        let unit = parse_source("int f(int a[]);");
+        let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+            panic!("expected declaration item");
+        };
+
+        let direct = decl.declarators[0].declarator.direct.as_ref();
+        let DirectDeclarator::Function { params, .. } = direct else {
+            panic!("expected function declarator");
+        };
+
+        let FunctionParams::Prototype { params, variadic } = params else {
+            panic!("expected prototype params");
+        };
+        assert!(!variadic);
+        assert_eq!(params.len(), 1);
+
+        let param_decl = params[0]
+            .declarator
+            .as_ref()
+            .expect("parameter declarator expected");
+
+        let DirectDeclarator::Array { inner, size, .. } = param_decl.direct.as_ref() else {
+            panic!("expected array declarator for parameter");
+        };
+        assert_eq!(size.as_ref(), &ArraySize::Unspecified);
+        assert_direct_ident(inner.as_ref(), "a");
+    }
+
+    #[test]
+    fn parses_function_declaration_with_const_char_pointer_array_param() {
+        let unit = parse_source("void p(const char *strings[], int count);");
+        let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+            panic!("expected declaration item");
+        };
+
+        let direct = decl.declarators[0].declarator.direct.as_ref();
+        let DirectDeclarator::Function { inner, params } = direct else {
+            panic!("expected function declarator");
+        };
+        assert_direct_ident(inner.as_ref(), "p");
+
+        let FunctionParams::Prototype { params, variadic } = params else {
+            panic!("expected prototype params");
+        };
+        assert!(!variadic);
+        assert_eq!(params.len(), 2);
+
+        assert_eq!(params[0].specifiers.qualifiers, vec![TypeQualifier::Const]);
+        assert_eq!(params[0].specifiers.ty, vec![TypeSpecifier::Char]);
+
+        let first = params[0]
+            .declarator
+            .as_ref()
+            .expect("first parameter declarator expected");
+        assert_eq!(first.pointers.len(), 1);
+
+        let DirectDeclarator::Array { inner, size, .. } = first.direct.as_ref() else {
+            panic!("expected array declarator for first parameter");
+        };
+        assert_eq!(size.as_ref(), &ArraySize::Unspecified);
+        assert_direct_ident(inner.as_ref(), "strings");
+
+        assert_eq!(params[1].specifiers.ty, vec![TypeSpecifier::Int]);
+        let second = params[1]
+            .declarator
+            .as_ref()
+            .expect("second parameter declarator expected");
+        assert_direct_ident(second.direct.as_ref(), "count");
     }
 
     #[test]
