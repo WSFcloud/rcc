@@ -53,6 +53,7 @@ fn is_unary_expression_starter(pattern: &RichPattern<'_, TokenKind>) -> bool {
             TokenKind::PlusPlus
                 | TokenKind::MinusMinus
                 | TokenKind::Sizeof
+                | TokenKind::LParen
                 | TokenKind::Plus
                 | TokenKind::Minus
                 | TokenKind::Bang

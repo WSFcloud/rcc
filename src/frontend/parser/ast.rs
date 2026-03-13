@@ -271,10 +271,10 @@ impl Expr {
     }
 
     pub fn int(value: u64) -> Self {
-        Self::int_with_base(value, IntLiteralBase::Int)
+        Self::int_with_base(value, IntLiteralSuffix::Int)
     }
 
-    pub fn int_with_base(value: u64, base: IntLiteralBase) -> Self {
+    pub fn int_with_base(value: u64, base: IntLiteralSuffix) -> Self {
         Self::new(ExprKind::Literal(Literal::Int { value, base }))
     }
 
@@ -440,7 +440,7 @@ pub enum ExprKind {
 /// Literal values that can appear in source code.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
-    Int { value: u64, base: IntLiteralBase },
+    Int { value: u64, base: IntLiteralSuffix },
     Float(f64),
     Char(char),
     String(String),
@@ -450,7 +450,7 @@ pub enum Literal {
 ///
 /// When there is no integer suffix, parser defaults it to `Int`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IntLiteralBase {
+pub enum IntLiteralSuffix {
     Int,
     UInt,
     Long,

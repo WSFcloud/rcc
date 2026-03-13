@@ -1,21 +1,25 @@
 use crate::common::token::TokenKind;
 use crate::frontend::parser::ast::{
     ArraySize, AssignOp, BinaryOp, BlockItem, CompoundStmt, DeclSpec, Declaration, Declarator,
-    DirectDeclarator, Expr, ExternalDecl, ForInit, FunctionDef, FunctionParams, FunctionSpecifier,
-    InitDeclarator, Initializer, InitializerKind, IntLiteralBase, ParameterDecl, Pointer, Stmt,
-    StorageClass, TranslationUnit, TypeQualifier, TypeSpecifier, UnaryOp,
+    DirectDeclarator, Expr, ExprKind, ExternalDecl, ForInit, FunctionDef, FunctionParams,
+    FunctionSpecifier, InitDeclarator, Initializer, InitializerKind, IntLiteralSuffix,
+    ParameterDecl, Pointer, Stmt, StorageClass, TranslationUnit, TypeName, TypeQualifier,
+    TypeSpecifier, UnaryOp,
 };
 use crate::frontend::parser::labels::ParserLabel;
+use crate::frontend::parser::typedefs::{BindingKind, Typedefs};
 use chumsky::{
     error::Rich,
     input::ValueInput,
-    pratt::{infix, left, postfix, prefix},
+    pratt::{infix, left},
     prelude::*,
     span::SimpleSpan,
 };
 
 pub type Span = SimpleSpan<usize>;
 pub type ParseError<'tokens> = Rich<'tokens, TokenKind, Span>;
+type ParserExtra<'tokens, I> =
+    extra::Full<ParseError<'tokens>, Typedefs, std::marker::PhantomData<I>>;
 
 // ============================
 // Expression parsing
@@ -27,7 +31,6 @@ enum PrefixExprOp {
     Unary(UnaryOp),
     PreInc,
     PreDec,
-    Sizeof,
 }
 
 impl PrefixExprOp {
@@ -37,7 +40,6 @@ impl PrefixExprOp {
             Self::Unary(op) => Expr::unary(op, rhs),
             Self::PreInc => Expr::pre_inc(rhs),
             Self::PreDec => Expr::pre_dec(rhs),
-            Self::Sizeof => Expr::sizeof_expr(rhs),
         }
     }
 }
@@ -77,18 +79,18 @@ fn fold_comma_expr(exprs: Vec<Expr>, context: &'static str) -> Expr {
 }
 
 fn literal_expr_parser<'tokens, I>()
--> impl Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
     choice((
         select! {
             TokenKind::IntLiteral(value) => Expr::int(value),
-            TokenKind::UIntLiteral(value) => Expr::int_with_base(value, IntLiteralBase::UInt),
-            TokenKind::LongLiteral(value) => Expr::int_with_base(value, IntLiteralBase::Long),
-            TokenKind::ULongLiteral(value) => Expr::int_with_base(value, IntLiteralBase::ULong),
-            TokenKind::LongLongLiteral(value) => Expr::int_with_base(value, IntLiteralBase::LongLong),
-            TokenKind::ULongLongLiteral(value) => Expr::int_with_base(value, IntLiteralBase::ULongLong),
+            TokenKind::UIntLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::UInt),
+            TokenKind::LongLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::Long),
+            TokenKind::ULongLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::ULong),
+            TokenKind::LongLongLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::LongLong),
+            TokenKind::ULongLongLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::ULongLong),
         },
         select! {
             TokenKind::FloatLiteral(value) => Expr::float(value),
@@ -102,7 +104,7 @@ where
 }
 
 fn identifier_expr_parser<'tokens, I>()
--> impl Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -112,14 +114,13 @@ where
 }
 
 fn prefix_expr_op_parser<'tokens, I>()
--> impl Parser<'tokens, I, PrefixExprOp, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, PrefixExprOp, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
     choice((
         just(TokenKind::PlusPlus).to(PrefixExprOp::PreInc),
         just(TokenKind::MinusMinus).to(PrefixExprOp::PreDec),
-        just(TokenKind::Sizeof).to(PrefixExprOp::Sizeof),
         just(TokenKind::Plus).to(PrefixExprOp::Unary(UnaryOp::Plus)),
         just(TokenKind::Minus).to(PrefixExprOp::Unary(UnaryOp::Minus)),
         just(TokenKind::Bang).to(PrefixExprOp::Unary(UnaryOp::LogicalNot)),
@@ -130,7 +131,7 @@ where
 }
 
 fn basic_postfix_expr_op_parser<'tokens, I>()
--> impl Parser<'tokens, I, PostfixExprOp, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, PostfixExprOp, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -141,7 +142,7 @@ where
 }
 
 fn assignment_op_parser<'tokens, I>()
--> impl Parser<'tokens, I, AssignOp, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, AssignOp, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -160,20 +161,14 @@ where
     ))
 }
 
-fn pratt_expr_parser<'tokens, I, P, PO>(
+fn binary_pratt_expr_parser<'tokens, I, P>(
     atom: P,
-    postfix_op: PO,
-) -> impl Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone
+) -> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
-    P: Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone,
-    PO: Parser<'tokens, I, PostfixExprOp, extra::Err<ParseError<'tokens>>> + Clone,
+    P: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
 {
     atom.pratt((
-        postfix(15, postfix_op, |lhs, op: PostfixExprOp, _| op.apply(lhs)),
-        prefix(14, prefix_expr_op_parser(), |op: PrefixExprOp, rhs, _| {
-            op.apply(rhs)
-        }),
         infix(
             left(13),
             choice((
@@ -248,10 +243,10 @@ where
 fn comma_sequence_parser<'tokens, I, P>(
     operand: P,
     context: &'static str,
-) -> impl Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone
+) -> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
-    P: Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone,
+    P: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
 {
     operand
         .separated_by(just(TokenKind::Comma))
@@ -263,10 +258,10 @@ where
 /// Parse expression atoms: literals, identifiers, and parenthesized expressions.
 fn expr_atom_parser<'tokens, I, P>(
     grouped_expr: P,
-) -> impl Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone
+) -> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
-    P: Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone,
+    P: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
 {
     choice((
         literal_expr_parser(),
@@ -279,10 +274,10 @@ where
 /// Parse function call postfix operator: `(arg0, arg1, ...)`.
 fn call_postfix_expr_op_parser<'tokens, I, P>(
     assignment: P,
-) -> impl Parser<'tokens, I, PostfixExprOp, extra::Err<ParseError<'tokens>>> + Clone
+) -> impl Parser<'tokens, I, PostfixExprOp, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
-    P: Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone,
+    P: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
 {
     assignment
         .separated_by(just(TokenKind::Comma))
@@ -296,10 +291,10 @@ where
 /// Parse array subscript postfix operator: `[index_expr]`.
 fn index_postfix_expr_op_parser<'tokens, I, P>(
     index_expr: P,
-) -> impl Parser<'tokens, I, PostfixExprOp, extra::Err<ParseError<'tokens>>> + Clone
+) -> impl Parser<'tokens, I, PostfixExprOp, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
-    P: Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone,
+    P: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
 {
     index_expr
         .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
@@ -308,7 +303,7 @@ where
 
 /// Parse member access postfix operators: `.field` and `->field`.
 fn member_postfix_expr_op_parser<'tokens, I>()
--> impl Parser<'tokens, I, PostfixExprOp, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, PostfixExprOp, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -325,17 +320,44 @@ where
     ))
 }
 
-/// Build `conditional-expression` and assignment chain on top of Pratt expressions.
-fn assignment_core_expr_parser<'tokens, I, P, Q, R>(
-    pratt: P,
-    assignment: Q,
-    assign_op: R,
-) -> impl Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone
+/// Parse postfix-expression from a primary-expression and repeated postfix operators.
+fn postfix_expr_parser<'tokens, I, P, A>(
+    primary: P,
+    assignment: A,
+) -> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
-    P: Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone,
-    Q: Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone,
-    R: Parser<'tokens, I, AssignOp, extra::Err<ParseError<'tokens>>> + Clone,
+    P: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
+    A: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
+{
+    let subscript_expr = comma_sequence_parser(
+        assignment.clone(),
+        "array subscript requires one expression",
+    );
+
+    let postfix_op = choice((
+        basic_postfix_expr_op_parser(),
+        call_postfix_expr_op_parser(assignment),
+        index_postfix_expr_op_parser(subscript_expr),
+        member_postfix_expr_op_parser(),
+    ));
+
+    primary
+        .then(postfix_op.repeated().collect::<Vec<_>>())
+        .map(|(base, ops)| ops.into_iter().fold(base, |lhs, op| op.apply(lhs)))
+}
+
+/// Build `conditional-expression` and assignment chain on top of Pratt expressions.
+fn assignment_core_expr_parser<'tokens, I, P, Q, R>(
+    binary: P,
+    assignment: Q,
+    assign_op: R,
+) -> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    P: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
+    Q: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
+    R: Parser<'tokens, I, AssignOp, ParserExtra<'tokens, I>> + Clone,
 {
     // In `cond ? then : else`, the then-branch is an `expression`
     // (comma expressions are allowed), while else-branch is assignment-expression.
@@ -344,7 +366,7 @@ where
         "then-branch requires at least one expression",
     );
 
-    let conditional = pratt
+    let conditional = binary
         .then(
             just(TokenKind::Question)
                 .ignore_then(then_expr)
@@ -370,36 +392,50 @@ where
 /// `ALLOW_COMMA` controls whether top-level comma expressions are accepted.
 /// Parenthesized sub-expressions always parse as full `expression` grammar.
 fn expr_parser<'tokens, I, const ALLOW_COMMA: bool>()
--> impl Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
     // This parser is used by parenthesized expressions and must always allow commas.
     let mut grouped_expr = Recursive::declare();
-
-    let atom = expr_atom_parser(grouped_expr.clone());
     let assign_op = assignment_op_parser();
 
     let assignment = recursive(|assignment| {
-        // In C, call arguments are assignment-expressions separated by commas.
-        // `foo(1, x = 2)` is valid; `foo((1, 2))` still works via parenthesized expr.
-        let subscript_expr = comma_sequence_parser(
-            assignment.clone(),
-            "array subscript requires one expression",
-        );
+        let primary = expr_atom_parser(grouped_expr.clone());
 
-        let postfix_op = choice((
-            basic_postfix_expr_op_parser(),
-            call_postfix_expr_op_parser(assignment.clone()),
-            index_postfix_expr_op_parser(subscript_expr),
-            member_postfix_expr_op_parser(),
-        ));
+        let unary = recursive(|unary| {
+            let sizeof_type = just(TokenKind::Sizeof)
+                .ignore_then(
+                    type_name_parser()
+                        .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
+                )
+                .map(|ty| Expr::new(ExprKind::SizeofType(Box::new(ty))));
 
-        // Pratt parsing handles the regular precedence ladder.
-        // Larger binding power means tighter binding.
-        let pratt = pratt_expr_parser(atom.clone(), postfix_op);
+            let sizeof_expr = just(TokenKind::Sizeof)
+                .ignore_then(unary.clone())
+                .map(Expr::sizeof_expr);
 
-        assignment_core_expr_parser(pratt, assignment, assign_op.clone())
+            let cast = type_name_parser()
+                .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+                .then(unary.clone())
+                .map(|(ty, expr)| {
+                    Expr::new(ExprKind::Cast {
+                        ty: Box::new(ty),
+                        expr: Box::new(expr),
+                    })
+                });
+
+            let prefix = prefix_expr_op_parser()
+                .then(unary.clone())
+                .map(|(op, rhs)| op.apply(rhs));
+
+            let postfix = postfix_expr_parser(primary.clone(), assignment.clone());
+
+            choice((sizeof_type, sizeof_expr, cast, prefix, postfix))
+        });
+
+        let binary = binary_pratt_expr_parser(unary);
+        assignment_core_expr_parser(binary, assignment, assign_op.clone())
     });
 
     let comma_expr = comma_sequence_parser(
@@ -420,7 +456,7 @@ where
 
 /// Parse an assignment-expression (comma not allowed at top level).
 fn assignment_expression_parser<'tokens, I>()
--> impl Parser<'tokens, I, Expr, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -433,7 +469,7 @@ where
 
 /// Parse one type qualifier token.
 fn type_qualifier_parser<'tokens, I>()
--> impl Parser<'tokens, I, TypeQualifier, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, TypeQualifier, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -446,7 +482,7 @@ where
 
 /// Parse a single pointer layer: `*` with optional qualifiers.
 fn pointer_layer_parser<'tokens, I>()
--> impl Parser<'tokens, I, Pointer, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, Pointer, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -461,7 +497,7 @@ where
 
 /// Parse zero-or-more pointer layers for declarators.
 fn pointer_layers_parser<'tokens, I>()
--> impl Parser<'tokens, I, Vec<Pointer>, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, Vec<Pointer>, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -479,7 +515,7 @@ enum DeclSpecifierPiece {
 /// Parse declaration specifiers and keep the original sequence information
 /// grouped by category for later semantic validation.
 fn decl_spec_parser<'tokens, I>()
--> impl Parser<'tokens, I, DeclSpec, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, DeclSpec, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -497,7 +533,19 @@ where
         .to(FunctionSpecifier::Inline)
         .map(DeclSpecifierPiece::Function);
 
-    let ty = choice((
+    let typedef_name = chumsky::primitive::select(
+        |token: TokenKind,
+         extra: &mut chumsky::input::MapExtra<'tokens, '_, I, ParserExtra<'tokens, I>>| {
+            match token {
+                TokenKind::Identifier(name) if extra.state().is_typedef_name(&name) => {
+                    Some(TypeSpecifier::TypedefName(name))
+                }
+                _ => None,
+            }
+        },
+    );
+
+    let builtin_ty = choice((
         just(TokenKind::Void).to(TypeSpecifier::Void),
         just(TokenKind::Char).to(TypeSpecifier::Char),
         just(TokenKind::Short).to(TypeSpecifier::Short),
@@ -507,14 +555,24 @@ where
         just(TokenKind::Double).to(TypeSpecifier::Double),
         just(TokenKind::Signed).to(TypeSpecifier::Signed),
         just(TokenKind::Unsigned).to(TypeSpecifier::Unsigned),
-    ))
-    .map(DeclSpecifierPiece::Type);
+    ));
 
-    choice((storage, qualifiers, function_specifier, ty))
+    let non_type_piece = choice((storage, qualifiers, function_specifier));
+    let first_type_piece = choice((builtin_ty.clone(), typedef_name)).map(DeclSpecifierPiece::Type);
+    let tail_piece = choice((
+        non_type_piece.clone(),
+        builtin_ty.map(DeclSpecifierPiece::Type),
+    ));
+
+    non_type_piece
         .repeated()
-        .at_least(1)
         .collect::<Vec<_>>()
-        .map(|pieces| {
+        .then(first_type_piece)
+        .then(tail_piece.repeated().collect::<Vec<_>>())
+        .map(|((mut prefix, first_ty), mut tail)| {
+            prefix.push(first_ty);
+            prefix.append(&mut tail);
+
             let mut specifiers = DeclSpec {
                 storage: Vec::new(),
                 qualifiers: Vec::new(),
@@ -522,7 +580,7 @@ where
                 ty: Vec::new(),
             };
 
-            for piece in pieces {
+            for piece in prefix {
                 match piece {
                     DeclSpecifierPiece::Storage(storage) => specifiers.storage.push(storage),
                     DeclSpecifierPiece::Qualifier(qualifier) => {
@@ -540,33 +598,13 @@ where
         .labelled(ParserLabel::DeclarationSpecifier.as_str())
 }
 
-/// `(void)` means an empty prototype parameter list in C.
-fn is_void_parameter_decl(param: &ParameterDecl) -> bool {
-    param.declarator.is_none()
-        && param.specifiers.storage.is_empty()
-        && param.specifiers.qualifiers.is_empty()
-        && param.specifiers.function.is_empty()
-        && param.specifiers.ty == vec![TypeSpecifier::Void]
-}
-
-/// Parse an optional parameter declarator:
-/// - `x`
-/// - `*p`
-/// - omitted name for forms like `int f(int, char *)`.
-///
-/// Returns:
-/// - `None` when there is no declarator at all (e.g. parameter is just `int`).
-/// - `Some(Declarator { direct: Abstract, .. })` for unnamed abstract forms like `char *`.
-fn parameter_declarator_parser<'tokens, I>()
--> impl Parser<'tokens, I, Option<Declarator>, extra::Err<ParseError<'tokens>>> + Clone
+fn pointer_ident_array_declarator_parser<'tokens, I, AS>(
+    array_size: AS,
+) -> impl Parser<'tokens, I, Option<Declarator>, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    AS: Parser<'tokens, I, ArraySize, ParserExtra<'tokens, I>> + Clone,
 {
-    let array_size = assignment_expression_parser()
-        .map(ArraySize::Expr)
-        .or_not()
-        .map(|size| size.unwrap_or(ArraySize::Unspecified));
-
     let array_suffixes = array_size
         .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
         .repeated()
@@ -589,23 +627,171 @@ where
                 None => None,
             };
 
-            direct_base.map(|base| {
-                let direct =
+            direct_base.map(|base| Declarator {
+                pointers,
+                direct: Box::new(fold_direct_declarator_suffixes(
+                    base,
                     suffixes
                         .into_iter()
-                        .fold(base, |inner, size| DirectDeclarator::Array {
-                            inner: Box::new(inner),
-                            qualifiers: Vec::new(),
-                            is_static: false,
-                            size: Box::new(size),
-                        });
-
-                Declarator {
-                    pointers,
-                    direct: Box::new(direct),
-                }
+                        .map(DirectDeclaratorSuffix::Array)
+                        .collect::<Vec<_>>(),
+                )),
             })
         })
+}
+
+/// Parse a `type-name` used by cast and `sizeof(type-name)`.
+///
+/// This phase supports declaration specifiers and optional pointer layers.
+fn type_name_parser<'tokens, I>()
+-> impl Parser<'tokens, I, TypeName, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    let type_name_array_size = choice((
+        select! {
+            TokenKind::IntLiteral(value) => ArraySize::Expr(Expr::int(value)),
+            TokenKind::UIntLiteral(value) => ArraySize::Expr(Expr::int_with_base(value, IntLiteralSuffix::UInt)),
+            TokenKind::LongLiteral(value) => ArraySize::Expr(Expr::int_with_base(value, IntLiteralSuffix::Long)),
+            TokenKind::ULongLiteral(value) => ArraySize::Expr(Expr::int_with_base(value, IntLiteralSuffix::ULong)),
+            TokenKind::LongLongLiteral(value) => ArraySize::Expr(Expr::int_with_base(value, IntLiteralSuffix::LongLong)),
+            TokenKind::ULongLongLiteral(value) => ArraySize::Expr(Expr::int_with_base(value, IntLiteralSuffix::ULongLong)),
+        },
+        empty().to(ArraySize::Unspecified),
+    ));
+
+    let type_name_parameter_declarator =
+        pointer_ident_array_declarator_parser(type_name_array_size.clone());
+
+    let type_name_parameter =
+        decl_spec_parser()
+            .then(type_name_parameter_declarator)
+            .map(|(specifiers, declarator)| ParameterDecl {
+                specifiers,
+                declarator: declarator.map(Box::new),
+            });
+
+    let type_name_function_params = type_name_parameter
+        .separated_by(just(TokenKind::Comma))
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .or_not()
+        .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+        .map(map_parameter_list);
+
+    let type_name_suffix = choice((
+        type_name_function_params.map(DirectDeclaratorSuffix::Function),
+        type_name_array_size
+            .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
+            .map(DirectDeclaratorSuffix::Array),
+    ));
+
+    let abstract_declarator = abstract_declarator_with_suffix_parser(type_name_suffix);
+
+    decl_spec_parser()
+        .then(abstract_declarator.or_not())
+        .map(|(specifiers, declarator)| TypeName {
+            specifiers,
+            declarator: declarator.map(Box::new),
+        })
+        .boxed()
+}
+
+/// `(void)` means an empty prototype parameter list in C.
+fn is_void_parameter_decl(param: &ParameterDecl) -> bool {
+    param.declarator.is_none()
+        && param.specifiers.storage.is_empty()
+        && param.specifiers.qualifiers.is_empty()
+        && param.specifiers.function.is_empty()
+        && param.specifiers.ty == vec![TypeSpecifier::Void]
+}
+
+fn map_parameter_list(params: Option<Vec<ParameterDecl>>) -> FunctionParams {
+    match params {
+        None => FunctionParams::NonPrototype,
+        Some(params) if params.len() == 1 && is_void_parameter_decl(&params[0]) => {
+            FunctionParams::Prototype {
+                params: Vec::new(),
+                variadic: false,
+            }
+        }
+        Some(params) => FunctionParams::Prototype {
+            params,
+            variadic: false,
+        },
+    }
+}
+
+fn basic_parameter_declarator_parser<'tokens, I>()
+-> impl Parser<'tokens, I, Option<Declarator>, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    let array_size = assignment_expression_parser()
+        .map(ArraySize::Expr)
+        .or_not()
+        .map(|size| size.unwrap_or(ArraySize::Unspecified));
+
+    pointer_ident_array_declarator_parser(array_size).boxed()
+}
+
+fn simple_function_params_parser<'tokens, I>()
+-> impl Parser<'tokens, I, FunctionParams, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    let parameter = decl_spec_parser()
+        .then(basic_parameter_declarator_parser())
+        .map(|(specifiers, declarator)| ParameterDecl {
+            specifiers,
+            declarator: declarator.map(Box::new),
+        });
+
+    parameter
+        .separated_by(just(TokenKind::Comma))
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .or_not()
+        .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+        .map(map_parameter_list)
+        .boxed()
+}
+
+/// Parse an optional parameter declarator:
+/// - `x`
+/// - `*p`
+/// - omitted name for forms like `int f(int, char *)`.
+///
+/// Returns:
+/// - `None` when there is no declarator at all (e.g. parameter is just `int`).
+/// - `Some(Declarator { direct: Abstract, .. })` for unnamed abstract forms like `char *`.
+fn parameter_declarator_parser<'tokens, I>()
+-> impl Parser<'tokens, I, Option<Declarator>, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    let basic_declarator = basic_parameter_declarator_parser();
+
+    let grouped_function_pointer = basic_declarator
+        .clone()
+        .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+        .then(simple_function_params_parser())
+        .map(|(inner_declarator, params)| {
+            let inner_declarator = inner_declarator.unwrap_or(Declarator {
+                pointers: Vec::new(),
+                direct: Box::new(DirectDeclarator::Abstract),
+            });
+
+            Some(Declarator {
+                pointers: Vec::new(),
+                direct: Box::new(DirectDeclarator::Function {
+                    inner: Box::new(DirectDeclarator::Grouped(Box::new(inner_declarator))),
+                    params,
+                }),
+            })
+        });
+
+    choice((grouped_function_pointer, basic_declarator)).boxed()
 }
 
 /// Parse function parameter list forms:
@@ -613,7 +799,7 @@ where
 /// - `(void)` as empty prototype
 /// - `(int x, char *p)` as named prototype
 fn function_params_parser<'tokens, I>()
--> impl Parser<'tokens, I, FunctionParams, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, FunctionParams, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -631,19 +817,8 @@ where
         .collect::<Vec<_>>()
         .or_not()
         .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
-        .map(|params| match params {
-            None => FunctionParams::NonPrototype,
-            Some(params) if params.len() == 1 && is_void_parameter_decl(&params[0]) => {
-                FunctionParams::Prototype {
-                    params: Vec::new(),
-                    variadic: false,
-                }
-            }
-            Some(params) => FunctionParams::Prototype {
-                params,
-                variadic: false,
-            },
-        })
+        .map(map_parameter_list)
+        .boxed()
 }
 
 #[derive(Clone)]
@@ -654,16 +829,38 @@ enum DirectDeclaratorSuffix {
     Array(ArraySize),
 }
 
+fn fold_direct_declarator_suffixes(
+    base: DirectDeclarator,
+    suffixes: Vec<DirectDeclaratorSuffix>,
+) -> DirectDeclarator {
+    suffixes
+        .into_iter()
+        .fold(base, |inner, suffix| match suffix {
+            DirectDeclaratorSuffix::Function(params) => DirectDeclarator::Function {
+                inner: Box::new(inner),
+                params,
+            },
+            DirectDeclaratorSuffix::Array(size) => DirectDeclarator::Array {
+                inner: Box::new(inner),
+                qualifiers: Vec::new(),
+                is_static: false,
+                size: Box::new(size),
+            },
+        })
+}
+
 /// Parse one direct-declarator suffix.
 ///
 /// This parser is intentionally suffix-only so declarator parsing can build:
 /// `base-ident + suffix*` and fold left-to-right.
-fn direct_declarator_suffix_parser<'tokens, I>()
--> impl Parser<'tokens, I, DirectDeclaratorSuffix, extra::Err<ParseError<'tokens>>> + Clone
+fn direct_declarator_suffix_with_function_params_parser<'tokens, I, FP>(
+    function_params: FP,
+) -> impl Parser<'tokens, I, DirectDeclaratorSuffix, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    FP: Parser<'tokens, I, FunctionParams, ParserExtra<'tokens, I>> + Clone + 'tokens,
 {
-    let function_suffix = function_params_parser().map(DirectDeclaratorSuffix::Function);
+    let function_suffix = function_params.map(DirectDeclaratorSuffix::Function);
 
     // Current minimal array-size support:
     // `[e]` -> expression size
@@ -679,13 +876,70 @@ where
         .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
         .map(DirectDeclaratorSuffix::Array);
 
-    choice((function_suffix, array_suffix))
+    choice((function_suffix, array_suffix)).boxed()
+}
+
+/// Parse one direct-declarator suffix.
+///
+/// This parser is intentionally suffix-only so declarator parsing can build:
+/// `base-ident + suffix*` and fold left-to-right.
+fn direct_declarator_suffix_parser<'tokens, I>()
+-> impl Parser<'tokens, I, DirectDeclaratorSuffix, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    direct_declarator_suffix_with_function_params_parser(function_params_parser())
+}
+
+fn abstract_declarator_with_suffix_parser<'tokens, I, S>(
+    suffix: S,
+) -> impl Parser<'tokens, I, Declarator, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    S: Parser<'tokens, I, DirectDeclaratorSuffix, ParserExtra<'tokens, I>> + Clone + 'tokens,
+{
+    recursive(|abstract_declarator| {
+        let grouped_base = abstract_declarator
+            .clone()
+            .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+            .map(|decl| DirectDeclarator::Grouped(Box::new(decl)));
+
+        let grouped_with_suffix = grouped_base
+            .then(suffix.clone().repeated().collect::<Vec<_>>())
+            .map(|(base, suffixes)| fold_direct_declarator_suffixes(base, suffixes));
+
+        let implicit_abstract_with_suffix = suffix
+            .clone()
+            .repeated()
+            .at_least(1)
+            .collect::<Vec<_>>()
+            .map(|suffixes| fold_direct_declarator_suffixes(DirectDeclarator::Abstract, suffixes));
+
+        let direct = choice((grouped_with_suffix, implicit_abstract_with_suffix));
+
+        let with_direct = pointer_layers_parser()
+            .then(direct)
+            .map(|(pointers, direct)| Declarator {
+                pointers,
+                direct: Box::new(direct),
+            });
+
+        let pointer_only = pointer_layers_parser()
+            .filter(|pointers| !pointers.is_empty())
+            .map(|pointers| Declarator {
+                pointers,
+                direct: Box::new(DirectDeclarator::Abstract),
+            });
+
+        choice((with_direct, pointer_only))
+    })
+    .boxed()
 }
 
 /// Parse the currently supported declarator subset:
 /// zero-or-more pointer stars, then identifier and postfix direct-declarator suffixes.
 fn declarator_parser<'tokens, I>()
--> impl Parser<'tokens, I, Declarator, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, Declarator, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -708,22 +962,7 @@ where
                     .repeated()
                     .collect::<Vec<_>>(),
             )
-            .map(|(base, suffixes)| {
-                suffixes
-                    .into_iter()
-                    .fold(base, |inner, suffix| match suffix {
-                        DirectDeclaratorSuffix::Function(params) => DirectDeclarator::Function {
-                            inner: Box::new(inner),
-                            params,
-                        },
-                        DirectDeclaratorSuffix::Array(size) => DirectDeclarator::Array {
-                            inner: Box::new(inner),
-                            qualifiers: Vec::new(),
-                            is_static: false,
-                            size: Box::new(size),
-                        },
-                    })
-            });
+            .map(|(base, suffixes)| fold_direct_declarator_suffixes(base, suffixes));
 
         pointer_layers_parser()
             .then(direct)
@@ -734,9 +973,70 @@ where
     })
 }
 
+fn direct_declarator_name(direct: &DirectDeclarator) -> Option<&str> {
+    match direct {
+        DirectDeclarator::Ident(name) => Some(name),
+        DirectDeclarator::Abstract => None,
+        DirectDeclarator::Grouped(declarator) => declarator_name(declarator),
+        DirectDeclarator::Array { inner, .. } | DirectDeclarator::Function { inner, .. } => {
+            direct_declarator_name(inner)
+        }
+    }
+}
+
+fn declarator_name(declarator: &Declarator) -> Option<&str> {
+    direct_declarator_name(declarator.direct.as_ref())
+}
+
+fn declaration_binding_kind(specifiers: &DeclSpec) -> BindingKind {
+    if specifiers.storage.contains(&StorageClass::Typedef) {
+        BindingKind::Typedef
+    } else {
+        BindingKind::Ordinary
+    }
+}
+
+fn bind_declaration_names(declaration: &Declaration, state: &mut Typedefs) {
+    let kind = declaration_binding_kind(&declaration.specifiers);
+    for init_declarator in &declaration.declarators {
+        if let Some(name) = declarator_name(&init_declarator.declarator) {
+            state.bind(name.to_string(), kind);
+        }
+    }
+}
+
+fn function_params_from_direct_declarator(direct: &DirectDeclarator) -> Option<&FunctionParams> {
+    match direct {
+        DirectDeclarator::Function { params, .. } => Some(params),
+        DirectDeclarator::Array { inner, .. } => function_params_from_direct_declarator(inner),
+        DirectDeclarator::Grouped(declarator) => {
+            function_params_from_direct_declarator(declarator.direct.as_ref())
+        }
+        DirectDeclarator::Ident(_) | DirectDeclarator::Abstract => None,
+    }
+}
+
+fn bind_function_parameter_names(declarator: &Declarator, state: &mut Typedefs) {
+    let Some(FunctionParams::Prototype { params, .. }) =
+        function_params_from_direct_declarator(declarator.direct.as_ref())
+    else {
+        return;
+    };
+
+    for param in params {
+        let Some(param_declarator) = &param.declarator else {
+            continue;
+        };
+
+        if let Some(name) = declarator_name(param_declarator) {
+            state.bind(name.to_string(), BindingKind::Ordinary);
+        }
+    }
+}
+
 /// Parse scalar initializer syntax: `= assignment-expression`.
 fn initializer_parser<'tokens, I>()
--> impl Parser<'tokens, I, Initializer, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, Initializer, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -747,7 +1047,7 @@ where
 
 /// Parse a declaration statement ending with `;`.
 fn declaration_parser<'tokens, I>()
--> impl Parser<'tokens, I, Declaration, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, Declaration, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -771,6 +1071,10 @@ where
             specifiers,
             declarators,
         })
+        .map_with(|declaration, extra| {
+            bind_declaration_names(&declaration, extra.state());
+            declaration
+        })
         .labelled(ParserLabel::Declaration.as_str())
 }
 
@@ -785,10 +1089,10 @@ where
 /// - a statement.
 fn block_item_with_statement_parser<'tokens, I, S>(
     statement: S,
-) -> impl Parser<'tokens, I, BlockItem, extra::Err<ParseError<'tokens>>> + Clone
+) -> impl Parser<'tokens, I, BlockItem, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
-    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+    S: Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone,
 {
     choice((
         declaration_parser().map(BlockItem::Decl),
@@ -800,44 +1104,39 @@ where
 /// Parse a compound statement (`{ ... }`) from a statement parser.
 fn compound_statement_parser<'tokens, I, S>(
     statement: S,
-) -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+) -> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
-    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+    S: Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone,
 {
-    block_item_with_statement_parser(statement)
-        .repeated()
-        .collect::<Vec<_>>()
-        .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
-        .map(|items| Stmt::Compound(CompoundStmt { items }))
+    just(TokenKind::LBrace)
+        .map_with(|_, extra| {
+            let extra: &mut chumsky::input::MapExtra<'tokens, '_, I, ParserExtra<'tokens, I>> =
+                extra;
+            extra.state().push_scope();
+        })
+        .then(
+            block_item_with_statement_parser(statement)
+                .repeated()
+                .collect::<Vec<_>>(),
+        )
+        .then_ignore(just(TokenKind::RBrace))
+        .map_with(|(_, items), extra| {
+            extra.state().pop_scope();
+            Stmt::Compound(CompoundStmt { items })
+        })
         .labelled(ParserLabel::CompoundStatement.as_str())
 }
 
-/// Parse `for` initializer clause:
-/// - declaration form: `int i = 0;`
-/// - expression form: `i = 0;` or empty `;`
-fn for_init_parser<'tokens, I>()
--> impl Parser<'tokens, I, Option<ForInit>, extra::Err<ParseError<'tokens>>> + Clone
-where
-    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
-{
-    choice((
-        declaration_parser().map(|decl| Some(ForInit::Decl(decl))),
-        expr_parser::<'tokens, I, true>()
-            .or_not()
-            .then_ignore(just(TokenKind::Semicolon))
-            .map(|expr| expr.map(ForInit::Expr)),
-    ))
-}
-
 /// Parse an expression statement: either `;` or `expression;`.
-fn expression_statement_parser<'tokens, I>()
--> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+fn expression_statement_parser<'tokens, I, E>(
+    expr: E,
+) -> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    E: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
 {
-    expr_parser::<'tokens, I, true>()
-        .or_not()
+    expr.or_not()
         .then_ignore(just(TokenKind::Semicolon))
         .map(|expr| match expr {
             Some(expr) => Stmt::Expr(expr),
@@ -847,31 +1146,32 @@ where
 }
 
 /// Parse `return;` and `return expr;`.
-fn return_statement_parser<'tokens, I>()
--> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+fn return_statement_parser<'tokens, I, E>(
+    expr: E,
+) -> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    E: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
 {
     just(TokenKind::Return)
-        .ignore_then(expr_parser::<'tokens, I, true>().or_not())
+        .ignore_then(expr.or_not())
         .then_ignore(just(TokenKind::Semicolon))
         .map(Stmt::Return)
         .labelled(ParserLabel::ReturnStatement.as_str())
 }
 
 /// Parse `if (cond) stmt` with optional `else stmt`.
-fn if_statement_parser<'tokens, I, S>(
+fn if_statement_parser<'tokens, I, S, E>(
     statement: S,
-) -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+    expr: E,
+) -> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
-    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+    S: Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone,
+    E: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
 {
     just(TokenKind::If)
-        .ignore_then(
-            expr_parser::<'tokens, I, true>()
-                .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
-        )
+        .ignore_then(expr.delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)))
         .then(statement.clone())
         .then(just(TokenKind::Else).ignore_then(statement).or_not())
         .map(|((cond, then_branch), else_branch)| Stmt::If {
@@ -883,18 +1183,17 @@ where
 }
 
 /// Parse `while (cond) stmt`.
-fn while_statement_parser<'tokens, I, S>(
+fn while_statement_parser<'tokens, I, S, E>(
     statement: S,
-) -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+    expr: E,
+) -> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
-    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+    S: Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone,
+    E: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
 {
     just(TokenKind::While)
-        .ignore_then(
-            expr_parser::<'tokens, I, true>()
-                .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
-        )
+        .ignore_then(expr.delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)))
         .then(statement)
         .map(|(cond, body)| Stmt::While {
             cond,
@@ -904,20 +1203,19 @@ where
 }
 
 /// Parse `do stmt while (cond);`.
-fn do_while_statement_parser<'tokens, I, S>(
+fn do_while_statement_parser<'tokens, I, S, E>(
     statement: S,
-) -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+    expr: E,
+) -> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
-    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+    S: Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone,
+    E: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
 {
     just(TokenKind::Do)
         .ignore_then(statement)
         .then_ignore(just(TokenKind::While))
-        .then(
-            expr_parser::<'tokens, I, true>()
-                .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
-        )
+        .then(expr.delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)))
         .then_ignore(just(TokenKind::Semicolon))
         .map(|(body, cond)| Stmt::DoWhile {
             body: Box::new(body),
@@ -927,44 +1225,70 @@ where
 }
 
 /// Parse `for (init; cond; step) stmt`.
-fn for_statement_parser<'tokens, I, S>(
+fn for_statement_parser<'tokens, I, S, E>(
     statement: S,
-) -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+    expr: E,
+) -> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
-    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+    S: Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone,
+    E: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
 {
-    just(TokenKind::For)
-        .ignore_then(
-            for_init_parser()
-                .then(expr_parser::<'tokens, I, true>().or_not())
+    let header_with_decl_init = just(TokenKind::LParen)
+        .map_with(|_, extra| {
+            let extra: &mut chumsky::input::MapExtra<'tokens, '_, I, ParserExtra<'tokens, I>> =
+                extra;
+            extra.state().push_scope();
+        })
+        .then(
+            declaration_parser()
+                .then(expr.clone().or_not())
                 .then_ignore(just(TokenKind::Semicolon))
-                .then(expr_parser::<'tokens, I, true>().or_not())
-                .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
+                .then(expr.clone().or_not()),
         )
+        .then_ignore(just(TokenKind::RParen))
+        .map(|(_, ((decl, cond), step))| (Some(ForInit::Decl(decl)), cond, step, true));
+
+    let header_with_expr_init = expr
+        .clone()
+        .or_not()
+        .then_ignore(just(TokenKind::Semicolon))
+        .then(expr.clone().or_not())
+        .then_ignore(just(TokenKind::Semicolon))
+        .then(expr.clone().or_not())
+        .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+        .map(|((init, cond), step)| (init.map(ForInit::Expr), cond, step, false));
+
+    just(TokenKind::For)
+        .ignore_then(choice((header_with_decl_init, header_with_expr_init)))
         .then(statement)
-        .map(|(((init, cond), step), body)| Stmt::For {
-            init,
-            cond,
-            step,
-            body: Box::new(body),
+        .map_with(|((init, cond, step, needs_decl_scope_pop), body), extra| {
+            if needs_decl_scope_pop {
+                extra.state().pop_scope();
+            }
+
+            Stmt::For {
+                init,
+                cond,
+                step,
+                body: Box::new(body),
+            }
         })
         .labelled(ParserLabel::ForStatement.as_str())
 }
 
 /// Parse `switch (expr) stmt`.
-fn switch_statement_parser<'tokens, I, S>(
+fn switch_statement_parser<'tokens, I, S, E>(
     statement: S,
-) -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+    expr: E,
+) -> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
-    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+    S: Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone,
+    E: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
 {
     just(TokenKind::Switch)
-        .ignore_then(
-            expr_parser::<'tokens, I, true>()
-                .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
-        )
+        .ignore_then(expr.delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)))
         .then(statement)
         .map(|(expr, body)| Stmt::Switch {
             expr,
@@ -974,15 +1298,18 @@ where
 }
 
 /// Parse `case expr: stmt`.
-fn case_statement_parser<'tokens, I, S>(
+fn case_statement_parser<'tokens, I, S, A>(
     statement: S,
-) -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+    assignment: A,
+) -> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
-    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+    S: Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone,
+    A: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
 {
     just(TokenKind::Case)
-        .ignore_then(expr_parser::<'tokens, I, true>())
+        // `case` expects constant-expression (no comma-expression at top level).
+        .ignore_then(assignment)
         .then_ignore(just(TokenKind::Colon))
         .then(statement)
         .map(|(expr, stmt)| Stmt::Case {
@@ -995,10 +1322,10 @@ where
 /// Parse `default: stmt`.
 fn default_statement_parser<'tokens, I, S>(
     statement: S,
-) -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+) -> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
-    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+    S: Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone,
 {
     just(TokenKind::Default)
         .ignore_then(just(TokenKind::Colon))
@@ -1012,10 +1339,10 @@ where
 /// Parse `label: stmt`.
 fn label_statement_parser<'tokens, I, S>(
     statement: S,
-) -> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+) -> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
-    S: Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone,
+    S: Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone,
 {
     select! {
         TokenKind::Identifier(name) => name,
@@ -1031,7 +1358,7 @@ where
 
 /// Parse `break;`.
 fn break_statement_parser<'tokens, I>()
--> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -1043,7 +1370,7 @@ where
 
 /// Parse `continue;`.
 fn continue_statement_parser<'tokens, I>()
--> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -1055,7 +1382,7 @@ where
 
 /// Parse `goto identifier;`.
 fn goto_statement_parser<'tokens, I>()
--> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -1068,43 +1395,77 @@ where
         .labelled(ParserLabel::GotoStatement.as_str())
 }
 
-/// Parse the currently supported statement subset.
-fn statement_parser<'tokens, I>()
--> impl Parser<'tokens, I, Stmt, extra::Err<ParseError<'tokens>>> + Clone
+/// Parse the currently supported statement subset using shared expression parsers.
+fn statement_parser_with_expr<'tokens, I, E, A>(
+    expr: E,
+    assignment: A,
+) -> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    E: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone + 'tokens,
+    A: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone + 'tokens,
 {
     recursive(|statement| {
         let compound_stmt = compound_statement_parser(statement.clone());
 
         choice((
             compound_stmt,
-            return_statement_parser(),
-            if_statement_parser(statement.clone()),
-            while_statement_parser(statement.clone()),
-            do_while_statement_parser(statement.clone()),
-            for_statement_parser(statement.clone()),
-            switch_statement_parser(statement.clone()),
-            case_statement_parser(statement.clone()),
+            return_statement_parser(expr.clone()),
+            if_statement_parser(statement.clone(), expr.clone()),
+            while_statement_parser(statement.clone(), expr.clone()),
+            do_while_statement_parser(statement.clone(), expr.clone()),
+            for_statement_parser(statement.clone(), expr.clone()),
+            switch_statement_parser(statement.clone(), expr.clone()),
+            case_statement_parser(statement.clone(), assignment.clone()),
             default_statement_parser(statement.clone()),
             // Must appear before expression statement to parse `label: ...` correctly.
             label_statement_parser(statement.clone()),
             goto_statement_parser(),
             break_statement_parser(),
             continue_statement_parser(),
-            expression_statement_parser(),
+            expression_statement_parser(expr.clone()),
         ))
     })
     .labelled(ParserLabel::Statement.as_str())
 }
 
+/// Parse the currently supported statement subset.
+fn statement_parser<'tokens, I>() -> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    let expr = expr_parser::<'tokens, I, true>();
+    let assignment = assignment_expression_parser::<'tokens, I>();
+    statement_parser_with_expr(expr, assignment)
+}
+
 /// Parse one block item as either a declaration or a statement.
 fn block_item_parser<'tokens, I>()
--> impl Parser<'tokens, I, BlockItem, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, BlockItem, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
     block_item_with_statement_parser(statement_parser())
+}
+
+/// Parse a function body `{ ... }` without creating an extra nested scope.
+///
+/// Function parameters and the outermost compound block share one scope in C.
+/// `function_definition_parser` enters that scope before parsing this body.
+fn function_body_parser<'tokens, I>()
+-> impl Parser<'tokens, I, CompoundStmt, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    just(TokenKind::LBrace)
+        .ignore_then(
+            block_item_with_statement_parser(statement_parser())
+                .repeated()
+                .collect::<Vec<_>>(),
+        )
+        .then_ignore(just(TokenKind::RBrace))
+        .map(|items| CompoundStmt { items })
+        .labelled(ParserLabel::CompoundStatement.as_str())
 }
 
 // ============================
@@ -1112,7 +1473,7 @@ where
 // ============================
 
 fn function_definition_parser<'tokens, I>()
--> impl Parser<'tokens, I, FunctionDef, extra::Err<ParseError<'tokens>>> + Clone
+-> impl Parser<'tokens, I, FunctionDef, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -1121,11 +1482,17 @@ where
         // Lookahead: only treat as function definition when a body starts here.
         // The leading `{` is preserved for `statement_parser`.
         .then_ignore(just(TokenKind::LBrace).rewind())
-        .then(statement_parser())
-        .map(|((specifiers, declarator), stmt)| {
-            let Stmt::Compound(body) = stmt else {
-                unreachable!("function body must start with '{{'");
-            };
+        .map_with(|(specifiers, declarator), extra| {
+            if let Some(name) = declarator_name(&declarator) {
+                extra.state().bind(name.to_string(), BindingKind::Ordinary);
+            }
+            extra.state().push_scope();
+            bind_function_parameter_names(&declarator, extra.state());
+            (specifiers, declarator)
+        })
+        .then(function_body_parser())
+        .map_with(|((specifiers, declarator), body), extra| {
+            extra.state().pop_scope();
 
             FunctionDef {
                 specifiers,
@@ -1137,8 +1504,7 @@ where
 }
 
 /// Parse the whole translation unit as a sequence of external declarations.
-fn parser<'tokens, I>()
--> impl Parser<'tokens, I, TranslationUnit, extra::Err<ParseError<'tokens>>> + Clone
+fn parser<'tokens, I>() -> impl Parser<'tokens, I, TranslationUnit, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -1159,7 +1525,8 @@ pub fn parse<'tokens, I>(input: I) -> Result<TranslationUnit, Vec<ParseError<'to
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
-    parser().parse(input).into_result()
+    let mut state = Typedefs::default();
+    parser().parse_with_state(input, &mut state).into_result()
 }
 
 /// Parse a single statement from input.
@@ -1167,9 +1534,10 @@ pub fn parse_statement<'tokens, I>(input: I) -> Result<Stmt, Vec<ParseError<'tok
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
+    let mut state = Typedefs::default();
     statement_parser()
         .then_ignore(end())
-        .parse(input)
+        .parse_with_state(input, &mut state)
         .into_result()
 }
 
@@ -1178,9 +1546,10 @@ pub fn parse_block_item<'tokens, I>(input: I) -> Result<BlockItem, Vec<ParseErro
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
+    let mut state = Typedefs::default();
     block_item_parser()
         .then_ignore(end())
-        .parse(input)
+        .parse_with_state(input, &mut state)
         .into_result()
 }
 
@@ -1189,6 +1558,7 @@ mod tests {
     use super::*;
     use crate::frontend::lexer::lexer_from_source;
     use crate::frontend::parser::ast::{ExprKind, Literal};
+    use crate::frontend::parser::typedefs::ScopeEntry;
     use chumsky::input::{Input, Stream};
 
     fn parse_source(src: &str) -> TranslationUnit {
@@ -1199,12 +1569,28 @@ mod tests {
         parse(stream).expect("source should parse")
     }
 
+    fn parse_source_error(src: &str) -> Vec<ParseError<'_>> {
+        let tokens = lexer_from_source(src);
+        let stream = Stream::from_iter(tokens)
+            .map((src.len()..src.len()).into(), |(token, span)| (token, span));
+
+        parse(stream).expect_err("source should fail to parse")
+    }
+
     fn parse_statement_source(src: &str) -> Stmt {
         let tokens = lexer_from_source(src);
         let stream = Stream::from_iter(tokens)
             .map((src.len()..src.len()).into(), |(token, span)| (token, span));
 
         parse_statement(stream).expect("statement should parse")
+    }
+
+    fn parse_statement_source_error(src: &str) -> Vec<ParseError<'_>> {
+        let tokens = lexer_from_source(src);
+        let stream = Stream::from_iter(tokens)
+            .map((src.len()..src.len()).into(), |(token, span)| (token, span));
+
+        parse_statement(stream).expect_err("statement should fail to parse")
     }
 
     fn parse_block_item_source(src: &str) -> BlockItem {
@@ -1741,6 +2127,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_case_statement_with_comma_expression() {
+        let errors = parse_statement_source_error("case 1, 2: break;");
+        assert!(
+            !errors.is_empty(),
+            "case label should reject top-level comma expression"
+        );
+    }
+
+    #[test]
     fn parses_default_statement() {
         let stmt = parse_statement_source("default: continue;");
         assert_eq!(
@@ -1970,5 +2365,563 @@ mod tests {
     #[test]
     fn parses_continue_statement() {
         assert_eq!(parse_statement_source("continue;"), Stmt::Continue);
+    }
+
+    #[test]
+    fn parses_typedef_and_uses_typedef_name_in_later_declaration() {
+        let unit = parse_source("typedef int T; T x;");
+        assert_eq!(unit.items.len(), 2);
+
+        let ExternalDecl::Declaration(typedef_decl) = &unit.items[0] else {
+            panic!("expected typedef declaration");
+        };
+        assert_eq!(typedef_decl.specifiers.storage, vec![StorageClass::Typedef]);
+        assert_ident_declarator(&typedef_decl.declarators[0], "T");
+
+        let ExternalDecl::Declaration(var_decl) = &unit.items[1] else {
+            panic!("expected declaration using typedef-name");
+        };
+        assert_eq!(
+            var_decl.specifiers.ty,
+            vec![TypeSpecifier::TypedefName("T".to_string())]
+        );
+        assert_ident_declarator(&var_decl.declarators[0], "x");
+    }
+
+    #[test]
+    fn parses_cast_expression_using_typedef_name() {
+        let unit = parse_source("typedef int T; int f(void) { return (T)+1; }");
+        let ExternalDecl::FunctionDef(def) = &unit.items[1] else {
+            panic!("expected function definition");
+        };
+
+        let BlockItem::Stmt(Stmt::Return(Some(expr))) = &def.body.items[0] else {
+            panic!("expected return statement");
+        };
+
+        let ExprKind::Cast { ty, expr } = &expr.kind else {
+            panic!("expected cast expression");
+        };
+        assert_eq!(
+            ty.specifiers.ty,
+            vec![TypeSpecifier::TypedefName("T".to_string())]
+        );
+        assert!(ty.declarator.is_none());
+
+        let ExprKind::Unary {
+            op: UnaryOp::Plus,
+            expr: cast_inner,
+        } = &expr.kind
+        else {
+            panic!("expected unary plus inside cast expression");
+        };
+        assert_eq!(**cast_inner, Expr::int(1));
+    }
+
+    #[test]
+    fn parses_sizeof_type_and_sizeof_expr() {
+        let unit = parse_source("typedef int T; int f(void) { return sizeof(T) + sizeof(x); }");
+        let ExternalDecl::FunctionDef(def) = &unit.items[1] else {
+            panic!("expected function definition");
+        };
+
+        let BlockItem::Stmt(Stmt::Return(Some(expr))) = &def.body.items[0] else {
+            panic!("expected return statement");
+        };
+
+        let ExprKind::Binary {
+            left,
+            op: BinaryOp::Add,
+            right,
+        } = &expr.kind
+        else {
+            panic!("expected binary add expression");
+        };
+
+        let ExprKind::SizeofType(ty) = &left.kind else {
+            panic!("expected sizeof(type-name) on left");
+        };
+        assert_eq!(
+            ty.specifiers.ty,
+            vec![TypeSpecifier::TypedefName("T".to_string())]
+        );
+
+        let ExprKind::SizeofExpr(inner) = &right.kind else {
+            panic!("expected sizeof(expr) on right");
+        };
+        assert_eq!(**inner, Expr::var("x".to_string()));
+    }
+
+    #[test]
+    fn ordinary_identifier_shadows_typedef_name_in_inner_scope() {
+        let unit = parse_source("typedef int T; void f(void) { int T; T = 1; }");
+        let ExternalDecl::FunctionDef(def) = &unit.items[1] else {
+            panic!("expected function definition");
+        };
+        assert_eq!(def.body.items.len(), 2);
+
+        let BlockItem::Decl(inner_decl) = &def.body.items[0] else {
+            panic!("expected declaration in function body");
+        };
+        assert_ident_declarator(&inner_decl.declarators[0], "T");
+
+        assert_eq!(
+            def.body.items[1],
+            BlockItem::Stmt(Stmt::Expr(Expr::assign(
+                Expr::var("T".to_string()),
+                AssignOp::Assign,
+                Expr::int(1),
+            )))
+        );
+    }
+
+    #[test]
+    fn typedef_name_works_in_for_declaration_init() {
+        let unit = parse_source("typedef int T; void f(void) { for (T i = 0; i < 1; i++) {} }");
+        let ExternalDecl::FunctionDef(def) = &unit.items[1] else {
+            panic!("expected function definition");
+        };
+        let BlockItem::Stmt(Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        }) = &def.body.items[0]
+        else {
+            panic!("expected for statement");
+        };
+
+        let Some(ForInit::Decl(decl)) = init else {
+            panic!("expected declaration init in for statement");
+        };
+        assert_eq!(
+            decl.specifiers.ty,
+            vec![TypeSpecifier::TypedefName("T".to_string())]
+        );
+        assert_ident_declarator(&decl.declarators[0], "i");
+
+        assert_eq!(
+            cond,
+            &Some(Expr::binary(
+                Expr::var("i".to_string()),
+                BinaryOp::Lt,
+                Expr::int(1),
+            ))
+        );
+        assert_eq!(step, &Some(Expr::post_inc(Expr::var("i".to_string()))));
+        assert_eq!(**body, Stmt::Compound(CompoundStmt { items: Vec::new() }));
+    }
+
+    #[test]
+    fn parameter_name_shadows_typedef_name_in_function_body() {
+        let unit = parse_source("typedef int T; int f(T T) { T = 1; return T; }");
+        let ExternalDecl::FunctionDef(def) = &unit.items[1] else {
+            panic!("expected function definition");
+        };
+
+        let DirectDeclarator::Function { params, .. } = def.declarator.direct.as_ref() else {
+            panic!("expected function declarator");
+        };
+        let FunctionParams::Prototype { params, .. } = params else {
+            panic!("expected prototype parameter list");
+        };
+        assert_eq!(params.len(), 1);
+        assert_eq!(
+            params[0].specifiers.ty,
+            vec![TypeSpecifier::TypedefName("T".to_string())]
+        );
+        let param_decl = params[0]
+            .declarator
+            .as_ref()
+            .expect("parameter name should be present");
+        assert_direct_ident(param_decl.direct.as_ref(), "T");
+
+        assert_eq!(
+            def.body.items[0],
+            BlockItem::Stmt(Stmt::Expr(Expr::assign(
+                Expr::var("T".to_string()),
+                AssignOp::Assign,
+                Expr::int(1),
+            )))
+        );
+        assert_eq!(
+            def.body.items[1],
+            BlockItem::Stmt(Stmt::Return(Some(Expr::var("T".to_string()))))
+        );
+    }
+
+    #[test]
+    fn typedef_visibility_survives_function_definition() {
+        let src = "typedef int T; void test() {}";
+        let tokens = lexer_from_source(src);
+        let stream = Stream::from_iter(tokens)
+            .map((src.len()..src.len()).into(), |(token, span)| (token, span));
+
+        let mut state = Typedefs::default();
+        parser()
+            .parse_with_state(stream, &mut state)
+            .into_result()
+            .expect("source should parse");
+
+        assert!(
+            state.is_typedef_name("T"),
+            "typedef should remain visible, entries = {:?}",
+            state.entries()
+        );
+    }
+
+    #[test]
+    fn function_definition_uses_single_scope_for_params_and_outer_body() {
+        let src = "int f(int x) { int y; return x; }";
+        let tokens = lexer_from_source(src);
+        let stream = Stream::from_iter(tokens)
+            .map((src.len()..src.len()).into(), |(token, span)| (token, span));
+
+        let mut state = Typedefs::default();
+        parser()
+            .parse_with_state(stream, &mut state)
+            .into_result()
+            .expect("source should parse");
+
+        let scope_starts = state
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry, ScopeEntry::ScopeStart))
+            .count();
+        let scope_ends = state
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry, ScopeEntry::ScopeEnd))
+            .count();
+        assert_eq!(
+            scope_starts, 1,
+            "function definition should enter only one scope"
+        );
+        assert_eq!(scope_ends, 1, "function definition should exit one scope");
+    }
+
+    #[test]
+    fn function_name_shadows_typedef_inside_body() {
+        let errors = parse_source_error(
+            "typedef int f;\n\
+             f f(void) {\n\
+                 f x;\n\
+                 return x;\n\
+             }",
+        );
+        assert!(
+            !errors.is_empty(),
+            "function name should hide typedef-name inside body"
+        );
+    }
+
+    #[test]
+    fn parses_sizeof_with_abstract_array_type_name() {
+        let unit = parse_source("int f(void) { return sizeof(int [10]); }");
+        let ExternalDecl::FunctionDef(def) = &unit.items[0] else {
+            panic!("expected function definition");
+        };
+
+        let BlockItem::Stmt(Stmt::Return(Some(expr))) = &def.body.items[0] else {
+            panic!("expected return statement");
+        };
+
+        let ExprKind::SizeofType(ty) = &expr.kind else {
+            panic!("expected sizeof(type-name)");
+        };
+        assert_eq!(ty.specifiers.ty, vec![TypeSpecifier::Int]);
+
+        let declarator = ty
+            .declarator
+            .as_ref()
+            .expect("abstract array declarator should be present");
+        let DirectDeclarator::Array { inner, size, .. } = declarator.direct.as_ref() else {
+            panic!("expected array abstract declarator");
+        };
+        assert_eq!(inner.as_ref(), &DirectDeclarator::Abstract);
+        assert_eq!(size.as_ref(), &ArraySize::Expr(Expr::int(10)));
+    }
+
+    #[test]
+    fn parses_cast_with_function_pointer_type_name() {
+        let unit = parse_source("int f(void) { return (int (*)(int))fp; }");
+        let ExternalDecl::FunctionDef(def) = &unit.items[0] else {
+            panic!("expected function definition");
+        };
+
+        let BlockItem::Stmt(Stmt::Return(Some(expr))) = &def.body.items[0] else {
+            panic!("expected return statement");
+        };
+
+        let ExprKind::Cast {
+            ty,
+            expr: cast_expr,
+        } = &expr.kind
+        else {
+            panic!("expected cast expression");
+        };
+        assert_eq!(ty.specifiers.ty, vec![TypeSpecifier::Int]);
+        assert_eq!(**cast_expr, Expr::var("fp".to_string()));
+
+        let declarator = ty
+            .declarator
+            .as_ref()
+            .expect("function-pointer abstract declarator should be present");
+        let DirectDeclarator::Function { inner, params } = declarator.direct.as_ref() else {
+            panic!("expected function abstract declarator");
+        };
+        let DirectDeclarator::Grouped(grouped) = inner.as_ref() else {
+            panic!("expected grouped pointer declarator");
+        };
+        assert_eq!(grouped.pointers.len(), 1);
+        assert_eq!(grouped.direct.as_ref(), &DirectDeclarator::Abstract);
+
+        let FunctionParams::Prototype { params, variadic } = params else {
+            panic!("expected prototype parameter list");
+        };
+        assert!(!variadic);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].specifiers.ty, vec![TypeSpecifier::Int]);
+    }
+
+    #[test]
+    fn parses_sizeof_with_function_pointer_type_name_pointer_parameter() {
+        let unit = parse_source("int f(void) { return sizeof(void (*)(int *)); }");
+        let ExternalDecl::FunctionDef(def) = &unit.items[0] else {
+            panic!("expected function definition");
+        };
+
+        let BlockItem::Stmt(Stmt::Return(Some(expr))) = &def.body.items[0] else {
+            panic!("expected return statement");
+        };
+
+        let ExprKind::SizeofType(ty) = &expr.kind else {
+            panic!("expected sizeof(type-name)");
+        };
+        assert_eq!(ty.specifiers.ty, vec![TypeSpecifier::Void]);
+
+        let declarator = ty
+            .declarator
+            .as_ref()
+            .expect("function-pointer abstract declarator should be present");
+        let DirectDeclarator::Function { params, .. } = declarator.direct.as_ref() else {
+            panic!("expected function abstract declarator");
+        };
+
+        let FunctionParams::Prototype { params, variadic } = params else {
+            panic!("expected prototype parameter list");
+        };
+        assert!(!variadic);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].specifiers.ty, vec![TypeSpecifier::Int]);
+
+        let param_decl = params[0]
+            .declarator
+            .as_ref()
+            .expect("pointer parameter declarator should be present");
+        assert_eq!(param_decl.pointers.len(), 1);
+        assert_eq!(param_decl.direct.as_ref(), &DirectDeclarator::Abstract);
+    }
+
+    #[test]
+    fn parses_cast_with_function_pointer_type_name_const_char_pointer_parameter() {
+        let unit = parse_source("int f(void) { return (int (*)(const char *))ptr; }");
+        let ExternalDecl::FunctionDef(def) = &unit.items[0] else {
+            panic!("expected function definition");
+        };
+
+        let BlockItem::Stmt(Stmt::Return(Some(expr))) = &def.body.items[0] else {
+            panic!("expected return statement");
+        };
+
+        let ExprKind::Cast { ty, expr } = &expr.kind else {
+            panic!("expected cast expression");
+        };
+        assert_eq!(**expr, Expr::var("ptr".to_string()));
+        assert_eq!(ty.specifiers.ty, vec![TypeSpecifier::Int]);
+
+        let declarator = ty
+            .declarator
+            .as_ref()
+            .expect("function-pointer abstract declarator should be present");
+        let DirectDeclarator::Function { params, .. } = declarator.direct.as_ref() else {
+            panic!("expected function abstract declarator");
+        };
+        let FunctionParams::Prototype { params, variadic } = params else {
+            panic!("expected prototype parameter list");
+        };
+        assert!(!variadic);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].specifiers.qualifiers, vec![TypeQualifier::Const]);
+        assert_eq!(params[0].specifiers.ty, vec![TypeSpecifier::Char]);
+        let param_decl = params[0]
+            .declarator
+            .as_ref()
+            .expect("pointer parameter declarator should be present");
+        assert_eq!(param_decl.pointers.len(), 1);
+        assert_eq!(param_decl.direct.as_ref(), &DirectDeclarator::Abstract);
+    }
+
+    #[test]
+    fn parses_sizeof_with_function_pointer_type_name_array_parameter() {
+        let unit = parse_source("int f(void) { return sizeof(int (*)(int, char *[])); }");
+        let ExternalDecl::FunctionDef(def) = &unit.items[0] else {
+            panic!("expected function definition");
+        };
+
+        let BlockItem::Stmt(Stmt::Return(Some(expr))) = &def.body.items[0] else {
+            panic!("expected return statement");
+        };
+
+        let ExprKind::SizeofType(ty) = &expr.kind else {
+            panic!("expected sizeof(type-name)");
+        };
+        assert_eq!(ty.specifiers.ty, vec![TypeSpecifier::Int]);
+
+        let declarator = ty
+            .declarator
+            .as_ref()
+            .expect("function-pointer abstract declarator should be present");
+        let DirectDeclarator::Function { params, .. } = declarator.direct.as_ref() else {
+            panic!("expected function abstract declarator");
+        };
+
+        let FunctionParams::Prototype { params, variadic } = params else {
+            panic!("expected prototype parameter list");
+        };
+        assert!(!variadic);
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].specifiers.ty, vec![TypeSpecifier::Int]);
+        assert_eq!(params[1].specifiers.ty, vec![TypeSpecifier::Char]);
+
+        let second_param_decl = params[1]
+            .declarator
+            .as_ref()
+            .expect("second parameter declarator should be present");
+        assert_eq!(second_param_decl.pointers.len(), 1);
+        let DirectDeclarator::Array { inner, size, .. } = second_param_decl.direct.as_ref() else {
+            panic!("expected array declarator on second parameter");
+        };
+        assert_eq!(inner.as_ref(), &DirectDeclarator::Abstract);
+        assert_eq!(size.as_ref(), &ArraySize::Unspecified);
+    }
+
+    #[test]
+    fn parses_function_pointer_parameter_declarator() {
+        let unit = parse_source("int f(int (*callback)(int));");
+        let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+            panic!("expected declaration");
+        };
+
+        let DirectDeclarator::Function { params, .. } =
+            decl.declarators[0].declarator.direct.as_ref()
+        else {
+            panic!("expected function declarator");
+        };
+        let FunctionParams::Prototype { params, .. } = params else {
+            panic!("expected prototype parameter list");
+        };
+        assert_eq!(params.len(), 1);
+
+        let param_declarator = params[0]
+            .declarator
+            .as_ref()
+            .expect("parameter declarator expected");
+        let DirectDeclarator::Function { inner, params } = param_declarator.direct.as_ref() else {
+            panic!("expected function-pointer parameter declarator");
+        };
+        let DirectDeclarator::Grouped(grouped) = inner.as_ref() else {
+            panic!("expected grouped inner declarator");
+        };
+        assert_eq!(grouped.pointers.len(), 1);
+        assert_direct_ident(grouped.direct.as_ref(), "callback");
+
+        let FunctionParams::Prototype { params, variadic } = params else {
+            panic!("expected prototype parameter list");
+        };
+        assert!(!variadic);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].specifiers.ty, vec![TypeSpecifier::Int]);
+    }
+
+    #[test]
+    fn parses_unnamed_function_pointer_parameter_declarator() {
+        let unit = parse_source("int f(int (*)(int));");
+        let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+            panic!("expected declaration");
+        };
+
+        let DirectDeclarator::Function { params, .. } =
+            decl.declarators[0].declarator.direct.as_ref()
+        else {
+            panic!("expected function declarator");
+        };
+        let FunctionParams::Prototype { params, .. } = params else {
+            panic!("expected prototype parameter list");
+        };
+        assert_eq!(params.len(), 1);
+
+        let param_declarator = params[0]
+            .declarator
+            .as_ref()
+            .expect("parameter declarator expected");
+        let DirectDeclarator::Function { inner, params } = param_declarator.direct.as_ref() else {
+            panic!("expected function-pointer parameter declarator");
+        };
+        let DirectDeclarator::Grouped(grouped) = inner.as_ref() else {
+            panic!("expected grouped inner declarator");
+        };
+        assert_eq!(grouped.pointers.len(), 1);
+        assert_eq!(grouped.direct.as_ref(), &DirectDeclarator::Abstract);
+
+        let FunctionParams::Prototype { params, variadic } = params else {
+            panic!("expected prototype parameter list");
+        };
+        assert!(!variadic);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].specifiers.ty, vec![TypeSpecifier::Int]);
+        assert!(params[0].declarator.is_none());
+    }
+
+    #[test]
+    fn parses_array_of_function_pointer_parameter_declarator() {
+        let unit = parse_source("int f4(int (*[])(int));");
+        let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+            panic!("expected declaration");
+        };
+
+        let DirectDeclarator::Function { params, .. } =
+            decl.declarators[0].declarator.direct.as_ref()
+        else {
+            panic!("expected function declarator");
+        };
+        let FunctionParams::Prototype { params, .. } = params else {
+            panic!("expected prototype parameter list");
+        };
+        assert_eq!(params.len(), 1);
+
+        let param_declarator = params[0]
+            .declarator
+            .as_ref()
+            .expect("parameter declarator expected");
+        let DirectDeclarator::Function { inner, params } = param_declarator.direct.as_ref() else {
+            panic!("expected function-pointer declarator");
+        };
+        let DirectDeclarator::Grouped(grouped) = inner.as_ref() else {
+            panic!("expected grouped inner declarator");
+        };
+        assert_eq!(grouped.pointers.len(), 1);
+        let DirectDeclarator::Array { inner, size, .. } = grouped.direct.as_ref() else {
+            panic!("expected inner array declarator");
+        };
+        assert_eq!(inner.as_ref(), &DirectDeclarator::Abstract);
+        assert_eq!(size.as_ref(), &ArraySize::Unspecified);
+
+        let FunctionParams::Prototype { params, variadic } = params else {
+            panic!("expected prototype parameter list");
+        };
+        assert!(!variadic);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].specifiers.ty, vec![TypeSpecifier::Int]);
     }
 }
