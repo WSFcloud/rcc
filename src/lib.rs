@@ -2,7 +2,7 @@ pub mod common;
 pub mod driver;
 pub mod frontend;
 
-use crate::driver::{cli, pipline};
+use crate::driver::{cli, pipeline};
 
 pub fn compiler_main() {
     let args = cli::parse();
@@ -15,7 +15,7 @@ pub fn compiler_main() {
         std::process::exit(1);
     }
 
-    if let Err(err) = pipline::run(config) {
+    if let Err(err) = pipeline::run(config) {
         eprintln!("{err}");
         std::process::exit(1);
     }
