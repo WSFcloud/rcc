@@ -1947,3 +1947,70 @@ fn parses_array_of_function_pointer_parameter_declarator() {
     assert_eq!(params.len(), 1);
     assert_eq!(params[0].specifiers.ty, vec![TypeSpecifier::Int]);
 }
+
+#[test]
+fn parses_variadic_function_declaration() {
+    let unit = parse_source("int printf(const char *fmt, ...);");
+    let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+        panic!("expected declaration");
+    };
+    assert_eq!(decl.specifiers.ty, vec![TypeSpecifier::Int]);
+
+    let declarator = &decl.declarators[0].declarator;
+    let DirectDeclarator::Function { inner, params } = declarator.direct.as_ref() else {
+        panic!("expected function declarator");
+    };
+    assert_direct_ident(inner.as_ref(), "printf");
+
+    let FunctionParams::Prototype { params, variadic } = params else {
+        panic!("expected prototype parameter list");
+    };
+    assert!(variadic);
+    assert_eq!(params.len(), 1);
+    assert_eq!(params[0].specifiers.qualifiers, vec![TypeQualifier::Const]);
+    assert_eq!(params[0].specifiers.ty, vec![TypeSpecifier::Char]);
+    let param_decl = params[0]
+        .declarator
+        .as_ref()
+        .expect("parameter should have declarator");
+    assert_eq!(param_decl.pointers.len(), 1);
+    assert_direct_ident(param_decl.direct.as_ref(), "fmt");
+}
+
+#[test]
+fn parses_variadic_function_with_unnamed_params() {
+    let unit = parse_source("void f(int, ...);");
+    let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+        panic!("expected declaration");
+    };
+
+    let declarator = &decl.declarators[0].declarator;
+    let DirectDeclarator::Function { params, .. } = declarator.direct.as_ref() else {
+        panic!("expected function declarator");
+    };
+    let FunctionParams::Prototype { params, variadic } = params else {
+        panic!("expected prototype parameter list");
+    };
+    assert!(variadic);
+    assert_eq!(params.len(), 1);
+    assert_eq!(params[0].specifiers.ty, vec![TypeSpecifier::Int]);
+    assert!(params[0].declarator.is_none());
+}
+
+#[test]
+fn parses_variadic_function_definition() {
+    let unit = parse_source("int sum(int count, ...) { return 0; }");
+    let ExternalDecl::FunctionDef(func) = &unit.items[0] else {
+        panic!("expected function definition");
+    };
+
+    let DirectDeclarator::Function { params, .. } = func.declarator.direct.as_ref() else {
+        panic!("expected function declarator");
+    };
+    let FunctionParams::Prototype { params, variadic } = params else {
+        panic!("expected prototype parameter list");
+    };
+    assert!(variadic);
+    assert_eq!(params.len(), 1);
+    assert_eq!(params[0].specifiers.ty, vec![TypeSpecifier::Int]);
+}

@@ -818,13 +818,19 @@ where
             declarator: declarator.map(Box::new),
         });
 
+    let variadic_suffix = just(TokenKind::Comma)
+        .then(just(TokenKind::Ellipsis))
+        .or_not()
+        .map(|opt| opt.is_some());
+
     let function_suffix = member_parameter
         .separated_by(just(TokenKind::Comma))
         .at_least(1)
         .collect::<Vec<_>>()
         .or_not()
+        .then(variadic_suffix)
         .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
-        .map(map_parameter_list)
+        .map(|(params, variadic)| map_parameter_list(params, variadic))
         .map(DirectDeclaratorSuffix::Function);
 
     let array_size = constant_expression_parser()
@@ -1206,13 +1212,19 @@ where
                 declarator: declarator.map(Box::new),
             });
 
+    let type_name_variadic_suffix = just(TokenKind::Comma)
+        .then(just(TokenKind::Ellipsis))
+        .or_not()
+        .map(|opt| opt.is_some());
+
     let type_name_function_params = type_name_parameter
         .separated_by(just(TokenKind::Comma))
         .at_least(1)
         .collect::<Vec<_>>()
         .or_not()
+        .then(type_name_variadic_suffix)
         .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
-        .map(map_parameter_list);
+        .map(|(params, variadic)| map_parameter_list(params, variadic));
 
     let type_name_suffix = choice((
         type_name_function_params.map(DirectDeclaratorSuffix::Function),
@@ -1241,7 +1253,7 @@ fn is_void_parameter_decl(param: &ParameterDecl) -> bool {
         && param.specifiers.ty == vec![TypeSpecifier::Void]
 }
 
-fn map_parameter_list(params: Option<Vec<ParameterDecl>>) -> FunctionParams {
+fn map_parameter_list(params: Option<Vec<ParameterDecl>>, variadic: bool) -> FunctionParams {
     match params {
         None => FunctionParams::NonPrototype,
         Some(params) if params.len() == 1 && is_void_parameter_decl(&params[0]) => {
@@ -1250,10 +1262,7 @@ fn map_parameter_list(params: Option<Vec<ParameterDecl>>) -> FunctionParams {
                 variadic: false,
             }
         }
-        Some(params) => FunctionParams::Prototype {
-            params,
-            variadic: false,
-        },
+        Some(params) => FunctionParams::Prototype { params, variadic },
     }
 }
 
@@ -1282,13 +1291,19 @@ where
             declarator: declarator.map(Box::new),
         });
 
+    let variadic_suffix = just(TokenKind::Comma)
+        .then(just(TokenKind::Ellipsis))
+        .or_not()
+        .map(|opt| opt.is_some());
+
     parameter
         .separated_by(just(TokenKind::Comma))
         .at_least(1)
         .collect::<Vec<_>>()
         .or_not()
+        .then(variadic_suffix)
         .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
-        .map(map_parameter_list)
+        .map(|(params, variadic)| map_parameter_list(params, variadic))
         .boxed()
 }
 
@@ -1346,13 +1361,19 @@ where
                 declarator: declarator.map(Box::new),
             });
 
+    let variadic_suffix = just(TokenKind::Comma)
+        .then(just(TokenKind::Ellipsis))
+        .or_not()
+        .map(|opt| opt.is_some());
+
     parameter
         .separated_by(just(TokenKind::Comma))
         .at_least(1)
         .collect::<Vec<_>>()
         .or_not()
+        .then(variadic_suffix)
         .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
-        .map(map_parameter_list)
+        .map(|(params, variadic)| map_parameter_list(params, variadic))
         .boxed()
 }
 
