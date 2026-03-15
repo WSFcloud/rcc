@@ -3,20 +3,31 @@ use super::*;
 // Statement and control-flow tests
 #[test]
 fn parses_basic_statements() {
-    assert_eq!(parse_statement_source(";"), Stmt::Empty);
-    assert_eq!(parse_statement_source("return;"), Stmt::Return(None));
-    assert_eq!(parse_statement_source("break;"), Stmt::Break);
-    assert_eq!(parse_statement_source("continue;"), Stmt::Continue);
-    assert_eq!(
-        parse_statement_source("goto entry;"),
-        Stmt::Goto("entry".to_string())
-    );
+    assert!(matches!(parse_statement_source(";").kind, StmtKind::Empty));
+    assert!(matches!(
+        parse_statement_source("return;").kind,
+        StmtKind::Return(None)
+    ));
+    assert!(matches!(
+        parse_statement_source("break;").kind,
+        StmtKind::Break
+    ));
+    assert!(matches!(
+        parse_statement_source("continue;").kind,
+        StmtKind::Continue
+    ));
+
+    let goto_stmt = parse_statement_source("goto entry;");
+    let StmtKind::Goto(label) = goto_stmt.kind else {
+        panic!("expected goto");
+    };
+    assert_eq!(label, "entry");
 }
 
 #[test]
 fn parses_compound_statement() {
     let stmt = parse_statement_source("{ int x; x = 1; }");
-    let Stmt::Compound(compound) = stmt else {
+    let StmtKind::Compound(compound) = stmt.kind else {
         panic!("expected compound");
     };
     assert_eq!(compound.items.len(), 2);
@@ -29,11 +40,11 @@ fn parses_compound_statement() {
 #[test]
 fn parses_if_else() {
     let stmt = parse_statement_source("if (flag) x = 1; else x = 2;");
-    let Stmt::If {
+    let StmtKind::If {
         cond,
         then_branch: _,
         else_branch,
-    } = stmt
+    } = stmt.kind
     else {
         panic!("expected if");
     };
@@ -44,19 +55,19 @@ fn parses_if_else() {
 #[test]
 fn parses_loops() {
     let while_stmt = parse_statement_source("while (x < 10) x++;");
-    assert!(matches!(while_stmt, Stmt::While { .. }));
+    assert!(matches!(while_stmt.kind, StmtKind::While { .. }));
 
     let do_while = parse_statement_source("do x++; while (x < 10);");
-    assert!(matches!(do_while, Stmt::DoWhile { .. }));
+    assert!(matches!(do_while.kind, StmtKind::DoWhile { .. }));
 
     let for_stmt = parse_statement_source("for (i = 0; i < 10; i++) i;");
-    assert!(matches!(for_stmt, Stmt::For { .. }));
+    assert!(matches!(for_stmt.kind, StmtKind::For { .. }));
 }
 
 #[test]
 fn parses_for_with_declaration() {
     let stmt = parse_statement_source("for (int i = 0; i < 3; i++) ;");
-    let Stmt::For { init, .. } = stmt else {
+    let StmtKind::For { init, .. } = stmt.kind else {
         panic!("expected for");
     };
     let Some(ForInit::Decl(decl)) = init else {
@@ -68,13 +79,13 @@ fn parses_for_with_declaration() {
 #[test]
 fn parses_switch_and_case() {
     let switch_stmt = parse_statement_source("switch (x) break;");
-    assert!(matches!(switch_stmt, Stmt::Switch { .. }));
+    assert!(matches!(switch_stmt.kind, StmtKind::Switch { .. }));
 
     let case_stmt = parse_statement_source("case 1: break;");
-    assert!(matches!(case_stmt, Stmt::Case { .. }));
+    assert!(matches!(case_stmt.kind, StmtKind::Case { .. }));
 
     let default_stmt = parse_statement_source("default: continue;");
-    assert!(matches!(default_stmt, Stmt::Default { .. }));
+    assert!(matches!(default_stmt.kind, StmtKind::Default { .. }));
 }
 
 #[test]
@@ -92,7 +103,7 @@ fn rejects_invalid_case_expressions() {
 #[test]
 fn parses_case_sizeof_with_abstract_array_type() {
     let case_stmt = parse_statement_source("case sizeof(int[3]): break;");
-    let Stmt::Case { expr, .. } = case_stmt else {
+    let StmtKind::Case { expr, .. } = case_stmt.kind else {
         panic!("expected case");
     };
     let ExprKind::SizeofType(ty) = expr.kind else {
@@ -115,14 +126,14 @@ fn parses_function_calls() {
     ];
     for (src, _) in cases {
         let stmt = parse_statement_source(src);
-        assert!(matches!(stmt, Stmt::Expr(_)));
+        assert!(matches!(stmt.kind, StmtKind::Expr(_)));
     }
 }
 
 #[test]
 fn parses_array_subscript() {
     let stmt = parse_statement_source("value = arr[i + 1];");
-    let Stmt::Expr(expr) = stmt else {
+    let StmtKind::Expr(expr) = stmt.kind else {
         panic!("expected expr stmt");
     };
     let ExprKind::Assign { right, .. } = &expr.kind else {
@@ -140,14 +151,14 @@ fn parses_member_access() {
     ];
     for src in cases {
         let stmt = parse_statement_source(src);
-        assert!(matches!(stmt, Stmt::Expr(_)));
+        assert!(matches!(stmt.kind, StmtKind::Expr(_)));
     }
 }
 
 #[test]
 fn parses_comma_in_call_arg() {
     let stmt = parse_statement_source("result = f((1, 2));");
-    let Stmt::Expr(expr) = stmt else {
+    let StmtKind::Expr(expr) = stmt.kind else {
         panic!("expected expr stmt");
     };
     let ExprKind::Assign { right, .. } = &expr.kind else {
@@ -158,4 +169,42 @@ fn parses_comma_in_call_arg() {
     };
     assert_eq!(args.len(), 1);
     assert!(matches!(args[0].kind, ExprKind::Comma { .. }));
+}
+
+#[test]
+fn statement_span_includes_semicolon() {
+    let src = "return 1;";
+    let stmt = parse_statement_source(src);
+    assert_eq!(stmt.span.start, 0);
+    assert_eq!(stmt.span.end, src.len());
+}
+
+#[test]
+fn compound_statement_span_includes_braces() {
+    let src = "{ ; }";
+    let stmt = parse_statement_source(src);
+    let StmtKind::Compound(compound) = &stmt.kind else {
+        panic!("expected compound");
+    };
+    assert_eq!(stmt.span.start, 0);
+    assert_eq!(stmt.span.end, src.len());
+    assert_eq!(compound.span.start, 0);
+    assert_eq!(compound.span.end, src.len());
+}
+
+#[test]
+fn prefix_and_postfix_expression_spans_cover_operators() {
+    let pre = parse_statement_source("++x;");
+    let StmtKind::Expr(pre_expr) = pre.kind else {
+        panic!("expected expression statement");
+    };
+    assert_eq!(pre_expr.span.start, 0);
+    assert_eq!(pre_expr.span.end, 3);
+
+    let post = parse_statement_source("x++;");
+    let StmtKind::Expr(post_expr) = post.kind else {
+        panic!("expected expression statement");
+    };
+    assert_eq!(post_expr.span.start, 0);
+    assert_eq!(post_expr.span.end, 3);
 }

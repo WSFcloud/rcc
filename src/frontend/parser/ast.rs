@@ -1,3 +1,5 @@
+use crate::common::span::SourceSpan;
+
 /// Root node of a parsed C source file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranslationUnit {
@@ -242,6 +244,7 @@ pub enum Designator {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompoundStmt {
     pub items: Vec<BlockItem>,
+    pub span: SourceSpan,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -257,7 +260,13 @@ pub enum ForInit {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Stmt {
+pub struct Stmt {
+    pub kind: StmtKind,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StmtKind {
     /// `;`
     Empty,
     /// Expression statement `expr;`.
@@ -299,119 +308,226 @@ pub enum Stmt {
     Default { stmt: Box<Stmt> },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl Stmt {
+    pub fn new(kind: StmtKind, span: SourceSpan) -> Self {
+        Self { kind, span }
+    }
+
+    #[cfg(test)]
+    pub fn test_new(kind: StmtKind) -> Self {
+        Self::new(kind, SourceSpan::dummy())
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Expr {
     pub kind: ExprKind,
+    pub span: SourceSpan,
+}
+
+impl PartialEq for Expr {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+    }
+}
+
+impl Eq for Expr {}
+
+impl Expr {
+    /// Create a new expression from an ExprKind and span.
+    pub fn new(kind: ExprKind, span: SourceSpan) -> Self {
+        Self { kind, span }
+    }
+
+    pub fn with_span(mut self, span: SourceSpan) -> Self {
+        self.span = span;
+        self
+    }
+
+    pub fn int_with_span(value: u64, span: SourceSpan) -> Self {
+        Self::int_with_base_and_span(value, IntLiteralSuffix::Int, span)
+    }
+
+    pub fn int_with_base_and_span(value: u64, base: IntLiteralSuffix, span: SourceSpan) -> Self {
+        Self::new(ExprKind::Literal(Literal::Int { value, base }), span)
+    }
+
+    pub fn float_with_span(value: f64, span: SourceSpan) -> Self {
+        Self::new(ExprKind::Literal(Literal::Float(value)), span)
+    }
+
+    pub fn char_with_span(value: char, span: SourceSpan) -> Self {
+        Self::new(ExprKind::Literal(Literal::Char(value)), span)
+    }
+
+    pub fn string_with_span(value: String, span: SourceSpan) -> Self {
+        Self::new(ExprKind::Literal(Literal::String(value)), span)
+    }
+
+    pub fn var_with_span(name: String, span: SourceSpan) -> Self {
+        Self::new(ExprKind::Var(name), span)
+    }
+
+    #[cfg(test)]
+    pub fn test_new(kind: ExprKind) -> Self {
+        Self::new(kind, SourceSpan::dummy())
+    }
+
+    #[cfg(test)]
+    pub fn int(value: u64) -> Self {
+        Self::int_with_span(value, SourceSpan::dummy())
+    }
+
+    #[cfg(test)]
+    pub fn int_with_base(value: u64, base: IntLiteralSuffix) -> Self {
+        Self::int_with_base_and_span(value, base, SourceSpan::dummy())
+    }
+
+    #[cfg(test)]
+    pub fn float(value: f64) -> Self {
+        Self::float_with_span(value, SourceSpan::dummy())
+    }
+
+    #[cfg(test)]
+    pub fn char(value: char) -> Self {
+        Self::char_with_span(value, SourceSpan::dummy())
+    }
+
+    #[cfg(test)]
+    pub fn string(value: String) -> Self {
+        Self::string_with_span(value, SourceSpan::dummy())
+    }
+
+    #[cfg(test)]
+    pub fn var(name: String) -> Self {
+        Self::var_with_span(name, SourceSpan::dummy())
+    }
 }
 
 impl Expr {
-    /// Create a new expression from an ExprKind.
-    pub fn new(kind: ExprKind) -> Self {
-        Self { kind }
+    fn join(lhs: SourceSpan, rhs: SourceSpan) -> SourceSpan {
+        lhs.join(rhs)
     }
+}
 
-    pub fn int(value: u64) -> Self {
-        Self::int_with_base(value, IntLiteralSuffix::Int)
-    }
-
-    pub fn int_with_base(value: u64, base: IntLiteralSuffix) -> Self {
-        Self::new(ExprKind::Literal(Literal::Int { value, base }))
-    }
-
-    pub fn float(value: f64) -> Self {
-        Self::new(ExprKind::Literal(Literal::Float(value)))
-    }
-
-    pub fn char(value: char) -> Self {
-        Self::new(ExprKind::Literal(Literal::Char(value)))
-    }
-
-    pub fn string(value: String) -> Self {
-        Self::new(ExprKind::Literal(Literal::String(value)))
-    }
-
-    pub fn var(name: String) -> Self {
-        Self::new(ExprKind::Var(name))
-    }
-
+impl Expr {
     pub fn unary(op: UnaryOp, expr: Self) -> Self {
-        Self::new(ExprKind::Unary {
-            op,
-            expr: Box::new(expr),
-        })
+        let span = expr.span;
+        Self::new(
+            ExprKind::Unary {
+                op,
+                expr: Box::new(expr),
+            },
+            span,
+        )
     }
 
     pub fn binary(left: Self, op: BinaryOp, right: Self) -> Self {
-        Self::new(ExprKind::Binary {
-            left: Box::new(left),
-            op,
-            right: Box::new(right),
-        })
+        let span = Self::join(left.span, right.span);
+        Self::new(
+            ExprKind::Binary {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            },
+            span,
+        )
     }
 
     pub fn assign(left: Self, op: AssignOp, right: Self) -> Self {
-        Self::new(ExprKind::Assign {
-            left: Box::new(left),
-            op,
-            right: Box::new(right),
-        })
+        let span = Self::join(left.span, right.span);
+        Self::new(
+            ExprKind::Assign {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            },
+            span,
+        )
     }
 
     pub fn conditional(cond: Self, then_expr: Self, else_expr: Self) -> Self {
-        Self::new(ExprKind::Conditional {
-            cond: Box::new(cond),
-            then_expr: Box::new(then_expr),
-            else_expr: Box::new(else_expr),
-        })
+        let span = Self::join(cond.span, else_expr.span);
+        Self::new(
+            ExprKind::Conditional {
+                cond: Box::new(cond),
+                then_expr: Box::new(then_expr),
+                else_expr: Box::new(else_expr),
+            },
+            span,
+        )
     }
 
     pub fn call(callee: Self, args: Vec<Self>) -> Self {
-        Self::new(ExprKind::Call {
-            callee: Box::new(callee),
-            args,
-        })
+        let span = args
+            .last()
+            .map_or(callee.span, |last| Self::join(callee.span, last.span));
+        Self::new(
+            ExprKind::Call {
+                callee: Box::new(callee),
+                args,
+            },
+            span,
+        )
     }
 
     pub fn index(base: Self, index: Self) -> Self {
-        Self::new(ExprKind::Index {
-            base: Box::new(base),
-            index: Box::new(index),
-        })
+        let span = Self::join(base.span, index.span);
+        Self::new(
+            ExprKind::Index {
+                base: Box::new(base),
+                index: Box::new(index),
+            },
+            span,
+        )
     }
 
     pub fn member(base: Self, field: String, deref: bool) -> Self {
-        Self::new(ExprKind::Member {
-            base: Box::new(base),
-            field,
-            deref,
-        })
+        let span = base.span;
+        Self::new(
+            ExprKind::Member {
+                base: Box::new(base),
+                field,
+                deref,
+            },
+            span,
+        )
     }
 
     pub fn comma(left: Self, right: Self) -> Self {
-        Self::new(ExprKind::Comma {
-            left: Box::new(left),
-            right: Box::new(right),
-        })
+        let span = Self::join(left.span, right.span);
+        Self::new(
+            ExprKind::Comma {
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            span,
+        )
     }
 
     pub fn pre_inc(expr: Self) -> Self {
-        Self::new(ExprKind::PreInc(Box::new(expr)))
+        let span = expr.span;
+        Self::new(ExprKind::PreInc(Box::new(expr)), span)
     }
 
     pub fn pre_dec(expr: Self) -> Self {
-        Self::new(ExprKind::PreDec(Box::new(expr)))
+        let span = expr.span;
+        Self::new(ExprKind::PreDec(Box::new(expr)), span)
     }
 
     pub fn post_inc(expr: Self) -> Self {
-        Self::new(ExprKind::PostInc(Box::new(expr)))
+        let span = expr.span;
+        Self::new(ExprKind::PostInc(Box::new(expr)), span)
     }
 
     pub fn post_dec(expr: Self) -> Self {
-        Self::new(ExprKind::PostDec(Box::new(expr)))
+        let span = expr.span;
+        Self::new(ExprKind::PostDec(Box::new(expr)), span)
     }
 
     pub fn sizeof_expr(expr: Self) -> Self {
-        Self::new(ExprKind::SizeofExpr(Box::new(expr)))
+        let span = expr.span;
+        Self::new(ExprKind::SizeofExpr(Box::new(expr)), span)
     }
 }
 

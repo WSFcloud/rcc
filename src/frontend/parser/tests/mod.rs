@@ -45,6 +45,21 @@ fn assert_ident_declarator(init_declarator: &InitDeclarator, expected: &str) {
     assert_direct_ident(init_declarator.declarator.direct.as_ref(), expected);
 }
 
+fn expect_stmt(item: &BlockItem) -> &Stmt {
+    let BlockItem::Stmt(stmt) = item else {
+        panic!("expected statement");
+    };
+    stmt
+}
+
+fn expect_return_expr(item: &BlockItem) -> &Expr {
+    let stmt = expect_stmt(item);
+    let StmtKind::Return(Some(expr)) = &stmt.kind else {
+        panic!("expected return expression");
+    };
+    expr
+}
+
 mod control_flow;
 mod declarations;
 mod functions;

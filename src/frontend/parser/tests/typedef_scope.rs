@@ -24,9 +24,7 @@ fn parses_typedef_in_cast_and_sizeof() {
     let ExternalDecl::FunctionDef(def) = &unit.items[1] else {
         panic!("expected function");
     };
-    let BlockItem::Stmt(Stmt::Return(Some(expr))) = &def.body.items[0] else {
-        panic!("expected return");
-    };
+    let expr = expect_return_expr(&def.body.items[0]);
     let ExprKind::Binary { left, right, .. } = &expr.kind else {
         panic!("expected binary");
     };
@@ -89,7 +87,8 @@ fn typedef_in_for_init() {
     let ExternalDecl::FunctionDef(def) = &unit.items[1] else {
         panic!("expected function");
     };
-    let BlockItem::Stmt(Stmt::For { init, .. }) = &def.body.items[0] else {
+    let stmt = expect_stmt(&def.body.items[0]);
+    let StmtKind::For { init, .. } = &stmt.kind else {
         panic!("expected for");
     };
     let Some(ForInit::Decl(decl)) = init else {

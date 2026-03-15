@@ -18,9 +18,7 @@ fn parses_sizeof_with_abstract_array() {
         let ExternalDecl::FunctionDef(def) = &unit.items[0] else {
             panic!("expected function");
         };
-        let BlockItem::Stmt(Stmt::Return(Some(expr))) = &def.body.items[0] else {
-            panic!("expected return");
-        };
+        let expr = expect_return_expr(&def.body.items[0]);
         let ExprKind::SizeofType(ty) = &expr.kind else {
             panic!("expected sizeof(type)");
         };
@@ -41,9 +39,7 @@ fn parses_cast_with_function_pointer() {
     let ExternalDecl::FunctionDef(def) = &unit.items[0] else {
         panic!("expected function");
     };
-    let BlockItem::Stmt(Stmt::Return(Some(expr))) = &def.body.items[0] else {
-        panic!("expected return");
-    };
+    let expr = expect_return_expr(&def.body.items[0]);
     let ExprKind::Cast { ty, .. } = &expr.kind else {
         panic!("expected cast");
     };
@@ -78,9 +74,7 @@ fn parses_function_pointer_with_pointer_params() {
         let ExternalDecl::FunctionDef(def) = &unit.items[0] else {
             panic!("expected function");
         };
-        let BlockItem::Stmt(Stmt::Return(Some(expr))) = &def.body.items[0] else {
-            panic!("expected return");
-        };
+        let expr = expect_return_expr(&def.body.items[0]);
         let ty = match &expr.kind {
             ExprKind::SizeofType(ty) => ty,
             ExprKind::Cast { ty, .. } => ty,
@@ -108,9 +102,7 @@ fn parses_function_pointer_with_array_param() {
     let ExternalDecl::FunctionDef(def) = &unit.items[0] else {
         panic!("expected function");
     };
-    let BlockItem::Stmt(Stmt::Return(Some(expr))) = &def.body.items[0] else {
-        panic!("expected return");
-    };
+    let expr = expect_return_expr(&def.body.items[0]);
     let ExprKind::SizeofType(ty) = &expr.kind else {
         panic!("expected sizeof");
     };
@@ -139,9 +131,7 @@ fn parses_compound_literal() {
     let ExternalDecl::FunctionDef(def) = &unit.items[0] else {
         panic!("expected function");
     };
-    let BlockItem::Stmt(Stmt::Return(Some(expr))) = &def.body.items[0] else {
-        panic!("expected return");
-    };
+    let expr = expect_return_expr(&def.body.items[0]);
     let ExprKind::CompoundLiteral { ty, init } = &expr.kind else {
         panic!("expected compound literal");
     };
@@ -161,9 +151,7 @@ fn parses_compound_literal_with_member_postfix() {
     let ExternalDecl::FunctionDef(def) = &unit.items[1] else {
         panic!("expected function");
     };
-    let BlockItem::Stmt(Stmt::Return(Some(expr))) = &def.body.items[0] else {
-        panic!("expected return");
-    };
+    let expr = expect_return_expr(&def.body.items[0]);
     let ExprKind::Member { base, field, deref } = &expr.kind else {
         panic!("expected member access");
     };

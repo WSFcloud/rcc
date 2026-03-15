@@ -1,10 +1,11 @@
+use crate::common::span::SourceSpan;
 use crate::common::token::TokenKind;
 use crate::frontend::parser::ast::{
     ArraySize, AssignOp, BinaryOp, BlockItem, CompoundStmt, DeclSpec, Declaration, Declarator,
     Designator, DirectDeclarator, EnumSpecifier, EnumVariant, Expr, ExprKind, ExternalDecl,
     ForInit, FunctionDef, FunctionParams, FunctionSpecifier, InitDeclarator, Initializer,
     InitializerItem, InitializerKind, IntLiteralSuffix, ParameterDecl, Pointer, RecordKind,
-    RecordMemberDecl, RecordSpecifier, Stmt, StorageClass, TranslationUnit, TypeName,
+    RecordMemberDecl, RecordSpecifier, Stmt, StmtKind, StorageClass, TranslationUnit, TypeName,
     TypeQualifier, TypeSpecifier, UnaryOp,
 };
 use crate::frontend::parser::labels::ParserLabel;
@@ -22,6 +23,10 @@ pub type ParseError<'tokens> = Rich<'tokens, TokenKind, Span>;
 type ParserExtra<'tokens, I> =
     extra::Full<ParseError<'tokens>, Typedefs, std::marker::PhantomData<I>>;
 
+fn span_to_source(span: Span) -> SourceSpan {
+    span.into()
+}
+
 // ============================
 // Expression parsing
 // ============================
@@ -36,11 +41,12 @@ enum PrefixExprOp {
 
 impl PrefixExprOp {
     /// Build the corresponding AST node for a parsed prefix operator.
-    fn apply(self, rhs: Expr) -> Expr {
+    fn apply(self, rhs: Expr, op_span: SourceSpan) -> Expr {
+        let span = op_span.join(rhs.span);
         match self {
-            Self::Unary(op) => Expr::unary(op, rhs),
-            Self::PreInc => Expr::pre_inc(rhs),
-            Self::PreDec => Expr::pre_dec(rhs),
+            Self::Unary(op) => Expr::unary(op, rhs).with_span(span),
+            Self::PreInc => Expr::pre_inc(rhs).with_span(span),
+            Self::PreDec => Expr::pre_dec(rhs).with_span(span),
         }
     }
 }
@@ -63,13 +69,14 @@ enum PostfixExprOp {
 
 impl PostfixExprOp {
     /// Build the corresponding AST node for a parsed postfix operator.
-    fn apply(self, lhs: Expr) -> Expr {
+    fn apply(self, lhs: Expr, op_span: SourceSpan) -> Expr {
+        let span = lhs.span.join(op_span);
         match self {
-            Self::PostInc => Expr::post_inc(lhs),
-            Self::PostDec => Expr::post_dec(lhs),
-            Self::Call(args) => Expr::call(lhs, args),
-            Self::Index(index) => Expr::index(lhs, index),
-            Self::Member { field, deref } => Expr::member(lhs, field, deref),
+            Self::PostInc => Expr::post_inc(lhs).with_span(span),
+            Self::PostDec => Expr::post_dec(lhs).with_span(span),
+            Self::Call(args) => Expr::call(lhs, args).with_span(span),
+            Self::Index(index) => Expr::index(lhs, index).with_span(span),
+            Self::Member { field, deref } => Expr::member(lhs, field, deref).with_span(span),
         }
     }
 }
@@ -84,24 +91,40 @@ fn literal_expr_parser<'tokens, I>()
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
+    enum LiteralExprToken {
+        Int(u64, IntLiteralSuffix),
+        Float(f64),
+        Char(char),
+        String(String),
+    }
+
     choice((
         select! {
-            TokenKind::IntLiteral(value) => Expr::int(value),
-            TokenKind::UIntLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::UInt),
-            TokenKind::LongLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::Long),
-            TokenKind::ULongLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::ULong),
-            TokenKind::LongLongLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::LongLong),
-            TokenKind::ULongLongLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::ULongLong),
+            TokenKind::IntLiteral(value) => LiteralExprToken::Int(value, IntLiteralSuffix::Int),
+            TokenKind::UIntLiteral(value) => LiteralExprToken::Int(value, IntLiteralSuffix::UInt),
+            TokenKind::LongLiteral(value) => LiteralExprToken::Int(value, IntLiteralSuffix::Long),
+            TokenKind::ULongLiteral(value) => LiteralExprToken::Int(value, IntLiteralSuffix::ULong),
+            TokenKind::LongLongLiteral(value) => LiteralExprToken::Int(value, IntLiteralSuffix::LongLong),
+            TokenKind::ULongLongLiteral(value) => LiteralExprToken::Int(value, IntLiteralSuffix::ULongLong),
         },
         select! {
-            TokenKind::FloatLiteral(value) => Expr::float(value),
-            TokenKind::FloatLiteralF32(value) => Expr::float(value),
+            TokenKind::FloatLiteral(value) => LiteralExprToken::Float(value),
+            TokenKind::FloatLiteralF32(value) => LiteralExprToken::Float(value),
         },
         select! {
-            TokenKind::CharLiteral(value) => Expr::char(value),
-            TokenKind::StringLiteral(value) => Expr::string(value),
+            TokenKind::CharLiteral(value) => LiteralExprToken::Char(value),
+            TokenKind::StringLiteral(value) => LiteralExprToken::String(value),
         },
     ))
+    .map_with(|token, extra| {
+        let span = span_to_source(extra.span());
+        match token {
+            LiteralExprToken::Int(value, suffix) => Expr::int_with_base_and_span(value, suffix, span),
+            LiteralExprToken::Float(value) => Expr::float_with_span(value, span),
+            LiteralExprToken::Char(value) => Expr::char_with_span(value, span),
+            LiteralExprToken::String(value) => Expr::string_with_span(value, span),
+        }
+    })
 }
 
 fn identifier_expr_parser<'tokens, I>()
@@ -110,12 +133,13 @@ where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
     select! {
-        TokenKind::Identifier(name) => Expr::var(name),
+        TokenKind::Identifier(name) => name,
     }
+    .map_with(|name, extra| Expr::var_with_span(name, span_to_source(extra.span())))
 }
 
 fn prefix_expr_op_parser<'tokens, I>()
--> impl Parser<'tokens, I, PrefixExprOp, ParserExtra<'tokens, I>> + Clone
+-> impl Parser<'tokens, I, (PrefixExprOp, SourceSpan), ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -129,10 +153,11 @@ where
         just(TokenKind::Star).to(PrefixExprOp::Unary(UnaryOp::Deref)),
         just(TokenKind::Amp).to(PrefixExprOp::Unary(UnaryOp::AddressOf)),
     ))
+    .map_with(|op, extra| (op, span_to_source(extra.span())))
 }
 
 fn basic_postfix_expr_op_parser<'tokens, I>()
--> impl Parser<'tokens, I, PostfixExprOp, ParserExtra<'tokens, I>> + Clone
+-> impl Parser<'tokens, I, (PostfixExprOp, SourceSpan), ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -140,6 +165,7 @@ where
         just(TokenKind::PlusPlus).to(PostfixExprOp::PostInc),
         just(TokenKind::MinusMinus).to(PostfixExprOp::PostDec),
     ))
+    .map_with(|op, extra| (op, span_to_source(extra.span())))
 }
 
 fn assignment_op_parser<'tokens, I>()
@@ -278,7 +304,7 @@ where
 /// Parse function call postfix operator: `(arg0, arg1, ...)`.
 fn call_postfix_expr_op_parser<'tokens, I, P>(
     assignment: P,
-) -> impl Parser<'tokens, I, PostfixExprOp, ParserExtra<'tokens, I>> + Clone
+) -> impl Parser<'tokens, I, (PostfixExprOp, SourceSpan), ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
     P: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
@@ -289,25 +315,30 @@ where
         .collect::<Vec<_>>()
         .or_not()
         .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
-        .map(|args| PostfixExprOp::Call(args.unwrap_or_default()))
+        .map_with(|args, extra| {
+            (
+                PostfixExprOp::Call(args.unwrap_or_default()),
+                span_to_source(extra.span()),
+            )
+        })
 }
 
 /// Parse array subscript postfix operator: `[index_expr]`.
 fn index_postfix_expr_op_parser<'tokens, I, P>(
     index_expr: P,
-) -> impl Parser<'tokens, I, PostfixExprOp, ParserExtra<'tokens, I>> + Clone
+) -> impl Parser<'tokens, I, (PostfixExprOp, SourceSpan), ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
     P: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
 {
     index_expr
         .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
-        .map(PostfixExprOp::Index)
+        .map_with(|index, extra| (PostfixExprOp::Index(index), span_to_source(extra.span())))
 }
 
 /// Parse member access postfix operators: `.field` and `->field`.
 fn member_postfix_expr_op_parser<'tokens, I>()
--> impl Parser<'tokens, I, PostfixExprOp, ParserExtra<'tokens, I>> + Clone
+-> impl Parser<'tokens, I, (PostfixExprOp, SourceSpan), ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -322,6 +353,7 @@ where
             .ignore_then(select! { TokenKind::Identifier(name) => name })
             .map(|field| PostfixExprOp::Member { field, deref: true }),
     ))
+    .map_with(|op, extra| (op, span_to_source(extra.span())))
 }
 
 /// Parse postfix-expression from a primary-expression and repeated postfix operators.
@@ -348,7 +380,10 @@ where
 
     primary
         .then(postfix_op.repeated().collect::<Vec<_>>())
-        .map(|(base, ops)| ops.into_iter().fold(base, |lhs, op| op.apply(lhs)))
+        .map(|(base, ops)| {
+            ops.into_iter()
+                .fold(base, |lhs, (op, span)| op.apply(lhs, span))
+        })
 }
 
 /// Build `conditional-expression` and assignment chain on top of Pratt expressions.
@@ -414,11 +449,14 @@ where
                 assignment.clone(),
                 true,
             ))
-            .map(|(ty, init)| {
-                Expr::new(ExprKind::CompoundLiteral {
-                    ty: Box::new(ty),
-                    init: Box::new(init),
-                })
+            .map_with(|(ty, init), extra| {
+                Expr::new(
+                    ExprKind::CompoundLiteral {
+                        ty: Box::new(ty),
+                        init: Box::new(init),
+                    },
+                    span_to_source(extra.span()),
+                )
             });
 
         let primary = expr_atom_parser(grouped_expr.clone(), compound_literal);
@@ -429,25 +467,36 @@ where
                     type_name_parser()
                         .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
                 )
-                .map(|ty| Expr::new(ExprKind::SizeofType(Box::new(ty))));
+                .map_with(|ty, extra| {
+                    Expr::new(
+                        ExprKind::SizeofType(Box::new(ty)),
+                        span_to_source(extra.span()),
+                    )
+                });
 
-            let sizeof_expr = just(TokenKind::Sizeof)
-                .ignore_then(unary.clone())
-                .map(Expr::sizeof_expr);
+            let sizeof_expr =
+                just(TokenKind::Sizeof)
+                    .ignore_then(unary.clone())
+                    .map_with(|expr, extra| {
+                        Expr::sizeof_expr(expr).with_span(span_to_source(extra.span()))
+                    });
 
             let cast = type_name_parser()
                 .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
                 .then(unary.clone())
-                .map(|(ty, expr)| {
-                    Expr::new(ExprKind::Cast {
-                        ty: Box::new(ty),
-                        expr: Box::new(expr),
-                    })
+                .map_with(|(ty, expr), extra| {
+                    Expr::new(
+                        ExprKind::Cast {
+                            ty: Box::new(ty),
+                            expr: Box::new(expr),
+                        },
+                        span_to_source(extra.span()),
+                    )
                 });
 
             let prefix = prefix_expr_op_parser()
                 .then(unary.clone())
-                .map(|(op, rhs)| op.apply(rhs));
+                .map(|((op, op_span), rhs)| op.apply(rhs, op_span));
 
             let postfix = postfix_expr_parser(primary.clone(), assignment.clone());
 
@@ -660,19 +709,24 @@ where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
     let int_literal = select! {
-        TokenKind::IntLiteral(value) => Expr::int(value),
-        TokenKind::UIntLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::UInt),
-        TokenKind::LongLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::Long),
-        TokenKind::ULongLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::ULong),
-        TokenKind::LongLongLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::LongLong),
-        TokenKind::ULongLongLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::ULongLong),
-    };
+        TokenKind::IntLiteral(value) => (value, IntLiteralSuffix::Int),
+        TokenKind::UIntLiteral(value) => (value, IntLiteralSuffix::UInt),
+        TokenKind::LongLiteral(value) => (value, IntLiteralSuffix::Long),
+        TokenKind::ULongLiteral(value) => (value, IntLiteralSuffix::ULong),
+        TokenKind::LongLongLiteral(value) => (value, IntLiteralSuffix::LongLong),
+        TokenKind::ULongLongLiteral(value) => (value, IntLiteralSuffix::ULongLong),
+    }
+    .map_with(|(value, suffix), extra| {
+        Expr::int_with_base_and_span(value, suffix, span_to_source(extra.span()))
+    });
 
     choice((
         int_literal.clone(),
         just(TokenKind::Minus)
             .ignore_then(int_literal)
-            .map(|expr| Expr::unary(UnaryOp::Minus, expr)),
+            .map_with(|expr, extra| {
+                Expr::unary(UnaryOp::Minus, expr).with_span(span_to_source(extra.span()))
+            }),
     ))
     .boxed()
 }
@@ -688,18 +742,33 @@ where
             const_expr.clone(),
         );
 
+        enum ConstAtom {
+            Expr(Expr),
+            Char(char),
+            Ident(String),
+        }
+
         let atom = choice((
-            integer_literal_expr_parser(),
+            integer_literal_expr_parser().map(ConstAtom::Expr),
             select! {
-                TokenKind::CharLiteral(value) => Expr::char(value),
+                TokenKind::CharLiteral(value) => ConstAtom::Char(value),
             },
             select! {
-                TokenKind::Identifier(name) => Expr::var(name),
+                TokenKind::Identifier(name) => ConstAtom::Ident(name),
             },
             const_expr
                 .clone()
-                .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
-        ));
+                .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+                .map(ConstAtom::Expr),
+        ))
+        .map_with(|value, extra| {
+            let span = span_to_source(extra.span());
+            match value {
+                ConstAtom::Expr(expr) => expr,
+                ConstAtom::Char(ch) => Expr::char_with_span(ch, span),
+                ConstAtom::Ident(name) => Expr::var_with_span(name, span),
+            }
+        });
 
         let unary = recursive(|unary| {
             let sizeof_type = just(TokenKind::Sizeof)
@@ -708,23 +777,33 @@ where
                         .clone()
                         .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
                 )
-                .map(|ty| Expr::new(ExprKind::SizeofType(Box::new(ty))));
+                .map_with(|ty, extra| {
+                    Expr::new(
+                        ExprKind::SizeofType(Box::new(ty)),
+                        span_to_source(extra.span()),
+                    )
+                });
 
-            let sizeof_expr = just(TokenKind::Sizeof)
-                .ignore_then(unary.clone())
-                .map(Expr::sizeof_expr);
+            let sizeof_expr =
+                just(TokenKind::Sizeof)
+                    .ignore_then(unary.clone())
+                    .map_with(|expr, extra| {
+                        Expr::sizeof_expr(expr).with_span(span_to_source(extra.span()))
+                    });
 
             let prefix_op = choice((
                 just(TokenKind::Plus).to(UnaryOp::Plus),
                 just(TokenKind::Minus).to(UnaryOp::Minus),
                 just(TokenKind::Bang).to(UnaryOp::LogicalNot),
                 just(TokenKind::Tilde).to(UnaryOp::BitNot),
-            ));
+            ))
+            .map_with(|op, extra| (op, span_to_source(extra.span())));
 
             choice((
-                prefix_op
-                    .then(unary.clone())
-                    .map(|(op, expr)| Expr::unary(op, expr)),
+                prefix_op.then(unary.clone()).map(|((op, op_span), expr)| {
+                    let expr_span = expr.span;
+                    Expr::unary(op, expr).with_span(op_span.join(expr_span))
+                }),
                 sizeof_type,
                 sizeof_expr,
                 atom.clone(),
@@ -1831,7 +1910,8 @@ where
         .then_ignore(just(TokenKind::RBrace))
         .map_with(|(_, items), extra| {
             extra.state().pop_scope();
-            Stmt::Compound(CompoundStmt { items })
+            let span = span_to_source(extra.span());
+            Stmt::new(StmtKind::Compound(CompoundStmt { items, span }), span)
         })
         .labelled(ParserLabel::CompoundStatement.as_str())
 }
@@ -1846,9 +1926,12 @@ where
 {
     expr.or_not()
         .then_ignore(just(TokenKind::Semicolon))
-        .map(|expr| match expr {
-            Some(expr) => Stmt::Expr(expr),
-            None => Stmt::Empty,
+        .map_with(|expr, extra| {
+            let kind = match expr {
+                Some(expr) => StmtKind::Expr(expr),
+                None => StmtKind::Empty,
+            };
+            Stmt::new(kind, span_to_source(extra.span()))
         })
         .labelled(ParserLabel::ExpressionStatement.as_str())
 }
@@ -1864,7 +1947,7 @@ where
     just(TokenKind::Return)
         .ignore_then(expr.or_not())
         .then_ignore(just(TokenKind::Semicolon))
-        .map(Stmt::Return)
+        .map_with(|expr, extra| Stmt::new(StmtKind::Return(expr), span_to_source(extra.span())))
         .labelled(ParserLabel::ReturnStatement.as_str())
 }
 
@@ -1882,10 +1965,15 @@ where
         .ignore_then(expr.delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)))
         .then(statement.clone())
         .then(just(TokenKind::Else).ignore_then(statement).or_not())
-        .map(|((cond, then_branch), else_branch)| Stmt::If {
-            cond,
-            then_branch: Box::new(then_branch),
-            else_branch: else_branch.map(Box::new),
+        .map_with(|((cond, then_branch), else_branch), extra| {
+            Stmt::new(
+                StmtKind::If {
+                    cond,
+                    then_branch: Box::new(then_branch),
+                    else_branch: else_branch.map(Box::new),
+                },
+                span_to_source(extra.span()),
+            )
         })
         .labelled(ParserLabel::IfStatement.as_str())
 }
@@ -1903,9 +1991,14 @@ where
     just(TokenKind::While)
         .ignore_then(expr.delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)))
         .then(statement)
-        .map(|(cond, body)| Stmt::While {
-            cond,
-            body: Box::new(body),
+        .map_with(|(cond, body), extra| {
+            Stmt::new(
+                StmtKind::While {
+                    cond,
+                    body: Box::new(body),
+                },
+                span_to_source(extra.span()),
+            )
         })
         .labelled(ParserLabel::WhileStatement.as_str())
 }
@@ -1925,9 +2018,14 @@ where
         .then_ignore(just(TokenKind::While))
         .then(expr.delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)))
         .then_ignore(just(TokenKind::Semicolon))
-        .map(|(body, cond)| Stmt::DoWhile {
-            body: Box::new(body),
-            cond,
+        .map_with(|(body, cond), extra| {
+            Stmt::new(
+                StmtKind::DoWhile {
+                    body: Box::new(body),
+                    cond,
+                },
+                span_to_source(extra.span()),
+            )
         })
         .labelled(ParserLabel::DoWhileStatement.as_str())
 }
@@ -1975,12 +2073,15 @@ where
                 extra.state().pop_scope();
             }
 
-            Stmt::For {
-                init,
-                cond,
-                step,
-                body: Box::new(body),
-            }
+            Stmt::new(
+                StmtKind::For {
+                    init,
+                    cond,
+                    step,
+                    body: Box::new(body),
+                },
+                span_to_source(extra.span()),
+            )
         })
         .labelled(ParserLabel::ForStatement.as_str())
 }
@@ -1998,9 +2099,14 @@ where
     just(TokenKind::Switch)
         .ignore_then(expr.delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)))
         .then(statement)
-        .map(|(expr, body)| Stmt::Switch {
-            expr,
-            body: Box::new(body),
+        .map_with(|(expr, body), extra| {
+            Stmt::new(
+                StmtKind::Switch {
+                    expr,
+                    body: Box::new(body),
+                },
+                span_to_source(extra.span()),
+            )
         })
         .labelled(ParserLabel::SwitchStatement.as_str())
 }
@@ -2018,9 +2124,14 @@ where
         .ignore_then(constant_expression_parser())
         .then_ignore(just(TokenKind::Colon))
         .then(statement)
-        .map(|(expr, stmt)| Stmt::Case {
-            expr,
-            stmt: Box::new(stmt),
+        .map_with(|(expr, stmt), extra| {
+            Stmt::new(
+                StmtKind::Case {
+                    expr,
+                    stmt: Box::new(stmt),
+                },
+                span_to_source(extra.span()),
+            )
         })
         .labelled(ParserLabel::CaseStatement.as_str())
 }
@@ -2036,8 +2147,13 @@ where
     just(TokenKind::Default)
         .ignore_then(just(TokenKind::Colon))
         .ignore_then(statement)
-        .map(|stmt| Stmt::Default {
-            stmt: Box::new(stmt),
+        .map_with(|stmt, extra| {
+            Stmt::new(
+                StmtKind::Default {
+                    stmt: Box::new(stmt),
+                },
+                span_to_source(extra.span()),
+            )
         })
         .labelled(ParserLabel::DefaultStatement.as_str())
 }
@@ -2055,9 +2171,14 @@ where
     }
     .then_ignore(just(TokenKind::Colon))
     .then(statement)
-    .map(|(label, stmt)| Stmt::Label {
-        label,
-        stmt: Box::new(stmt),
+    .map_with(|(label, stmt), extra| {
+        Stmt::new(
+            StmtKind::Label {
+                label,
+                stmt: Box::new(stmt),
+            },
+            span_to_source(extra.span()),
+        )
     })
     .labelled(ParserLabel::LabelStatement.as_str())
 }
@@ -2070,7 +2191,7 @@ where
 {
     just(TokenKind::Break)
         .then_ignore(just(TokenKind::Semicolon))
-        .to(Stmt::Break)
+        .map_with(|_, extra| Stmt::new(StmtKind::Break, span_to_source(extra.span())))
         .labelled(ParserLabel::BreakStatement.as_str())
 }
 
@@ -2082,7 +2203,7 @@ where
 {
     just(TokenKind::Continue)
         .then_ignore(just(TokenKind::Semicolon))
-        .to(Stmt::Continue)
+        .map_with(|_, extra| Stmt::new(StmtKind::Continue, span_to_source(extra.span())))
         .labelled(ParserLabel::ContinueStatement.as_str())
 }
 
@@ -2097,7 +2218,7 @@ where
             TokenKind::Identifier(name) => name,
         })
         .then_ignore(just(TokenKind::Semicolon))
-        .map(Stmt::Goto)
+        .map_with(|name, extra| Stmt::new(StmtKind::Goto(name), span_to_source(extra.span())))
         .labelled(ParserLabel::GotoStatement.as_str())
 }
 
@@ -2167,7 +2288,10 @@ where
                 .collect::<Vec<_>>(),
         )
         .then_ignore(just(TokenKind::RBrace))
-        .map(|items| CompoundStmt { items })
+        .map_with(|items, extra| CompoundStmt {
+            items,
+            span: span_to_source(extra.span()),
+        })
         .labelled(ParserLabel::CompoundStatement.as_str())
 }
 
