@@ -1202,6 +1202,9 @@ fn type_name_decl_spec_parser<'tokens, I>()
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
+    // Restricted declaration-specifier set used by constant-expression type-name parsing.
+    // This path accepts builtin/typedef/tag references, but intentionally does not parse
+    // inline `struct/union/enum { ... }` definitions.
     let qualifier_piece = type_qualifier_parser().map(DeclSpecifierPiece::Qualifier);
     let first_type_piece = choice((
         builtin_type_specifier_parser(),
