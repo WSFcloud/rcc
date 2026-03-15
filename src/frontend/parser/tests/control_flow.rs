@@ -89,6 +89,22 @@ fn rejects_invalid_case_expressions() {
     }
 }
 
+#[test]
+fn parses_case_sizeof_with_abstract_array_type() {
+    let case_stmt = parse_statement_source("case sizeof(int[3]): break;");
+    let Stmt::Case { expr, .. } = case_stmt else {
+        panic!("expected case");
+    };
+    let ExprKind::SizeofType(ty) = expr.kind else {
+        panic!("expected sizeof(type)");
+    };
+    let declarator = ty.declarator.as_ref().expect("array declarator expected");
+    let DirectDeclarator::Array { size, .. } = declarator.direct.as_ref() else {
+        panic!("expected array declarator");
+    };
+    assert_eq!(size.as_ref(), &ArraySize::Expr(Expr::int(3)));
+}
+
 // Postfix expression tests
 #[test]
 fn parses_function_calls() {

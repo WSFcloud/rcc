@@ -158,6 +158,29 @@ fn parses_enum_complex_values() {
 }
 
 #[test]
+fn parses_enum_value_with_sizeof_abstract_array_type() {
+    let unit = parse_source("enum Bits { A = sizeof(int[3]) };");
+    let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+        panic!("expected enum");
+    };
+    let TypeSpecifier::Enum(enum_spec) = &decl.specifiers.ty[0] else {
+        panic!("expected enum");
+    };
+    let variants = enum_spec.variants.as_ref().expect("variants expected");
+    let Some(value) = &variants[0].value else {
+        panic!("expected enum value");
+    };
+    let ExprKind::SizeofType(ty) = &value.kind else {
+        panic!("expected sizeof(type)");
+    };
+    let declarator = ty.declarator.as_ref().expect("array declarator expected");
+    let DirectDeclarator::Array { size, .. } = declarator.direct.as_ref() else {
+        panic!("expected array declarator");
+    };
+    assert_eq!(size.as_ref(), &ArraySize::Expr(Expr::int(3)));
+}
+
+#[test]
 fn rejects_enum_redeclaring_typedef() {
     assert!(!parse_source_error("typedef int foo; enum { foo = 1 };").is_empty());
 }

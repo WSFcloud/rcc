@@ -663,51 +663,12 @@ fn constant_expression_parser<'tokens, I>()
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
-    let sizeof_type_spec = {
-        let qualifier_piece = type_qualifier_parser().map(DeclSpecifierPiece::Qualifier);
-        let first_type_piece = choice((
-            builtin_type_specifier_parser(),
-            typedef_name_type_specifier_parser(),
-            record_or_enum_tag_ref_type_specifier_parser(),
-        ))
-        .map(DeclSpecifierPiece::Type);
-        let tail_piece = choice((
-            qualifier_piece.clone(),
-            builtin_type_specifier_parser().map(DeclSpecifierPiece::Type),
-            typedef_name_type_specifier_parser().map(DeclSpecifierPiece::Type),
-            record_or_enum_tag_ref_type_specifier_parser().map(DeclSpecifierPiece::Type),
-        ));
-
-        qualifier_piece
-            .repeated()
-            .collect::<Vec<_>>()
-            .then(first_type_piece)
-            .then(tail_piece.repeated().collect::<Vec<_>>())
-            .map(|((mut prefix, first_ty), mut tail)| {
-                prefix.push(first_ty);
-                prefix.append(&mut tail);
-                assemble_decl_spec(prefix)
-            })
-    };
-
-    let sizeof_type_name = sizeof_type_spec
-        .then(
-            pointer_layers_parser()
-                .filter(|pointers| !pointers.is_empty())
-                .or_not(),
-        )
-        .map(|(specifiers, pointers)| TypeName {
-            specifiers,
-            declarator: pointers.map(|pointers| {
-                Box::new(Declarator {
-                    pointers,
-                    direct: Box::new(DirectDeclarator::Abstract),
-                })
-            }),
-        })
-        .boxed();
-
     recursive(|const_expr| {
+        let sizeof_type_name = type_name_with_decl_spec_and_size_expr_parser(
+            type_name_decl_spec_parser(),
+            const_expr.clone(),
+        );
+
         let atom = choice((
             integer_literal_expr_parser(),
             select! {
@@ -1176,24 +1137,27 @@ where
 /// Parse a `type-name` used by cast and `sizeof(type-name)`.
 ///
 /// This phase supports declaration specifiers and optional pointer layers.
-fn type_name_parser<'tokens, I>()
--> impl Parser<'tokens, I, TypeName, ParserExtra<'tokens, I>> + Clone
+fn type_name_with_decl_spec_and_size_expr_parser<'tokens, I, DS, SZ>(
+    decl_spec: DS,
+    size_expr: SZ,
+) -> impl Parser<'tokens, I, TypeName, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    DS: Parser<'tokens, I, DeclSpec, ParserExtra<'tokens, I>> + Clone + 'tokens,
+    SZ: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone + 'tokens,
 {
-    let type_name_array_suffix =
-        array_declarator_suffix_with_size_expr_parser(constant_expression_parser());
+    let type_name_array_suffix = array_declarator_suffix_with_size_expr_parser(size_expr);
 
     let type_name_parameter_declarator =
         pointer_ident_array_declarator_parser(type_name_array_suffix.clone());
 
-    let type_name_parameter =
-        decl_spec_parser()
-            .then(type_name_parameter_declarator)
-            .map(|(specifiers, declarator)| ParameterDecl {
-                specifiers,
-                declarator: declarator.map(Box::new),
-            });
+    let type_name_parameter = decl_spec
+        .clone()
+        .then(type_name_parameter_declarator)
+        .map(|(specifiers, declarator)| ParameterDecl {
+            specifiers,
+            declarator: declarator.map(Box::new),
+        });
 
     let type_name_function_params = function_params_list_parser(type_name_parameter);
 
@@ -1204,13 +1168,62 @@ where
 
     let abstract_declarator = abstract_declarator_with_suffix_parser(type_name_suffix);
 
-    decl_spec_parser()
+    decl_spec
         .then(abstract_declarator.or_not())
         .map(|(specifiers, declarator)| TypeName {
             specifiers,
             declarator: declarator.map(Box::new),
         })
         .boxed()
+}
+
+fn type_name_decl_spec_parser<'tokens, I>()
+-> impl Parser<'tokens, I, DeclSpec, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    let qualifier_piece = type_qualifier_parser().map(DeclSpecifierPiece::Qualifier);
+    let first_type_piece = choice((
+        builtin_type_specifier_parser(),
+        typedef_name_type_specifier_parser(),
+        record_or_enum_tag_ref_type_specifier_parser(),
+    ))
+    .map(DeclSpecifierPiece::Type);
+    let tail_piece = choice((
+        qualifier_piece.clone(),
+        builtin_type_specifier_parser().map(DeclSpecifierPiece::Type),
+        typedef_name_type_specifier_parser().map(DeclSpecifierPiece::Type),
+        record_or_enum_tag_ref_type_specifier_parser().map(DeclSpecifierPiece::Type),
+    ));
+
+    qualifier_piece
+        .repeated()
+        .collect::<Vec<_>>()
+        .then(first_type_piece)
+        .then(tail_piece.repeated().collect::<Vec<_>>())
+        .map(|((mut prefix, first_ty), mut tail)| {
+            prefix.push(first_ty);
+            prefix.append(&mut tail);
+            assemble_decl_spec(prefix)
+        })
+}
+
+fn type_name_with_size_expr_parser<'tokens, I, SZ>(
+    size_expr: SZ,
+) -> impl Parser<'tokens, I, TypeName, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    SZ: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone + 'tokens,
+{
+    type_name_with_decl_spec_and_size_expr_parser(decl_spec_parser(), size_expr)
+}
+
+fn type_name_parser<'tokens, I>()
+-> impl Parser<'tokens, I, TypeName, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    type_name_with_size_expr_parser(constant_expression_parser())
 }
 
 /// `(void)` means an empty prototype parameter list in C.
