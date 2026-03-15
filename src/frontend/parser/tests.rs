@@ -2073,6 +2073,24 @@ fn parses_variadic_function_with_unnamed_params() {
 }
 
 #[test]
+fn rejects_variadic_function_without_leading_parameter() {
+    let errors = parse_source_error("int f(, ...);");
+    assert!(
+        !errors.is_empty(),
+        "variadic parameter list should require at least one leading parameter"
+    );
+}
+
+#[test]
+fn rejects_variadic_function_with_void_as_only_fixed_parameter() {
+    let errors = parse_source_error("int f(void, ...);");
+    assert!(
+        !errors.is_empty(),
+        "variadic parameter list should reject `void` as the only fixed parameter"
+    );
+}
+
+#[test]
 fn parses_variadic_function_definition() {
     let unit = parse_source("int sum(int count, ...) { return 0; }");
     let ExternalDecl::FunctionDef(func) = &unit.items[0] else {

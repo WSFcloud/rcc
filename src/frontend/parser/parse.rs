@@ -818,20 +818,8 @@ where
             declarator: declarator.map(Box::new),
         });
 
-    let variadic_suffix = just(TokenKind::Comma)
-        .then(just(TokenKind::Ellipsis))
-        .or_not()
-        .map(|opt| opt.is_some());
-
-    let function_suffix = member_parameter
-        .separated_by(just(TokenKind::Comma))
-        .at_least(1)
-        .collect::<Vec<_>>()
-        .or_not()
-        .then(variadic_suffix)
-        .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
-        .map(|(params, variadic)| map_parameter_list(params, variadic))
-        .map(DirectDeclaratorSuffix::Function);
+    let function_suffix =
+        function_params_list_parser(member_parameter).map(DirectDeclaratorSuffix::Function);
 
     let array_size = constant_expression_parser()
         .map(ArraySize::Expr)
@@ -1207,19 +1195,7 @@ where
                 declarator: declarator.map(Box::new),
             });
 
-    let type_name_variadic_suffix = just(TokenKind::Comma)
-        .then(just(TokenKind::Ellipsis))
-        .or_not()
-        .map(|opt| opt.is_some());
-
-    let type_name_function_params = type_name_parameter
-        .separated_by(just(TokenKind::Comma))
-        .at_least(1)
-        .collect::<Vec<_>>()
-        .or_not()
-        .then(type_name_variadic_suffix)
-        .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
-        .map(|(params, variadic)| map_parameter_list(params, variadic));
+    let type_name_function_params = function_params_list_parser(type_name_parameter);
 
     let type_name_suffix = choice((
         type_name_function_params.map(DirectDeclaratorSuffix::Function),
@@ -1259,6 +1235,54 @@ fn map_parameter_list(params: Option<Vec<ParameterDecl>>, variadic: bool) -> Fun
     }
 }
 
+/// Parse the variadic suffix `, ...` in function parameter lists.
+///
+/// Returns `true` if the parameter list is variadic, `false` otherwise.
+fn variadic_suffix_parser<'tokens, I>()
+-> impl Parser<'tokens, I, bool, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    just(TokenKind::Comma)
+        .then(just(TokenKind::Ellipsis))
+        .or_not()
+        .map(|opt| opt.is_some())
+}
+
+/// Parse a function parameter list: `(param1, param2, ...)`.
+fn function_params_list_parser<'tokens, I, P>(
+    parameter: P,
+) -> impl Parser<'tokens, I, FunctionParams, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    P: Parser<'tokens, I, ParameterDecl, ParserExtra<'tokens, I>> + Clone + 'tokens,
+{
+    parameter
+        .separated_by(just(TokenKind::Comma))
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .or_not()
+        .then(variadic_suffix_parser())
+        .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+        .try_map(|(params, variadic), span| {
+            if variadic {
+                if params.is_none() {
+                    return Err(Rich::custom(
+                        span,
+                        "variadic parameter list requires at least one named or typed parameter",
+                    ));
+                }
+                if matches!(params.as_deref(), Some([param]) if is_void_parameter_decl(param)) {
+                    return Err(Rich::custom(
+                        span,
+                        "variadic parameter list cannot use `void` as the only fixed parameter",
+                    ));
+                }
+            }
+            Ok(map_parameter_list(params, variadic))
+        })
+}
+
 fn basic_parameter_declarator_parser<'tokens, I>()
 -> impl Parser<'tokens, I, Option<Declarator>, ParserExtra<'tokens, I>> + Clone
 where
@@ -1282,20 +1306,7 @@ where
             declarator: declarator.map(Box::new),
         });
 
-    let variadic_suffix = just(TokenKind::Comma)
-        .then(just(TokenKind::Ellipsis))
-        .or_not()
-        .map(|opt| opt.is_some());
-
-    parameter
-        .separated_by(just(TokenKind::Comma))
-        .at_least(1)
-        .collect::<Vec<_>>()
-        .or_not()
-        .then(variadic_suffix)
-        .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
-        .map(|(params, variadic)| map_parameter_list(params, variadic))
-        .boxed()
+    function_params_list_parser(parameter).boxed()
 }
 
 /// Parse an optional parameter declarator:
@@ -1352,20 +1363,7 @@ where
                 declarator: declarator.map(Box::new),
             });
 
-    let variadic_suffix = just(TokenKind::Comma)
-        .then(just(TokenKind::Ellipsis))
-        .or_not()
-        .map(|opt| opt.is_some());
-
-    parameter
-        .separated_by(just(TokenKind::Comma))
-        .at_least(1)
-        .collect::<Vec<_>>()
-        .or_not()
-        .then(variadic_suffix)
-        .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
-        .map(|(params, variadic)| map_parameter_list(params, variadic))
-        .boxed()
+    function_params_list_parser(parameter).boxed()
 }
 
 #[derive(Clone)]
