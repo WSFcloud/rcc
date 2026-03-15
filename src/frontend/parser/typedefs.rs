@@ -116,6 +116,7 @@ impl Typedefs {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn entries(&self) -> &[ScopeEntry] {
         &self.entries
     }
