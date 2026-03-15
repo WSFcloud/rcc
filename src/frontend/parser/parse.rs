@@ -257,16 +257,19 @@ where
 }
 
 /// Parse expression atoms: literals, identifiers, and parenthesized expressions.
-fn expr_atom_parser<'tokens, I, P>(
+fn expr_atom_parser<'tokens, I, P, C>(
     grouped_expr: P,
+    compound_literal: C,
 ) -> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
     P: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
+    C: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
 {
     choice((
         literal_expr_parser(),
         identifier_expr_parser(),
+        compound_literal,
         grouped_expr.delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
     ))
     .labelled(ParserLabel::Expr.as_str())
@@ -402,7 +405,23 @@ where
     let assign_op = assignment_op_parser();
 
     let assignment = recursive(|assignment| {
-        let primary = expr_atom_parser(grouped_expr.clone());
+        let compound_literal = type_name_parser()
+            .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+            // Compound literals must be followed by a braced initializer.
+            // Requiring braces here keeps `(type-name) expr` on the cast branch
+            // and removes the parse ambiguity between these two forms.
+            .then(initializer_parser_with_scalar_expr(
+                assignment.clone(),
+                true,
+            ))
+            .map(|(ty, init)| {
+                Expr::new(ExprKind::CompoundLiteral {
+                    ty: Box::new(ty),
+                    init: Box::new(init),
+                })
+            });
+
+        let primary = expr_atom_parser(grouped_expr.clone(), compound_literal);
 
         let unary = recursive(|unary| {
             let sizeof_type = just(TokenKind::Sizeof)
@@ -1151,13 +1170,14 @@ where
     let type_name_parameter_declarator =
         pointer_ident_array_declarator_parser(type_name_array_suffix.clone());
 
-    let type_name_parameter = decl_spec
-        .clone()
-        .then(type_name_parameter_declarator)
-        .map(|(specifiers, declarator)| ParameterDecl {
-            specifiers,
-            declarator: declarator.map(Box::new),
-        });
+    let type_name_parameter =
+        decl_spec
+            .clone()
+            .then(type_name_parameter_declarator)
+            .map(|(specifiers, declarator)| ParameterDecl {
+                specifiers,
+                declarator: declarator.map(Box::new),
+            });
 
     let type_name_function_params = function_params_list_parser(type_name_parameter);
 
@@ -1656,51 +1676,76 @@ fn bind_function_parameter_names(declarator: &Declarator, state: &mut Typedefs) 
 /// Parse initializer syntax:
 /// - scalar: `assignment-expression`
 /// - aggregate: `{ ... }`
+fn initializer_parser_with_scalar_expr<'tokens, I, E>(
+    scalar_expr: E,
+    require_braces: bool,
+) -> impl Parser<'tokens, I, Initializer, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    E: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone + 'tokens,
+{
+    let mut initializer = Recursive::declare();
+
+    let scalar = scalar_expr.map(|expr| Initializer {
+        kind: InitializerKind::Expr(expr),
+    });
+
+    let designator = choice((
+        constant_expression_parser()
+            .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
+            .map(Designator::Index),
+        just(TokenKind::Dot)
+            .ignore_then(select! {
+                TokenKind::Identifier(field) => field,
+            })
+            .map(Designator::Field),
+    ));
+
+    let initializer_item = designator
+        .repeated()
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .then_ignore(just(TokenKind::Assign))
+        .then(initializer.clone())
+        .map(|(designators, init)| InitializerItem { designators, init })
+        .or(initializer.clone().map(|init| InitializerItem {
+            designators: Vec::new(),
+            init,
+        }));
+
+    let aggregate_items = initializer_item
+        .separated_by(just(TokenKind::Comma))
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .then_ignore(just(TokenKind::Comma).or_not());
+
+    let aggregate = aggregate_items
+        .clone()
+        .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
+        .map(|items| Initializer {
+            kind: InitializerKind::Aggregate(items),
+        });
+
+    initializer.define(choice((aggregate, scalar)).boxed());
+
+    if require_braces {
+        aggregate_items
+            .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
+            .map(|items| Initializer {
+                kind: InitializerKind::Aggregate(items),
+            })
+            .boxed()
+    } else {
+        initializer.boxed()
+    }
+}
+
 fn initializer_parser<'tokens, I>()
 -> impl Parser<'tokens, I, Initializer, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
-    recursive(|initializer| {
-        let scalar = assignment_expression_parser().map(|expr| Initializer {
-            kind: InitializerKind::Expr(expr),
-        });
-
-        let designator = choice((
-            constant_expression_parser()
-                .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
-                .map(Designator::Index),
-            just(TokenKind::Dot)
-                .ignore_then(select! {
-                    TokenKind::Identifier(field) => field,
-                })
-                .map(Designator::Field),
-        ));
-
-        let initializer_item = designator
-            .repeated()
-            .at_least(1)
-            .collect::<Vec<_>>()
-            .then_ignore(just(TokenKind::Assign))
-            .then(initializer.clone())
-            .map(|(designators, init)| InitializerItem { designators, init })
-            .or(initializer.clone().map(|init| InitializerItem {
-                designators: Vec::new(),
-                init,
-            }));
-
-        let aggregate = initializer_item
-            .separated_by(just(TokenKind::Comma))
-            .at_least(1)
-            .collect::<Vec<_>>()
-            .then_ignore(just(TokenKind::Comma).or_not())
-            .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
-            .map(|items| Initializer {
-                kind: InitializerKind::Aggregate(items),
-            });
-
-        choice((aggregate, scalar))
-    })
+    initializer_parser_with_scalar_expr(assignment_expression_parser(), false)
 }
 
 /// Parse a declaration statement ending with `;`.

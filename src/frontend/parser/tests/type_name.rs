@@ -132,3 +132,53 @@ fn parses_function_pointer_with_array_param() {
     };
     assert_eq!(size.as_ref(), &ArraySize::Unspecified);
 }
+
+#[test]
+fn parses_compound_literal() {
+    let unit = parse_source("int f(void) { return (int){1}; }");
+    let ExternalDecl::FunctionDef(def) = &unit.items[0] else {
+        panic!("expected function");
+    };
+    let BlockItem::Stmt(Stmt::Return(Some(expr))) = &def.body.items[0] else {
+        panic!("expected return");
+    };
+    let ExprKind::CompoundLiteral { ty, init } = &expr.kind else {
+        panic!("expected compound literal");
+    };
+    assert_eq!(ty.specifiers.ty, vec![TypeSpecifier::Int]);
+    let InitializerKind::Aggregate(items) = &init.kind else {
+        panic!("expected aggregate initializer");
+    };
+    assert_eq!(items.len(), 1);
+    assert!(items[0].designators.is_empty());
+    assert_eq!(items[0].init.kind, InitializerKind::Expr(Expr::int(1)));
+}
+
+#[test]
+fn parses_compound_literal_with_member_postfix() {
+    let unit =
+        parse_source("struct S { int x; }; int f(void) { return ((struct S){ .x = 3 }).x; }");
+    let ExternalDecl::FunctionDef(def) = &unit.items[1] else {
+        panic!("expected function");
+    };
+    let BlockItem::Stmt(Stmt::Return(Some(expr))) = &def.body.items[0] else {
+        panic!("expected return");
+    };
+    let ExprKind::Member { base, field, deref } = &expr.kind else {
+        panic!("expected member access");
+    };
+    assert_eq!(field, "x");
+    assert!(!deref);
+    let ExprKind::CompoundLiteral { init, .. } = &base.kind else {
+        panic!("expected compound literal base");
+    };
+    let InitializerKind::Aggregate(items) = &init.kind else {
+        panic!("expected aggregate initializer");
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].designators,
+        vec![Designator::Field("x".to_string())]
+    );
+    assert_eq!(items[0].init.kind, InitializerKind::Expr(Expr::int(3)));
+}
