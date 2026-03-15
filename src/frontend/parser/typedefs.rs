@@ -76,15 +76,22 @@ impl Typedefs {
 
     /// Bind `name` in the current scope.
     ///
-    /// Previous binding in the same scope (if any) is recorded for rewind.
-    pub fn bind(&mut self, name: String, kind: BindingKind) {
-        let previous = self.scopes.insert(name.clone(), kind);
+    /// Returns `true` when a new binding was inserted. If the name already exists
+    /// in the current scope, the original binding is kept and this returns `false`.
+    pub fn bind(&mut self, name: String, kind: BindingKind) -> bool {
+        if self.scopes.insert_unique(name.clone(), kind).is_err() {
+            return false;
+        }
+
         self.entries.push(ScopeEntry::Bind {
             name: name.clone(),
             kind,
         });
-        self.undos
-            .push(UndoEntry::RestoreBinding { name, previous });
+        self.undos.push(UndoEntry::RestoreBinding {
+            name,
+            previous: None,
+        });
+        true
     }
 
     /// Check whether a visible binding of `name` is currently a typedef.
@@ -93,6 +100,19 @@ impl Typedefs {
             self.resolve_visible_binding(name),
             Some(BindingKind::Typedef)
         )
+    }
+
+    /// Check whether `name` is a typedef in the current (innermost) scope.
+    pub fn is_typedef_name_in_current_scope(&self, name: &str) -> bool {
+        matches!(
+            self.scopes.get_in_current_scope(name),
+            Some(BindingKind::Typedef)
+        )
+    }
+
+    /// Get the binding kind of `name` in the current (innermost) scope.
+    pub fn binding_in_current_scope(&self, name: &str) -> Option<BindingKind> {
+        self.scopes.get_in_current_scope(name).copied()
     }
 
     #[cfg(test)]
@@ -198,5 +218,13 @@ mod tests {
 
         assert!(state.is_typedef_name("T"));
         assert!(!state.is_typedef_name("X"));
+    }
+
+    #[test]
+    fn same_scope_duplicate_bind_keeps_original_binding() {
+        let mut state = Typedefs::default();
+        assert!(state.bind("T".to_string(), BindingKind::Typedef));
+        assert!(!state.bind("T".to_string(), BindingKind::Ordinary));
+        assert!(state.is_typedef_name("T"));
     }
 }

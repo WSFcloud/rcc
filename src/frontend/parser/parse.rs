@@ -1,10 +1,11 @@
 use crate::common::token::TokenKind;
 use crate::frontend::parser::ast::{
     ArraySize, AssignOp, BinaryOp, BlockItem, CompoundStmt, DeclSpec, Declaration, Declarator,
-    DirectDeclarator, Expr, ExprKind, ExternalDecl, ForInit, FunctionDef, FunctionParams,
-    FunctionSpecifier, InitDeclarator, Initializer, InitializerKind, IntLiteralSuffix,
-    ParameterDecl, Pointer, Stmt, StorageClass, TranslationUnit, TypeName, TypeQualifier,
-    TypeSpecifier, UnaryOp,
+    Designator, DirectDeclarator, EnumSpecifier, EnumVariant, Expr, ExprKind, ExternalDecl,
+    ForInit, FunctionDef, FunctionParams, FunctionSpecifier, InitDeclarator, Initializer,
+    InitializerItem, InitializerKind, IntLiteralSuffix, ParameterDecl, Pointer, RecordKind,
+    RecordMemberDecl, RecordSpecifier, Stmt, StorageClass, TranslationUnit, TypeName,
+    TypeQualifier, TypeSpecifier, UnaryOp,
 };
 use crate::frontend::parser::labels::ParserLabel;
 use crate::frontend::parser::typedefs::{BindingKind, Typedefs};
@@ -512,6 +513,580 @@ enum DeclSpecifierPiece {
     Type(TypeSpecifier),
 }
 
+fn assemble_decl_spec(pieces: Vec<DeclSpecifierPiece>) -> DeclSpec {
+    let mut specifiers = DeclSpec {
+        storage: Vec::new(),
+        qualifiers: Vec::new(),
+        function: Vec::new(),
+        ty: Vec::new(),
+    };
+
+    for piece in pieces {
+        match piece {
+            DeclSpecifierPiece::Storage(storage) => specifiers.storage.push(storage),
+            DeclSpecifierPiece::Qualifier(qualifier) => specifiers.qualifiers.push(qualifier),
+            DeclSpecifierPiece::Function(function_specifier) => {
+                specifiers.function.push(function_specifier)
+            }
+            DeclSpecifierPiece::Type(ty) => specifiers.ty.push(ty),
+        }
+    }
+
+    specifiers
+}
+
+fn typedef_name_type_specifier_parser<'tokens, I>()
+-> impl Parser<'tokens, I, TypeSpecifier, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    chumsky::primitive::select(
+        |token: TokenKind,
+         extra: &mut chumsky::input::MapExtra<'tokens, '_, I, ParserExtra<'tokens, I>>| {
+            match token {
+                TokenKind::Identifier(name) if extra.state().is_typedef_name(&name) => {
+                    Some(TypeSpecifier::TypedefName(name))
+                }
+                _ => None,
+            }
+        },
+    )
+    .boxed()
+}
+
+fn builtin_type_specifier_parser<'tokens, I>()
+-> impl Parser<'tokens, I, TypeSpecifier, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    choice((
+        just(TokenKind::Void).to(TypeSpecifier::Void),
+        just(TokenKind::Char).to(TypeSpecifier::Char),
+        just(TokenKind::Short).to(TypeSpecifier::Short),
+        just(TokenKind::Int).to(TypeSpecifier::Int),
+        just(TokenKind::Long).to(TypeSpecifier::Long),
+        just(TokenKind::Float).to(TypeSpecifier::Float),
+        just(TokenKind::Double).to(TypeSpecifier::Double),
+        just(TokenKind::Signed).to(TypeSpecifier::Signed),
+        just(TokenKind::Unsigned).to(TypeSpecifier::Unsigned),
+    ))
+    .boxed()
+}
+
+fn record_or_enum_tag_ref_type_specifier_parser<'tokens, I>()
+-> impl Parser<'tokens, I, TypeSpecifier, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    let tag = select! {
+        TokenKind::Identifier(name) => name,
+    };
+
+    let record_ref = choice((
+        just(TokenKind::Struct).to(RecordKind::Struct),
+        just(TokenKind::Union).to(RecordKind::Union),
+    ))
+    .then(tag.clone())
+    .map(|(kind, tag)| {
+        TypeSpecifier::StructOrUnion(RecordSpecifier {
+            kind,
+            tag: Some(tag),
+            members: None,
+        })
+    });
+
+    let enum_ref = just(TokenKind::Enum).ignore_then(tag).map(|tag| {
+        TypeSpecifier::Enum(EnumSpecifier {
+            tag: Some(tag),
+            variants: None,
+        })
+    });
+
+    choice((record_ref, enum_ref)).boxed()
+}
+
+fn bind_enum_variants(enum_spec: &EnumSpecifier, state: &mut Typedefs) {
+    let Some(variants) = &enum_spec.variants else {
+        return;
+    };
+
+    for variant in variants {
+        state.bind(variant.name.clone(), BindingKind::Ordinary);
+    }
+}
+
+fn enum_enumerator_name_parser<'tokens, I>()
+-> impl Parser<'tokens, I, String, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    chumsky::primitive::select(
+        |token: TokenKind,
+         extra: &mut chumsky::input::MapExtra<'tokens, '_, I, ParserExtra<'tokens, I>>| {
+            match token {
+                TokenKind::Identifier(name)
+                    if !extra.state().is_typedef_name_in_current_scope(&name) =>
+                {
+                    Some(name)
+                }
+                _ => None,
+            }
+        },
+    )
+}
+
+fn integer_literal_expr_parser<'tokens, I>()
+-> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    let int_literal = select! {
+        TokenKind::IntLiteral(value) => Expr::int(value),
+        TokenKind::UIntLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::UInt),
+        TokenKind::LongLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::Long),
+        TokenKind::ULongLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::ULong),
+        TokenKind::LongLongLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::LongLong),
+        TokenKind::ULongLongLiteral(value) => Expr::int_with_base(value, IntLiteralSuffix::ULongLong),
+    };
+
+    choice((
+        int_literal.clone(),
+        just(TokenKind::Minus)
+            .ignore_then(int_literal)
+            .map(|expr| Expr::unary(UnaryOp::Minus, expr)),
+    ))
+    .boxed()
+}
+
+fn constant_expression_parser<'tokens, I>()
+-> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    let sizeof_type_spec = {
+        let qualifier_piece = type_qualifier_parser().map(DeclSpecifierPiece::Qualifier);
+        let first_type_piece = choice((
+            builtin_type_specifier_parser(),
+            typedef_name_type_specifier_parser(),
+            record_or_enum_tag_ref_type_specifier_parser(),
+        ))
+        .map(DeclSpecifierPiece::Type);
+        let tail_piece = choice((
+            qualifier_piece.clone(),
+            builtin_type_specifier_parser().map(DeclSpecifierPiece::Type),
+            typedef_name_type_specifier_parser().map(DeclSpecifierPiece::Type),
+            record_or_enum_tag_ref_type_specifier_parser().map(DeclSpecifierPiece::Type),
+        ));
+
+        qualifier_piece
+            .repeated()
+            .collect::<Vec<_>>()
+            .then(first_type_piece)
+            .then(tail_piece.repeated().collect::<Vec<_>>())
+            .map(|((mut prefix, first_ty), mut tail)| {
+                prefix.push(first_ty);
+                prefix.append(&mut tail);
+                assemble_decl_spec(prefix)
+            })
+    };
+
+    let sizeof_type_name = sizeof_type_spec
+        .then(
+            pointer_layers_parser()
+                .filter(|pointers| !pointers.is_empty())
+                .or_not(),
+        )
+        .map(|(specifiers, pointers)| TypeName {
+            specifiers,
+            declarator: pointers.map(|pointers| {
+                Box::new(Declarator {
+                    pointers,
+                    direct: Box::new(DirectDeclarator::Abstract),
+                })
+            }),
+        })
+        .boxed();
+
+    recursive(|const_expr| {
+        let atom = choice((
+            integer_literal_expr_parser(),
+            select! {
+                TokenKind::CharLiteral(value) => Expr::char(value),
+            },
+            select! {
+                TokenKind::Identifier(name) => Expr::var(name),
+            },
+            const_expr
+                .clone()
+                .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
+        ));
+
+        let unary = recursive(|unary| {
+            let sizeof_type = just(TokenKind::Sizeof)
+                .ignore_then(
+                    sizeof_type_name
+                        .clone()
+                        .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen)),
+                )
+                .map(|ty| Expr::new(ExprKind::SizeofType(Box::new(ty))));
+
+            let sizeof_expr = just(TokenKind::Sizeof)
+                .ignore_then(unary.clone())
+                .map(Expr::sizeof_expr);
+
+            let prefix_op = choice((
+                just(TokenKind::Plus).to(UnaryOp::Plus),
+                just(TokenKind::Minus).to(UnaryOp::Minus),
+                just(TokenKind::Bang).to(UnaryOp::LogicalNot),
+                just(TokenKind::Tilde).to(UnaryOp::BitNot),
+            ));
+
+            choice((
+                prefix_op
+                    .then(unary.clone())
+                    .map(|(op, expr)| Expr::unary(op, expr)),
+                sizeof_type,
+                sizeof_expr,
+                atom.clone(),
+            ))
+        });
+
+        binary_pratt_expr_parser(unary)
+    })
+    .boxed()
+}
+
+fn record_member_declarator_suffix_parser<'tokens, I>()
+-> impl Parser<'tokens, I, DirectDeclaratorSuffix, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    let member_param_decl_spec = {
+        let storage = just(TokenKind::Register)
+            .to(StorageClass::Register)
+            .map(DeclSpecifierPiece::Storage);
+        let qualifiers = type_qualifier_parser().map(DeclSpecifierPiece::Qualifier);
+        let non_type_piece = choice((storage, qualifiers.clone()));
+        let first_type_piece = choice((
+            builtin_type_specifier_parser(),
+            typedef_name_type_specifier_parser(),
+            record_or_enum_tag_ref_type_specifier_parser(),
+        ))
+        .map(DeclSpecifierPiece::Type);
+        let tail_piece = choice((
+            non_type_piece.clone(),
+            builtin_type_specifier_parser().map(DeclSpecifierPiece::Type),
+            typedef_name_type_specifier_parser().map(DeclSpecifierPiece::Type),
+            record_or_enum_tag_ref_type_specifier_parser().map(DeclSpecifierPiece::Type),
+        ));
+
+        non_type_piece
+            .repeated()
+            .collect::<Vec<_>>()
+            .then(first_type_piece)
+            .then(tail_piece.repeated().collect::<Vec<_>>())
+            .map(|((mut prefix, first_ty), mut tail)| {
+                prefix.push(first_ty);
+                prefix.append(&mut tail);
+                assemble_decl_spec(prefix)
+            })
+    };
+
+    let member_parameter = member_param_decl_spec
+        .then(
+            pointer_layers_parser()
+                .then(
+                    select! {
+                        TokenKind::Identifier(name) => name,
+                    }
+                    .or_not(),
+                )
+                .map(|(pointers, name)| match name {
+                    Some(name) => Some(Declarator {
+                        pointers,
+                        direct: Box::new(DirectDeclarator::Ident(name)),
+                    }),
+                    None if pointers.is_empty() => None,
+                    None => Some(Declarator {
+                        pointers,
+                        direct: Box::new(DirectDeclarator::Abstract),
+                    }),
+                }),
+        )
+        .map(|(specifiers, declarator)| ParameterDecl {
+            specifiers,
+            declarator: declarator.map(Box::new),
+        });
+
+    let function_suffix = member_parameter
+        .separated_by(just(TokenKind::Comma))
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .or_not()
+        .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+        .map(map_parameter_list)
+        .map(DirectDeclaratorSuffix::Function);
+
+    let array_size = constant_expression_parser()
+        .map(ArraySize::Expr)
+        .or_not()
+        .map(|size| size.unwrap_or(ArraySize::Unspecified));
+
+    let array_suffix = array_size
+        .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
+        .map(DirectDeclaratorSuffix::Array);
+
+    choice((function_suffix, array_suffix)).boxed()
+}
+
+fn record_member_declarator_parser<'tokens, I>()
+-> impl Parser<'tokens, I, Declarator, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    recursive(|declarator| {
+        let direct_ident = select! {
+            TokenKind::Identifier(name) => DirectDeclarator::Ident(name),
+        };
+
+        let direct_grouped = declarator
+            .clone()
+            .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
+            .map(|decl| DirectDeclarator::Grouped(Box::new(decl)));
+
+        let direct_base = choice((direct_ident, direct_grouped));
+
+        let direct = direct_base
+            .then(
+                record_member_declarator_suffix_parser()
+                    .repeated()
+                    .collect::<Vec<_>>(),
+            )
+            .map(|(base, suffixes)| fold_direct_declarator_suffixes(base, suffixes));
+
+        pointer_layers_parser()
+            .then(direct)
+            .map(|(pointers, direct)| Declarator {
+                pointers,
+                direct: Box::new(direct),
+            })
+    })
+    .boxed()
+}
+
+fn record_member_declaration_parser<'tokens, I>()
+-> impl Parser<'tokens, I, RecordMemberDecl, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    let mut member_decl = Recursive::declare();
+    let mut member_type_spec = Recursive::declare();
+
+    let tag = select! {
+        TokenKind::Identifier(name) => name,
+    }
+    .or_not();
+
+    let nested_record_spec = choice((
+        just(TokenKind::Struct).to(RecordKind::Struct),
+        just(TokenKind::Union).to(RecordKind::Union),
+    ))
+    .then(tag.clone())
+    .then(
+        member_decl
+            .clone()
+            .repeated()
+            .collect::<Vec<_>>()
+            .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
+            .or_not(),
+    )
+    .try_map(|((kind, tag), members), span| {
+        if tag.is_none() && members.is_none() {
+            return Err(Rich::custom(
+                span,
+                "struct/union specifier requires a tag or a definition",
+            ));
+        }
+
+        Ok(TypeSpecifier::StructOrUnion(RecordSpecifier {
+            kind,
+            tag,
+            members,
+        }))
+    });
+
+    let nested_enum_spec = just(TokenKind::Enum)
+        .ignore_then(tag)
+        .then(
+            enum_enumerator_name_parser()
+                .then(
+                    just(TokenKind::Assign)
+                        .ignore_then(constant_expression_parser())
+                        .or_not(),
+                )
+                .map(|(name, value)| EnumVariant { name, value })
+                .separated_by(just(TokenKind::Comma))
+                .at_least(1)
+                .collect::<Vec<_>>()
+                .then_ignore(just(TokenKind::Comma).or_not())
+                .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
+                .or_not(),
+        )
+        .try_map(|(tag, variants), span| {
+            if tag.is_none() && variants.is_none() {
+                return Err(Rich::custom(
+                    span,
+                    "enum specifier requires a tag or a definition",
+                ));
+            }
+
+            Ok(TypeSpecifier::Enum(EnumSpecifier { tag, variants }))
+        })
+        .map_with(|ty, extra| {
+            if let TypeSpecifier::Enum(enum_spec) = &ty {
+                bind_enum_variants(enum_spec, extra.state());
+            }
+            ty
+        });
+
+    member_type_spec.define(
+        choice((
+            builtin_type_specifier_parser(),
+            typedef_name_type_specifier_parser(),
+            nested_record_spec,
+            nested_enum_spec,
+            record_or_enum_tag_ref_type_specifier_parser(),
+        ))
+        .boxed(),
+    );
+
+    let qualifiers = type_qualifier_parser().map(DeclSpecifierPiece::Qualifier);
+    let first_ty = member_type_spec.clone().map(DeclSpecifierPiece::Type);
+    let tail_piece = choice((
+        qualifiers.clone(),
+        member_type_spec.map(DeclSpecifierPiece::Type),
+    ));
+
+    member_decl.define(
+        qualifiers
+            .repeated()
+            .collect::<Vec<_>>()
+            .then(first_ty)
+            .then(tail_piece.repeated().collect::<Vec<_>>())
+            .map(
+                |((mut prefix, first_ty), mut tail): (
+                    (Vec<DeclSpecifierPiece>, DeclSpecifierPiece),
+                    Vec<DeclSpecifierPiece>,
+                )| {
+                    prefix.push(first_ty);
+                    prefix.append(&mut tail);
+                    assemble_decl_spec(prefix)
+                },
+            )
+            .then(
+                record_member_declarator_parser()
+                    .separated_by(just(TokenKind::Comma))
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(just(TokenKind::Semicolon))
+            .map(|(specifiers, declarators)| RecordMemberDecl {
+                specifiers,
+                declarators,
+            }),
+    );
+
+    member_decl.boxed()
+}
+
+fn record_specifier_parser<'tokens, I>()
+-> impl Parser<'tokens, I, TypeSpecifier, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    let kind = choice((
+        just(TokenKind::Struct).to(RecordKind::Struct),
+        just(TokenKind::Union).to(RecordKind::Union),
+    ));
+
+    let tag = select! {
+        TokenKind::Identifier(name) => name,
+    }
+    .or_not();
+
+    let members = record_member_declaration_parser()
+        .repeated()
+        .collect::<Vec<_>>()
+        .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
+        .or_not();
+
+    kind.then(tag)
+        .then(members)
+        .try_map(|((kind, tag), members), span| {
+            if tag.is_none() && members.is_none() {
+                return Err(Rich::custom(
+                    span,
+                    "struct/union specifier requires a tag or a definition",
+                ));
+            }
+
+            Ok(TypeSpecifier::StructOrUnion(RecordSpecifier {
+                kind,
+                tag,
+                members,
+            }))
+        })
+        .boxed()
+}
+
+fn enum_specifier_parser<'tokens, I>()
+-> impl Parser<'tokens, I, TypeSpecifier, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
+    let tag = select! {
+        TokenKind::Identifier(name) => name,
+    }
+    .or_not();
+
+    let enumerator = enum_enumerator_name_parser()
+        .then(
+            just(TokenKind::Assign)
+                .ignore_then(constant_expression_parser())
+                .or_not(),
+        )
+        .map(|(name, value)| EnumVariant { name, value });
+
+    let variants = enumerator
+        .separated_by(just(TokenKind::Comma))
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .then_ignore(just(TokenKind::Comma).or_not())
+        .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
+        .or_not();
+
+    just(TokenKind::Enum)
+        .ignore_then(tag)
+        .then(variants)
+        .try_map(|(tag, variants), span| {
+            if tag.is_none() && variants.is_none() {
+                return Err(Rich::custom(
+                    span,
+                    "enum specifier requires a tag or a definition",
+                ));
+            }
+
+            Ok(TypeSpecifier::Enum(EnumSpecifier { tag, variants }))
+        })
+        .map_with(|ty, extra| {
+            if let TypeSpecifier::Enum(enum_spec) = &ty {
+                bind_enum_variants(enum_spec, extra.state());
+            }
+            ty
+        })
+        .boxed()
+}
+
 /// Parse declaration specifiers and keep the original sequence information
 /// grouped by category for later semantic validation.
 fn decl_spec_parser<'tokens, I>()
@@ -533,32 +1108,19 @@ where
         .to(FunctionSpecifier::Inline)
         .map(DeclSpecifierPiece::Function);
 
-    let typedef_name = chumsky::primitive::select(
-        |token: TokenKind,
-         extra: &mut chumsky::input::MapExtra<'tokens, '_, I, ParserExtra<'tokens, I>>| {
-            match token {
-                TokenKind::Identifier(name) if extra.state().is_typedef_name(&name) => {
-                    Some(TypeSpecifier::TypedefName(name))
-                }
-                _ => None,
-            }
-        },
-    );
-
-    let builtin_ty = choice((
-        just(TokenKind::Void).to(TypeSpecifier::Void),
-        just(TokenKind::Char).to(TypeSpecifier::Char),
-        just(TokenKind::Short).to(TypeSpecifier::Short),
-        just(TokenKind::Int).to(TypeSpecifier::Int),
-        just(TokenKind::Long).to(TypeSpecifier::Long),
-        just(TokenKind::Float).to(TypeSpecifier::Float),
-        just(TokenKind::Double).to(TypeSpecifier::Double),
-        just(TokenKind::Signed).to(TypeSpecifier::Signed),
-        just(TokenKind::Unsigned).to(TypeSpecifier::Unsigned),
-    ));
+    let builtin_ty = builtin_type_specifier_parser();
+    let typedef_name = typedef_name_type_specifier_parser();
+    let record_specifier = record_specifier_parser();
+    let enum_specifier = enum_specifier_parser();
 
     let non_type_piece = choice((storage, qualifiers, function_specifier));
-    let first_type_piece = choice((builtin_ty.clone(), typedef_name)).map(DeclSpecifierPiece::Type);
+    let first_type_piece = choice((
+        builtin_ty.clone(),
+        typedef_name,
+        record_specifier,
+        enum_specifier,
+    ))
+    .map(DeclSpecifierPiece::Type);
     let tail_piece = choice((
         non_type_piece.clone(),
         builtin_ty.map(DeclSpecifierPiece::Type),
@@ -572,30 +1134,10 @@ where
         .map(|((mut prefix, first_ty), mut tail)| {
             prefix.push(first_ty);
             prefix.append(&mut tail);
-
-            let mut specifiers = DeclSpec {
-                storage: Vec::new(),
-                qualifiers: Vec::new(),
-                function: Vec::new(),
-                ty: Vec::new(),
-            };
-
-            for piece in prefix {
-                match piece {
-                    DeclSpecifierPiece::Storage(storage) => specifiers.storage.push(storage),
-                    DeclSpecifierPiece::Qualifier(qualifier) => {
-                        specifiers.qualifiers.push(qualifier)
-                    }
-                    DeclSpecifierPiece::Function(function_specifier) => {
-                        specifiers.function.push(function_specifier)
-                    }
-                    DeclSpecifierPiece::Type(ty) => specifiers.ty.push(ty),
-                }
-            }
-
-            specifiers
+            assemble_decl_spec(prefix)
         })
         .labelled(ParserLabel::DeclarationSpecifier.as_str())
+        .boxed()
 }
 
 fn pointer_ident_array_declarator_parser<'tokens, I, AS>(
@@ -648,17 +1190,10 @@ fn type_name_parser<'tokens, I>()
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
-    let type_name_array_size = choice((
-        select! {
-            TokenKind::IntLiteral(value) => ArraySize::Expr(Expr::int(value)),
-            TokenKind::UIntLiteral(value) => ArraySize::Expr(Expr::int_with_base(value, IntLiteralSuffix::UInt)),
-            TokenKind::LongLiteral(value) => ArraySize::Expr(Expr::int_with_base(value, IntLiteralSuffix::Long)),
-            TokenKind::ULongLiteral(value) => ArraySize::Expr(Expr::int_with_base(value, IntLiteralSuffix::ULong)),
-            TokenKind::LongLongLiteral(value) => ArraySize::Expr(Expr::int_with_base(value, IntLiteralSuffix::LongLong)),
-            TokenKind::ULongLongLiteral(value) => ArraySize::Expr(Expr::int_with_base(value, IntLiteralSuffix::ULongLong)),
-        },
-        empty().to(ArraySize::Unspecified),
-    ));
+    let type_name_array_size = constant_expression_parser()
+        .map(ArraySize::Expr)
+        .or_not()
+        .map(|size| size.unwrap_or(ArraySize::Unspecified));
 
     let type_name_parameter_declarator =
         pointer_ident_array_declarator_parser(type_name_array_size.clone());
@@ -996,13 +1531,31 @@ fn declaration_binding_kind(specifiers: &DeclSpec) -> BindingKind {
     }
 }
 
-fn bind_declaration_names(declaration: &Declaration, state: &mut Typedefs) {
+fn bind_declaration_names<'tokens, I>(
+    declaration: &Declaration,
+    extra: &mut chumsky::input::MapExtra<'tokens, '_, I, ParserExtra<'tokens, I>>,
+) -> Result<(), ParseError<'tokens>>
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+{
     let kind = declaration_binding_kind(&declaration.specifiers);
     for init_declarator in &declaration.declarators {
         if let Some(name) = declarator_name(&init_declarator.declarator) {
-            state.bind(name.to_string(), kind);
+            if let Some(existing_kind) = extra.state().binding_in_current_scope(name) {
+                if existing_kind != kind {
+                    return Err(Rich::custom(
+                        extra.span(),
+                        format!("conflicting declaration for '{name}' in the same scope"),
+                    ));
+                }
+                continue;
+            }
+
+            let _ = extra.state().bind(name.to_string(), kind);
         }
     }
+
+    Ok(())
 }
 
 fn function_params_from_direct_declarator(direct: &DirectDeclarator) -> Option<&FunctionParams> {
@@ -1034,14 +1587,53 @@ fn bind_function_parameter_names(declarator: &Declarator, state: &mut Typedefs) 
     }
 }
 
-/// Parse scalar initializer syntax: `= assignment-expression`.
+/// Parse initializer syntax:
+/// - scalar: `assignment-expression`
+/// - aggregate: `{ ... }`
 fn initializer_parser<'tokens, I>()
 -> impl Parser<'tokens, I, Initializer, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
-    assignment_expression_parser().map(|expr| Initializer {
-        kind: InitializerKind::Expr(expr),
+    recursive(|initializer| {
+        let scalar = assignment_expression_parser().map(|expr| Initializer {
+            kind: InitializerKind::Expr(expr),
+        });
+
+        let designator = choice((
+            constant_expression_parser()
+                .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
+                .map(Designator::Index),
+            just(TokenKind::Dot)
+                .ignore_then(select! {
+                    TokenKind::Identifier(field) => field,
+                })
+                .map(Designator::Field),
+        ));
+
+        let initializer_item = designator
+            .repeated()
+            .at_least(1)
+            .collect::<Vec<_>>()
+            .then_ignore(just(TokenKind::Assign))
+            .then(initializer.clone())
+            .map(|(designators, init)| InitializerItem { designators, init })
+            .or(initializer.clone().map(|init| InitializerItem {
+                designators: Vec::new(),
+                init,
+            }));
+
+        let aggregate = initializer_item
+            .separated_by(just(TokenKind::Comma))
+            .at_least(1)
+            .collect::<Vec<_>>()
+            .then_ignore(just(TokenKind::Comma).or_not())
+            .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
+            .map(|items| Initializer {
+                kind: InitializerKind::Aggregate(items),
+            });
+
+        choice((aggregate, scalar))
     })
 }
 
@@ -1064,16 +1656,18 @@ where
             init_declarator
                 .separated_by(just(TokenKind::Comma))
                 .at_least(1)
-                .collect::<Vec<_>>(),
+                .collect::<Vec<_>>()
+                .or_not()
+                .map(|declarators| declarators.unwrap_or_default()),
         )
         .then_ignore(just(TokenKind::Semicolon))
         .map(|(specifiers, declarators)| Declaration {
             specifiers,
             declarators,
         })
-        .map_with(|declaration, extra| {
-            bind_declaration_names(&declaration, extra.state());
-            declaration
+        .try_map_with(|declaration, extra| {
+            bind_declaration_names(&declaration, extra)?;
+            Ok(declaration)
         })
         .labelled(ParserLabel::Declaration.as_str())
 }
@@ -1297,19 +1891,17 @@ where
         .labelled(ParserLabel::SwitchStatement.as_str())
 }
 
-/// Parse `case expr: stmt`.
-fn case_statement_parser<'tokens, I, S, A>(
+/// Parse `case constant-expression: stmt`.
+fn case_statement_parser<'tokens, I, S>(
     statement: S,
-    assignment: A,
 ) -> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
     S: Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone,
-    A: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone,
 {
     just(TokenKind::Case)
         // `case` expects constant-expression (no comma-expression at top level).
-        .ignore_then(assignment)
+        .ignore_then(constant_expression_parser())
         .then_ignore(just(TokenKind::Colon))
         .then(statement)
         .map(|(expr, stmt)| Stmt::Case {
@@ -1396,14 +1988,12 @@ where
 }
 
 /// Parse the currently supported statement subset using shared expression parsers.
-fn statement_parser_with_expr<'tokens, I, E, A>(
+fn statement_parser_with_expr<'tokens, I, E>(
     expr: E,
-    assignment: A,
 ) -> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
     E: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone + 'tokens,
-    A: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone + 'tokens,
 {
     recursive(|statement| {
         let compound_stmt = compound_statement_parser(statement.clone());
@@ -1416,7 +2006,7 @@ where
             do_while_statement_parser(statement.clone(), expr.clone()),
             for_statement_parser(statement.clone(), expr.clone()),
             switch_statement_parser(statement.clone(), expr.clone()),
-            case_statement_parser(statement.clone(), assignment.clone()),
+            case_statement_parser(statement.clone()),
             default_statement_parser(statement.clone()),
             // Must appear before expression statement to parse `label: ...` correctly.
             label_statement_parser(statement.clone()),
@@ -1435,8 +2025,7 @@ where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
     let expr = expr_parser::<'tokens, I, true>();
-    let assignment = assignment_expression_parser::<'tokens, I>();
-    statement_parser_with_expr(expr, assignment)
+    statement_parser_with_expr(expr)
 }
 
 /// Parse one block item as either a declaration or a statement.
@@ -1482,13 +2071,22 @@ where
         // Lookahead: only treat as function definition when a body starts here.
         // The leading `{` is preserved for `statement_parser`.
         .then_ignore(just(TokenKind::LBrace).rewind())
-        .map_with(|(specifiers, declarator), extra| {
+        .try_map_with(|(specifiers, declarator), extra| {
             if let Some(name) = declarator_name(&declarator) {
-                extra.state().bind(name.to_string(), BindingKind::Ordinary);
+                if let Some(existing_kind) = extra.state().binding_in_current_scope(name) {
+                    if existing_kind != BindingKind::Ordinary {
+                        return Err(Rich::custom(
+                            extra.span(),
+                            format!("conflicting declaration for '{name}' in the same scope"),
+                        ));
+                    }
+                } else {
+                    let _ = extra.state().bind(name.to_string(), BindingKind::Ordinary);
+                }
             }
             extra.state().push_scope();
             bind_function_parameter_names(&declarator, extra.state());
-            (specifiers, declarator)
+            Ok((specifiers, declarator))
         })
         .then(function_body_parser())
         .map_with(|((specifiers, declarator), body), extra| {

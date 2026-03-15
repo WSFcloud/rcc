@@ -1,4 +1,5 @@
 use super::*;
+use crate::common::token::TokenKind;
 use crate::frontend::lexer::lexer_from_source;
 use crate::frontend::parser::ast::{ExprKind, Literal};
 use crate::frontend::parser::typedefs::ScopeEntry;
@@ -10,6 +11,19 @@ fn parse_source(src: &str) -> TranslationUnit {
         Stream::from_iter(tokens).map((src.len()..src.len()).into(), |(token, span)| (token, span));
 
     parse(stream).expect("source should parse")
+}
+
+fn parse_tokens(tokens: Vec<TokenKind>) -> TranslationUnit {
+    let token_count = tokens.len();
+    let stream = Stream::from_iter(tokens.into_iter().enumerate().map(|(idx, token)| {
+        let span: Span = (idx..idx + 1).into();
+        (token, span)
+    }))
+    .map((token_count..token_count).into(), |(token, span)| {
+        (token, span)
+    });
+
+    parse(stream).expect("token stream should parse")
 }
 
 fn parse_source_error(src: &str) -> Vec<ParseError<'_>> {
@@ -216,6 +230,465 @@ fn rejects_vla_marker_array_declaration() {
     assert!(
         !errors.is_empty(),
         "expected at least one parser error for VLA marker syntax"
+    );
+}
+
+#[test]
+fn parses_struct_definition_without_declarator() {
+    let unit = parse_source("struct Point { int x; int y; };");
+    let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+        panic!("expected declaration");
+    };
+
+    assert!(decl.declarators.is_empty());
+    assert_eq!(decl.specifiers.ty.len(), 1);
+    let TypeSpecifier::StructOrUnion(record) = &decl.specifiers.ty[0] else {
+        panic!("expected record type specifier");
+    };
+    assert_eq!(record.kind, RecordKind::Struct);
+    assert_eq!(record.tag.as_deref(), Some("Point"));
+
+    let members = record.members.as_ref().expect("record members expected");
+    assert_eq!(members.len(), 2);
+    assert_eq!(members[0].specifiers.ty, vec![TypeSpecifier::Int]);
+    assert_direct_ident(members[0].declarators[0].direct.as_ref(), "x");
+    assert_eq!(members[1].specifiers.ty, vec![TypeSpecifier::Int]);
+    assert_direct_ident(members[1].declarators[0].direct.as_ref(), "y");
+}
+
+#[test]
+fn parses_struct_members_with_complex_declarators() {
+    let unit = parse_source("struct Ops { int (*apply)(int, int); int data[2 + 1]; int *next; };");
+    let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+        panic!("expected declaration");
+    };
+
+    let TypeSpecifier::StructOrUnion(record) = &decl.specifiers.ty[0] else {
+        panic!("expected struct type specifier");
+    };
+    assert_eq!(record.kind, RecordKind::Struct);
+    let members = record.members.as_ref().expect("record members expected");
+    assert_eq!(members.len(), 3);
+
+    let apply_decl = &members[0].declarators[0];
+    let DirectDeclarator::Function { inner, params } = apply_decl.direct.as_ref() else {
+        panic!("expected function declarator member");
+    };
+    let DirectDeclarator::Grouped(grouped) = inner.as_ref() else {
+        panic!("expected grouped declarator for function pointer member");
+    };
+    assert_eq!(grouped.pointers.len(), 1);
+    assert_direct_ident(grouped.direct.as_ref(), "apply");
+    let FunctionParams::Prototype { params, variadic } = params else {
+        panic!("expected prototype parameter list");
+    };
+    assert!(!variadic);
+    assert_eq!(params.len(), 2);
+    assert_eq!(params[0].specifiers.ty, vec![TypeSpecifier::Int]);
+    assert_eq!(params[1].specifiers.ty, vec![TypeSpecifier::Int]);
+
+    let data_decl = &members[1].declarators[0];
+    let DirectDeclarator::Array { inner, size, .. } = data_decl.direct.as_ref() else {
+        panic!("expected array member declarator");
+    };
+    assert_direct_ident(inner.as_ref(), "data");
+    assert_eq!(
+        size.as_ref(),
+        &ArraySize::Expr(Expr::binary(Expr::int(2), BinaryOp::Add, Expr::int(1)))
+    );
+
+    let next_decl = &members[2].declarators[0];
+    assert_eq!(next_decl.pointers.len(), 1);
+    assert_direct_ident(next_decl.direct.as_ref(), "next");
+}
+
+#[test]
+fn parses_struct_member_function_pointer_params_with_register_and_qualifiers() {
+    let unit = parse_source("struct S { int (*fp)(register int n, const int *p); };");
+    let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+        panic!("expected declaration");
+    };
+
+    let TypeSpecifier::StructOrUnion(record) = &decl.specifiers.ty[0] else {
+        panic!("expected struct type specifier");
+    };
+    let members = record.members.as_ref().expect("record members expected");
+    let fp_decl = &members[0].declarators[0];
+
+    let DirectDeclarator::Function { inner, params } = fp_decl.direct.as_ref() else {
+        panic!("expected function declarator member");
+    };
+    let DirectDeclarator::Grouped(grouped) = inner.as_ref() else {
+        panic!("expected grouped declarator for function pointer member");
+    };
+    assert_eq!(grouped.pointers.len(), 1);
+    assert_direct_ident(grouped.direct.as_ref(), "fp");
+
+    let FunctionParams::Prototype { params, variadic } = params else {
+        panic!("expected prototype parameter list");
+    };
+    assert!(!variadic);
+    assert_eq!(params.len(), 2);
+    assert_eq!(params[0].specifiers.storage, vec![StorageClass::Register]);
+    assert_eq!(params[0].specifiers.ty, vec![TypeSpecifier::Int]);
+    let first_param_decl = params[0]
+        .declarator
+        .as_ref()
+        .expect("first parameter should have declarator");
+    assert_direct_ident(first_param_decl.direct.as_ref(), "n");
+
+    assert_eq!(params[1].specifiers.qualifiers, vec![TypeQualifier::Const]);
+    assert_eq!(params[1].specifiers.ty, vec![TypeSpecifier::Int]);
+    let second_param_decl = params[1]
+        .declarator
+        .as_ref()
+        .expect("second parameter should have declarator");
+    assert_eq!(second_param_decl.pointers.len(), 1);
+    assert_direct_ident(second_param_decl.direct.as_ref(), "p");
+}
+
+#[test]
+fn parses_union_members_with_complex_declarators() {
+    let unit = parse_source("union Payload { int i; int (*fp)(int); int values[3]; };");
+    let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+        panic!("expected declaration");
+    };
+
+    let TypeSpecifier::StructOrUnion(record) = &decl.specifiers.ty[0] else {
+        panic!("expected union type specifier");
+    };
+    assert_eq!(record.kind, RecordKind::Union);
+    let members = record.members.as_ref().expect("union members expected");
+    assert_eq!(members.len(), 3);
+
+    let fp_decl = &members[1].declarators[0];
+    let DirectDeclarator::Function { inner, params } = fp_decl.direct.as_ref() else {
+        panic!("expected function declarator member");
+    };
+    let DirectDeclarator::Grouped(grouped) = inner.as_ref() else {
+        panic!("expected grouped declarator for function pointer member");
+    };
+    assert_eq!(grouped.pointers.len(), 1);
+    assert_direct_ident(grouped.direct.as_ref(), "fp");
+    let FunctionParams::Prototype { params, variadic } = params else {
+        panic!("expected prototype parameter list");
+    };
+    assert!(!variadic);
+    assert_eq!(params.len(), 1);
+    assert_eq!(params[0].specifiers.ty, vec![TypeSpecifier::Int]);
+
+    let values_decl = &members[2].declarators[0];
+    let DirectDeclarator::Array { inner, size, .. } = values_decl.direct.as_ref() else {
+        panic!("expected array member declarator");
+    };
+    assert_direct_ident(inner.as_ref(), "values");
+    assert_eq!(size.as_ref(), &ArraySize::Expr(Expr::int(3)));
+}
+
+#[test]
+fn parses_member_array_size_with_identifier_constant_expression() {
+    let unit = parse_source("struct Buffer { int data[BUFSIZE]; };");
+    let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+        panic!("expected declaration");
+    };
+
+    let TypeSpecifier::StructOrUnion(record) = &decl.specifiers.ty[0] else {
+        panic!("expected struct type specifier");
+    };
+    let members = record.members.as_ref().expect("record members expected");
+    let data_decl = &members[0].declarators[0];
+    let DirectDeclarator::Array { inner, size, .. } = data_decl.direct.as_ref() else {
+        panic!("expected array member declarator");
+    };
+    assert_direct_ident(inner.as_ref(), "data");
+    assert_eq!(
+        size.as_ref(),
+        &ArraySize::Expr(Expr::var("BUFSIZE".to_string()))
+    );
+}
+
+#[test]
+fn rejects_initializer_with_empty_designator_before_assign() {
+    let errors = parse_source_error("int a[1] = { = 1 };");
+    assert!(
+        !errors.is_empty(),
+        "initializer item should require at least one designator before '='"
+    );
+}
+
+#[test]
+fn rejects_designator_index_with_assignment_expression() {
+    let errors = parse_source_error("int x = 0; int arr[3] = { [x = 1] = 2 };");
+    assert!(
+        !errors.is_empty(),
+        "designator index should parse as constant-expression, not assignment-expression"
+    );
+}
+
+#[test]
+fn parses_union_designated_initializer() {
+    let unit = parse_source("union Value { int i; char c; }; union Value v = { .c = 1 };");
+    assert_eq!(unit.items.len(), 2);
+
+    let ExternalDecl::Declaration(ty_decl) = &unit.items[0] else {
+        panic!("expected record declaration");
+    };
+    let TypeSpecifier::StructOrUnion(record) = &ty_decl.specifiers.ty[0] else {
+        panic!("expected union type specifier");
+    };
+    assert_eq!(record.kind, RecordKind::Union);
+    assert_eq!(record.tag.as_deref(), Some("Value"));
+
+    let ExternalDecl::Declaration(var_decl) = &unit.items[1] else {
+        panic!("expected variable declaration");
+    };
+    assert_eq!(var_decl.declarators.len(), 1);
+
+    let init = var_decl.declarators[0]
+        .init
+        .as_ref()
+        .expect("initializer should exist");
+    let InitializerKind::Aggregate(items) = &init.kind else {
+        panic!("expected aggregate initializer");
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].designators,
+        vec![Designator::Field("c".to_string())]
+    );
+    assert_eq!(items[0].init.kind, InitializerKind::Expr(Expr::int(1)));
+}
+
+#[test]
+fn parses_nested_record_and_enum_definitions_in_members() {
+    let unit = parse_source(
+        "struct Outer { struct Inner { int x; } inner; enum Kind { A = 1 << 2, B } kind; };",
+    );
+    let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+        panic!("expected declaration");
+    };
+    let TypeSpecifier::StructOrUnion(outer) = &decl.specifiers.ty[0] else {
+        panic!("expected outer struct");
+    };
+    let members = outer.members.as_ref().expect("outer members expected");
+    assert_eq!(members.len(), 2);
+
+    let TypeSpecifier::StructOrUnion(inner_spec) = &members[0].specifiers.ty[0] else {
+        panic!("expected nested struct specifier");
+    };
+    assert_eq!(inner_spec.tag.as_deref(), Some("Inner"));
+    let inner_members = inner_spec
+        .members
+        .as_ref()
+        .expect("nested struct members expected");
+    assert_eq!(inner_members.len(), 1);
+    assert_eq!(inner_members[0].specifiers.ty, vec![TypeSpecifier::Int]);
+    assert_direct_ident(inner_members[0].declarators[0].direct.as_ref(), "x");
+    assert_direct_ident(members[0].declarators[0].direct.as_ref(), "inner");
+
+    let TypeSpecifier::Enum(kind_spec) = &members[1].specifiers.ty[0] else {
+        panic!("expected nested enum specifier");
+    };
+    assert_eq!(kind_spec.tag.as_deref(), Some("Kind"));
+    let variants = kind_spec
+        .variants
+        .as_ref()
+        .expect("nested enum variants expected");
+    assert_eq!(variants.len(), 2);
+    assert_eq!(variants[0].name, "A");
+    assert_eq!(
+        variants[0].value,
+        Some(Expr::binary(Expr::int(1), BinaryOp::Shl, Expr::int(2)))
+    );
+    assert_eq!(variants[1].name, "B");
+    assert_direct_ident(members[1].declarators[0].direct.as_ref(), "kind");
+}
+
+#[test]
+fn parses_enum_definition_and_initializer_use() {
+    let unit = parse_source("enum Color { Red, Green = 3, Blue, }; enum Color c = Green;");
+    assert_eq!(unit.items.len(), 2);
+
+    let ExternalDecl::Declaration(enum_decl) = &unit.items[0] else {
+        panic!("expected enum declaration");
+    };
+    assert!(enum_decl.declarators.is_empty());
+    let TypeSpecifier::Enum(enum_spec) = &enum_decl.specifiers.ty[0] else {
+        panic!("expected enum specifier");
+    };
+    assert_eq!(enum_spec.tag.as_deref(), Some("Color"));
+    let variants = enum_spec.variants.as_ref().expect("enum variants expected");
+    assert_eq!(variants.len(), 3);
+    assert_eq!(variants[0].name, "Red");
+    assert_eq!(variants[0].value, None);
+    assert_eq!(variants[1].name, "Green");
+    assert_eq!(variants[1].value, Some(Expr::int(3)));
+    assert_eq!(variants[2].name, "Blue");
+
+    let ExternalDecl::Declaration(var_decl) = &unit.items[1] else {
+        panic!("expected enum variable declaration");
+    };
+    let init = var_decl.declarators[0]
+        .init
+        .as_ref()
+        .expect("enum variable initializer expected");
+    assert_eq!(
+        init.kind,
+        InitializerKind::Expr(Expr::var("Green".to_string()))
+    );
+}
+
+#[test]
+fn parses_enum_value_constant_expressions() {
+    let unit = parse_source("enum Bits { A = 1 << 2, B = A + 3, C = (B & 7), D = sizeof(int) };");
+    let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+        panic!("expected enum declaration");
+    };
+    let TypeSpecifier::Enum(enum_spec) = &decl.specifiers.ty[0] else {
+        panic!("expected enum specifier");
+    };
+    let variants = enum_spec.variants.as_ref().expect("enum variants expected");
+    assert_eq!(variants.len(), 4);
+    assert_eq!(
+        variants[0].value,
+        Some(Expr::binary(Expr::int(1), BinaryOp::Shl, Expr::int(2)))
+    );
+    assert_eq!(
+        variants[1].value,
+        Some(Expr::binary(
+            Expr::var("A".to_string()),
+            BinaryOp::Add,
+            Expr::int(3)
+        ))
+    );
+    assert_eq!(
+        variants[2].value,
+        Some(Expr::binary(
+            Expr::var("B".to_string()),
+            BinaryOp::BitAnd,
+            Expr::int(7)
+        ))
+    );
+    let Some(Expr {
+        kind: ExprKind::SizeofType(ty),
+    }) = variants[3].value.as_ref()
+    else {
+        panic!("expected sizeof(type-name) enum value");
+    };
+    assert_eq!(ty.specifiers.ty, vec![TypeSpecifier::Int]);
+}
+
+#[test]
+fn parses_enum_value_character_literals() {
+    let unit = parse_tokens(vec![
+        TokenKind::Enum,
+        TokenKind::LBrace,
+        TokenKind::Identifier("LETTER_A".to_string()),
+        TokenKind::Assign,
+        TokenKind::CharLiteral('A'),
+        TokenKind::Comma,
+        TokenKind::Identifier("LETTER_B".to_string()),
+        TokenKind::Assign,
+        TokenKind::CharLiteral('B'),
+        TokenKind::RBrace,
+        TokenKind::Semicolon,
+    ]);
+    let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+        panic!("expected enum declaration");
+    };
+    let TypeSpecifier::Enum(enum_spec) = &decl.specifiers.ty[0] else {
+        panic!("expected enum specifier");
+    };
+    let variants = enum_spec.variants.as_ref().expect("enum variants expected");
+    assert_eq!(variants.len(), 2);
+    assert_eq!(variants[0].name, "LETTER_A");
+    assert_eq!(variants[0].value, Some(Expr::char('A')));
+    assert_eq!(variants[1].name, "LETTER_B");
+    assert_eq!(variants[1].value, Some(Expr::char('B')));
+}
+
+#[test]
+fn parses_enum_sizeof_with_multi_specifier_type_name() {
+    let unit = parse_source("enum Sizes { A = sizeof(unsigned long), B = sizeof(const int *) };");
+    let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+        panic!("expected enum declaration");
+    };
+    let TypeSpecifier::Enum(enum_spec) = &decl.specifiers.ty[0] else {
+        panic!("expected enum specifier");
+    };
+    let variants = enum_spec.variants.as_ref().expect("enum variants expected");
+    assert_eq!(variants.len(), 2);
+
+    let Some(Expr {
+        kind: ExprKind::SizeofType(ty),
+    }) = variants[0].value.as_ref()
+    else {
+        panic!("expected sizeof(type-name) for first variant");
+    };
+    assert_eq!(
+        ty.specifiers.ty,
+        vec![TypeSpecifier::Unsigned, TypeSpecifier::Long]
+    );
+    assert!(ty.specifiers.qualifiers.is_empty());
+    assert!(ty.declarator.is_none());
+
+    let Some(Expr {
+        kind: ExprKind::SizeofType(ty),
+    }) = variants[1].value.as_ref()
+    else {
+        panic!("expected sizeof(type-name) for second variant");
+    };
+    assert_eq!(ty.specifiers.qualifiers, vec![TypeQualifier::Const]);
+    assert_eq!(ty.specifiers.ty, vec![TypeSpecifier::Int]);
+    let declarator = ty
+        .declarator
+        .as_ref()
+        .expect("pointer abstract declarator expected");
+    assert_eq!(declarator.pointers.len(), 1);
+    assert_eq!(declarator.direct.as_ref(), &DirectDeclarator::Abstract);
+}
+
+#[test]
+fn rejects_enum_enumerator_redeclaring_typedef_name() {
+    let errors = parse_source_error("typedef int foo; enum { foo = 1 };");
+    assert!(
+        !errors.is_empty(),
+        "enum enumerator should not be allowed to redeclare typedef-name"
+    );
+}
+
+#[test]
+fn parses_struct_aggregate_init_and_member_access() {
+    let unit = parse_source(
+        "struct Point { int x; int y; }; int f(void) { struct Point p = {1, 2}; return p.x; }",
+    );
+    assert_eq!(unit.items.len(), 2);
+
+    let ExternalDecl::FunctionDef(def) = &unit.items[1] else {
+        panic!("expected function definition");
+    };
+    assert_eq!(def.body.items.len(), 2);
+
+    let BlockItem::Decl(decl) = &def.body.items[0] else {
+        panic!("expected declaration in function body");
+    };
+    let init = decl.declarators[0]
+        .init
+        .as_ref()
+        .expect("struct initializer expected");
+    let InitializerKind::Aggregate(items) = &init.kind else {
+        panic!("expected aggregate initializer");
+    };
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].init.kind, InitializerKind::Expr(Expr::int(1)));
+    assert_eq!(items[1].init.kind, InitializerKind::Expr(Expr::int(2)));
+
+    let BlockItem::Stmt(Stmt::Return(Some(expr))) = &def.body.items[1] else {
+        panic!("expected return statement");
+    };
+    assert_eq!(
+        *expr,
+        Expr::member(Expr::var("p".to_string()), "x".to_string(), false)
     );
 }
 
@@ -593,6 +1066,24 @@ fn rejects_case_statement_with_comma_expression() {
 }
 
 #[test]
+fn rejects_case_statement_with_assignment_expression() {
+    let errors = parse_statement_source_error("case y = 1: break;");
+    assert!(
+        !errors.is_empty(),
+        "case label should reject assignment expression"
+    );
+}
+
+#[test]
+fn rejects_case_statement_with_function_call_expression() {
+    let errors = parse_statement_source_error("case foo(): break;");
+    assert!(
+        !errors.is_empty(),
+        "case label should reject non-constant call expression"
+    );
+}
+
+#[test]
 fn parses_default_statement() {
     let stmt = parse_statement_source("default: continue;");
     assert_eq!(
@@ -925,6 +1416,60 @@ fn ordinary_identifier_shadows_typedef_name_in_inner_scope() {
 }
 
 #[test]
+fn rejects_conflicting_same_scope_typedef_and_ordinary_declaration() {
+    let errors = parse_source_error("typedef int T; int T;");
+    assert!(
+        !errors.is_empty(),
+        "same-scope typedef/object name conflict should be rejected"
+    );
+}
+
+#[test]
+fn conflicting_same_scope_declaration_does_not_pollute_typedef_disambiguation() {
+    let src = "typedef int T; int T; T x;";
+    let tokens = lexer_from_source(src);
+    let stream =
+        Stream::from_iter(tokens).map((src.len()..src.len()).into(), |(token, span)| (token, span));
+
+    let mut state = Typedefs::default();
+    let result = parser().parse_with_state(stream, &mut state).into_result();
+    assert!(
+        result.is_err(),
+        "conflicting same-scope declaration should fail parsing"
+    );
+    assert!(
+        state.is_typedef_name("T"),
+        "typedef binding should be preserved after conflict, entries = {:?}",
+        state.entries()
+    );
+}
+
+#[test]
+fn enum_enumerator_shadows_outer_scope_typedef_name() {
+    let unit = parse_source("typedef int T; int f(void) { enum { T = 42 }; return T; }");
+    let ExternalDecl::FunctionDef(def) = &unit.items[1] else {
+        panic!("expected function definition");
+    };
+    assert_eq!(def.body.items.len(), 2);
+
+    let BlockItem::Decl(enum_decl) = &def.body.items[0] else {
+        panic!("expected enum declaration in function body");
+    };
+    let TypeSpecifier::Enum(enum_spec) = &enum_decl.specifiers.ty[0] else {
+        panic!("expected enum specifier in function body");
+    };
+    let variants = enum_spec.variants.as_ref().expect("enum variants expected");
+    assert_eq!(variants.len(), 1);
+    assert_eq!(variants[0].name, "T");
+    assert_eq!(variants[0].value, Some(Expr::int(42)));
+
+    let BlockItem::Stmt(Stmt::Return(Some(expr))) = &def.body.items[1] else {
+        panic!("expected return statement");
+    };
+    assert_eq!(*expr, Expr::var("T".to_string()));
+}
+
+#[test]
 fn typedef_name_works_in_for_declaration_init() {
     let unit = parse_source("typedef int T; void f(void) { for (T i = 0; i < 1; i++) {} }");
     let ExternalDecl::FunctionDef(def) = &unit.items[1] else {
@@ -1090,6 +1635,36 @@ fn parses_sizeof_with_abstract_array_type_name() {
     };
     assert_eq!(inner.as_ref(), &DirectDeclarator::Abstract);
     assert_eq!(size.as_ref(), &ArraySize::Expr(Expr::int(10)));
+}
+
+#[test]
+fn parses_sizeof_with_abstract_array_type_name_constant_expression_size() {
+    let unit = parse_source("int f(void) { return sizeof(int [2 + 1]); }");
+    let ExternalDecl::FunctionDef(def) = &unit.items[0] else {
+        panic!("expected function definition");
+    };
+
+    let BlockItem::Stmt(Stmt::Return(Some(expr))) = &def.body.items[0] else {
+        panic!("expected return statement");
+    };
+
+    let ExprKind::SizeofType(ty) = &expr.kind else {
+        panic!("expected sizeof(type-name)");
+    };
+    assert_eq!(ty.specifiers.ty, vec![TypeSpecifier::Int]);
+
+    let declarator = ty
+        .declarator
+        .as_ref()
+        .expect("abstract array declarator should be present");
+    let DirectDeclarator::Array { inner, size, .. } = declarator.direct.as_ref() else {
+        panic!("expected array abstract declarator");
+    };
+    assert_eq!(inner.as_ref(), &DirectDeclarator::Abstract);
+    assert_eq!(
+        size.as_ref(),
+        &ArraySize::Expr(Expr::binary(Expr::int(2), BinaryOp::Add, Expr::int(1)))
+    );
 }
 
 #[test]

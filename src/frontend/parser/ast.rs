@@ -72,6 +72,44 @@ pub enum FunctionSpecifier {
     Inline,
 }
 
+/// Record kind for `struct` / `union`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordKind {
+    Struct,
+    Union,
+}
+
+/// `struct` / `union` type specifier.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordSpecifier {
+    pub kind: RecordKind,
+    pub tag: Option<String>,
+    /// Present for definitions like `struct S { int x; };`.
+    pub members: Option<Vec<RecordMemberDecl>>,
+}
+
+/// One declaration inside a record definition.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordMemberDecl {
+    pub specifiers: DeclSpec,
+    pub declarators: Vec<Declarator>,
+}
+
+/// `enum` type specifier.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumSpecifier {
+    pub tag: Option<String>,
+    /// Present for definitions like `enum E { A, B = 2 };`.
+    pub variants: Option<Vec<EnumVariant>>,
+}
+
+/// One enumerator.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumVariant {
+    pub name: String,
+    pub value: Option<Expr>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeSpecifier {
     Void,
@@ -84,6 +122,8 @@ pub enum TypeSpecifier {
     Signed,
     Unsigned,
     Bool,
+    StructOrUnion(RecordSpecifier),
+    Enum(EnumSpecifier),
     TypedefName(String),
 }
 
