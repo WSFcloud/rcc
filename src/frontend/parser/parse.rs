@@ -840,7 +840,13 @@ where
 
     let array_suffix = array_size
         .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
-        .map(DirectDeclaratorSuffix::Array);
+        .map(|size| {
+            DirectDeclaratorSuffix::Array(ArrayDeclaratorSuffix {
+                qualifiers: Vec::new(),
+                is_static: false,
+                size,
+            })
+        });
 
     choice((function_suffix, array_suffix)).boxed()
 }
@@ -1146,17 +1152,14 @@ where
         .boxed()
 }
 
-fn pointer_ident_array_declarator_parser<'tokens, I, AS>(
-    array_size: AS,
+fn pointer_ident_array_declarator_parser<'tokens, I, S>(
+    array_suffix: S,
 ) -> impl Parser<'tokens, I, Option<Declarator>, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
-    AS: Parser<'tokens, I, ArraySize, ParserExtra<'tokens, I>> + Clone,
+    S: Parser<'tokens, I, DirectDeclaratorSuffix, ParserExtra<'tokens, I>> + Clone + 'tokens,
 {
-    let array_suffixes = array_size
-        .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
-        .repeated()
-        .collect::<Vec<_>>();
+    let array_suffixes = array_suffix.repeated().collect::<Vec<_>>();
 
     pointer_layers_parser()
         .then(
@@ -1177,13 +1180,7 @@ where
 
             direct_base.map(|base| Declarator {
                 pointers,
-                direct: Box::new(fold_direct_declarator_suffixes(
-                    base,
-                    suffixes
-                        .into_iter()
-                        .map(DirectDeclaratorSuffix::Array)
-                        .collect::<Vec<_>>(),
-                )),
+                direct: Box::new(fold_direct_declarator_suffixes(base, suffixes)),
             })
         })
 }
@@ -1196,13 +1193,11 @@ fn type_name_parser<'tokens, I>()
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
-    let type_name_array_size = constant_expression_parser()
-        .map(ArraySize::Expr)
-        .or_not()
-        .map(|size| size.unwrap_or(ArraySize::Unspecified));
+    let type_name_array_suffix =
+        array_declarator_suffix_with_size_expr_parser(constant_expression_parser());
 
     let type_name_parameter_declarator =
-        pointer_ident_array_declarator_parser(type_name_array_size.clone());
+        pointer_ident_array_declarator_parser(type_name_array_suffix.clone());
 
     let type_name_parameter =
         decl_spec_parser()
@@ -1228,9 +1223,7 @@ where
 
     let type_name_suffix = choice((
         type_name_function_params.map(DirectDeclaratorSuffix::Function),
-        type_name_array_size
-            .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
-            .map(DirectDeclaratorSuffix::Array),
+        type_name_array_suffix,
     ));
 
     let abstract_declarator = abstract_declarator_with_suffix_parser(type_name_suffix);
@@ -1271,12 +1264,10 @@ fn basic_parameter_declarator_parser<'tokens, I>()
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
-    let array_size = assignment_expression_parser()
-        .map(ArraySize::Expr)
-        .or_not()
-        .map(|size| size.unwrap_or(ArraySize::Unspecified));
-
-    pointer_ident_array_declarator_parser(array_size).boxed()
+    pointer_ident_array_declarator_parser(array_declarator_suffix_with_size_expr_parser(
+        assignment_expression_parser(),
+    ))
+    .boxed()
 }
 
 fn simple_function_params_parser<'tokens, I>()
@@ -1378,11 +1369,62 @@ where
 }
 
 #[derive(Clone)]
+struct ArrayDeclaratorSuffix {
+    qualifiers: Vec<TypeQualifier>,
+    is_static: bool,
+    size: ArraySize,
+}
+
+fn array_declarator_suffix_with_size_expr_parser<'tokens, I, SZ>(
+    size_expr: SZ,
+) -> impl Parser<'tokens, I, DirectDeclaratorSuffix, ParserExtra<'tokens, I>> + Clone
+where
+    I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
+    SZ: Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone + 'tokens,
+{
+    let qualifiers = type_qualifier_parser()
+        .repeated()
+        .collect::<Vec<TypeQualifier>>();
+    let sized = size_expr.map(ArraySize::Expr);
+
+    let plain_array = qualifiers
+        .clone()
+        .then(sized.clone().or_not())
+        .map(|(qualifiers, size)| ArrayDeclaratorSuffix {
+            qualifiers,
+            is_static: false,
+            size: size.unwrap_or(ArraySize::Unspecified),
+        });
+
+    let static_then_qualifiers = just(TokenKind::Static)
+        .ignore_then(qualifiers.clone())
+        .then(sized.clone())
+        .map(|(qualifiers, size)| ArrayDeclaratorSuffix {
+            qualifiers,
+            is_static: true,
+            size,
+        });
+
+    let qualifiers_then_static = qualifiers
+        .then_ignore(just(TokenKind::Static))
+        .then(sized)
+        .map(|(qualifiers, size)| ArrayDeclaratorSuffix {
+            qualifiers,
+            is_static: true,
+            size,
+        });
+
+    choice((static_then_qualifiers, qualifiers_then_static, plain_array))
+        .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
+        .map(DirectDeclaratorSuffix::Array)
+}
+
+#[derive(Clone)]
 enum DirectDeclaratorSuffix {
     /// Function suffix: `(params...)`
     Function(FunctionParams),
     /// Array suffix: `[...]`
-    Array(ArraySize),
+    Array(ArrayDeclaratorSuffix),
 }
 
 fn fold_direct_declarator_suffixes(
@@ -1396,11 +1438,11 @@ fn fold_direct_declarator_suffixes(
                 inner: Box::new(inner),
                 params,
             },
-            DirectDeclaratorSuffix::Array(size) => DirectDeclarator::Array {
+            DirectDeclaratorSuffix::Array(array) => DirectDeclarator::Array {
                 inner: Box::new(inner),
-                qualifiers: Vec::new(),
-                is_static: false,
-                size: Box::new(size),
+                qualifiers: array.qualifiers,
+                is_static: array.is_static,
+                size: Box::new(array.size),
             },
         })
 }
@@ -1418,19 +1460,11 @@ where
 {
     let function_suffix = function_params.map(DirectDeclaratorSuffix::Function);
 
-    // Current minimal array-size support:
-    // `[e]` -> expression size
-    // `[]`  -> unspecified size
-    //
-    // `[*]` (VLA marker in prototype scope) is intentionally unsupported.
-    let array_size = assignment_expression_parser()
-        .map(ArraySize::Expr)
-        .or_not()
-        .map(|size| size.unwrap_or(ArraySize::Unspecified));
-
-    let array_suffix = array_size
-        .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
-        .map(DirectDeclaratorSuffix::Array);
+    // Supports array declarator forms with optional qualifiers/static:
+    // `[]`, `[e]`, `[const]`, `[static e]`, `[const static e]`, `[static const e]`.
+    // `[*]` (VLA marker in prototype scope) is still intentionally unsupported.
+    let array_suffix =
+        array_declarator_suffix_with_size_expr_parser(assignment_expression_parser());
 
     choice((function_suffix, array_suffix)).boxed()
 }

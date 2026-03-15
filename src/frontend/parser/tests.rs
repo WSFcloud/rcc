@@ -821,6 +821,81 @@ fn parses_function_declaration_with_array_param() {
 }
 
 #[test]
+fn parses_function_declaration_with_static_array_param() {
+    let unit = parse_source("int f(int a[static 4]);");
+    let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+        panic!("expected declaration item");
+    };
+
+    let direct = decl.declarators[0].declarator.direct.as_ref();
+    let DirectDeclarator::Function { params, .. } = direct else {
+        panic!("expected function declarator");
+    };
+
+    let FunctionParams::Prototype { params, variadic } = params else {
+        panic!("expected prototype params");
+    };
+    assert!(!variadic);
+    assert_eq!(params.len(), 1);
+
+    let param_decl = params[0]
+        .declarator
+        .as_ref()
+        .expect("parameter declarator expected");
+
+    let DirectDeclarator::Array {
+        inner,
+        qualifiers,
+        is_static,
+        size,
+    } = param_decl.direct.as_ref()
+    else {
+        panic!("expected array declarator for parameter");
+    };
+    assert!(qualifiers.is_empty());
+    assert!(*is_static);
+    assert_eq!(size.as_ref(), &ArraySize::Expr(Expr::int(4)));
+    assert_direct_ident(inner.as_ref(), "a");
+}
+
+#[test]
+fn parses_function_declaration_with_qualified_static_array_param() {
+    let unit = parse_source("int f(int a[const static 4]);");
+    let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+        panic!("expected declaration item");
+    };
+
+    let direct = decl.declarators[0].declarator.direct.as_ref();
+    let DirectDeclarator::Function { params, .. } = direct else {
+        panic!("expected function declarator");
+    };
+
+    let FunctionParams::Prototype { params, variadic } = params else {
+        panic!("expected prototype params");
+    };
+    assert!(!variadic);
+    assert_eq!(params.len(), 1);
+
+    let param_decl = params[0]
+        .declarator
+        .as_ref()
+        .expect("parameter declarator expected");
+
+    let DirectDeclarator::Array {
+        qualifiers,
+        is_static,
+        size,
+        ..
+    } = param_decl.direct.as_ref()
+    else {
+        panic!("expected array declarator for parameter");
+    };
+    assert_eq!(qualifiers.as_slice(), &[TypeQualifier::Const]);
+    assert!(*is_static);
+    assert_eq!(size.as_ref(), &ArraySize::Expr(Expr::int(4)));
+}
+
+#[test]
 fn parses_function_declaration_with_const_char_pointer_array_param() {
     let unit = parse_source("void p(const char *strings[], int count);");
     let ExternalDecl::Declaration(decl) = &unit.items[0] else {
