@@ -6,6 +6,9 @@ use logos::Logos;
 pub enum LexingErrorType {
     InvalidInteger(String),
     InvalidFloat(String),
+    InvalidStringLiteral(String),
+    InvalidCharLiteral(String),
+    UnsupportedLiteralPrefix(String),
     NonAsciiCharacter(char),
     #[default]
     Other,
@@ -32,6 +35,15 @@ impl fmt::Display for LexingErrorType {
         match self {
             LexingErrorType::InvalidInteger(s) => write!(f, "invalid integer literal: '{}'", s),
             LexingErrorType::InvalidFloat(s) => write!(f, "invalid float literal: '{}'", s),
+            LexingErrorType::InvalidStringLiteral(s) => {
+                write!(f, "invalid string literal: '{}'", s)
+            }
+            LexingErrorType::InvalidCharLiteral(s) => {
+                write!(f, "invalid character literal: '{}'", s)
+            }
+            LexingErrorType::UnsupportedLiteralPrefix(s) => {
+                write!(f, "unsupported character/string literal prefix: '{}'", s)
+            }
             LexingErrorType::NonAsciiCharacter(c) => write!(f, "non-ASCII character: '{}'", c),
             LexingErrorType::Other => write!(f, "unknown lexing error"),
         }
@@ -83,6 +95,140 @@ fn parse_float_f32(s: &str) -> Result<f64, LexingErrorType> {
         .map_err(|_| LexingErrorType::InvalidFloat(s.to_string()))
 }
 
+fn parse_hex_escape(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    literal: &str,
+) -> Result<char, LexingErrorType> {
+    let mut value: u32 = 0;
+    let mut consumed = 0usize;
+
+    while let Some(ch) = chars.peek().copied() {
+        let Some(digit) = ch.to_digit(16) else {
+            break;
+        };
+        consumed += 1;
+        value = value
+            .checked_mul(16)
+            .and_then(|v| v.checked_add(digit))
+            .ok_or_else(|| LexingErrorType::InvalidStringLiteral(literal.to_string()))?;
+        let _ = chars.next();
+    }
+
+    if consumed == 0 {
+        return Err(LexingErrorType::InvalidStringLiteral(literal.to_string()));
+    }
+
+    char::from_u32(value).ok_or_else(|| LexingErrorType::InvalidStringLiteral(literal.to_string()))
+}
+
+fn parse_fixed_hex_escape(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    literal: &str,
+    digits: usize,
+) -> Result<char, LexingErrorType> {
+    let mut value: u32 = 0;
+    for _ in 0..digits {
+        let Some(ch) = chars.next() else {
+            return Err(LexingErrorType::InvalidStringLiteral(literal.to_string()));
+        };
+        let Some(digit) = ch.to_digit(16) else {
+            return Err(LexingErrorType::InvalidStringLiteral(literal.to_string()));
+        };
+        value = value
+            .checked_mul(16)
+            .and_then(|v| v.checked_add(digit))
+            .ok_or_else(|| LexingErrorType::InvalidStringLiteral(literal.to_string()))?;
+    }
+    char::from_u32(value).ok_or_else(|| LexingErrorType::InvalidStringLiteral(literal.to_string()))
+}
+
+fn parse_escape_sequence(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    literal: &str,
+) -> Result<char, LexingErrorType> {
+    let Some(esc) = chars.next() else {
+        return Err(LexingErrorType::InvalidStringLiteral(literal.to_string()));
+    };
+
+    match esc {
+        '\'' => Ok('\''),
+        '"' => Ok('"'),
+        '?' => Ok('?'),
+        '\\' => Ok('\\'),
+        'a' => Ok('\x07'),
+        'b' => Ok('\x08'),
+        'f' => Ok('\x0c'),
+        'n' => Ok('\n'),
+        'r' => Ok('\r'),
+        't' => Ok('\t'),
+        'v' => Ok('\x0b'),
+        'x' => parse_hex_escape(chars, literal),
+        'u' => parse_fixed_hex_escape(chars, literal, 4),
+        'U' => parse_fixed_hex_escape(chars, literal, 8),
+        '0'..='7' => {
+            let mut value = esc.to_digit(8).unwrap_or(0);
+            for _ in 0..2 {
+                let Some(peek) = chars.peek().copied() else {
+                    break;
+                };
+                let Some(digit) = peek.to_digit(8) else {
+                    break;
+                };
+                value = value
+                    .checked_mul(8)
+                    .and_then(|v| v.checked_add(digit))
+                    .ok_or_else(|| LexingErrorType::InvalidStringLiteral(literal.to_string()))?;
+                let _ = chars.next();
+            }
+            char::from_u32(value)
+                .ok_or_else(|| LexingErrorType::InvalidStringLiteral(literal.to_string()))
+        }
+        _ => Err(LexingErrorType::InvalidStringLiteral(literal.to_string())),
+    }
+}
+
+fn parse_c_string_body(body: &str, literal: &str) -> Result<String, LexingErrorType> {
+    let mut chars = body.chars().peekable();
+    let mut out = String::new();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            out.push(parse_escape_sequence(&mut chars, literal)?);
+        } else {
+            out.push(ch);
+        }
+    }
+
+    Ok(out)
+}
+
+fn parse_string_literal(s: &str) -> Result<String, LexingErrorType> {
+    let Some(inner) = s.strip_prefix('"').and_then(|v| v.strip_suffix('"')) else {
+        return Err(LexingErrorType::InvalidStringLiteral(s.to_string()));
+    };
+    parse_c_string_body(inner, s)
+}
+
+fn parse_char_literal(s: &str) -> Result<char, LexingErrorType> {
+    let Some(inner) = s.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) else {
+        return Err(LexingErrorType::InvalidCharLiteral(s.to_string()));
+    };
+    let decoded = parse_c_string_body(inner, s)
+        .map_err(|_| LexingErrorType::InvalidCharLiteral(s.to_string()))?;
+    let mut chars = decoded.chars();
+    let Some(ch) = chars.next() else {
+        return Err(LexingErrorType::InvalidCharLiteral(s.to_string()));
+    };
+    if chars.next().is_some() {
+        return Err(LexingErrorType::InvalidCharLiteral(s.to_string()));
+    }
+    Ok(ch)
+}
+
+fn unsupported_literal_prefix<T>(s: &str) -> Result<T, LexingErrorType> {
+    Err(LexingErrorType::UnsupportedLiteralPrefix(s.to_string()))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct IncludeDirective {
     pub filename: String,
@@ -122,11 +268,20 @@ pub enum TokenKind {
     /// Long double literal (l/L suffix). Stores (f64_approx, f128_bytes).
     /// f128_bytes is IEEE 754 binary128 format with full 112-bit mantissa precision.
     // FloatLiteralLongDouble(f128),
-    StringLiteral(String),
-    /// Wide string literal (L"..."), stores content as Rust chars (each becomes wchar_t = i32)
+    #[regex(r#"u8"([^"\\\r\n]|\\.)*""#, |lex| unsupported_literal_prefix::<String>(lex.slice()))]
+    #[regex(r#"u"([^"\\\r\n]|\\.)*""#, |lex| unsupported_literal_prefix::<String>(lex.slice()))]
+    #[regex(r#"U"([^"\\\r\n]|\\.)*""#, |lex| unsupported_literal_prefix::<String>(lex.slice()))]
+    #[regex(r#"L"([^"\\\r\n]|\\.)*""#, |lex| unsupported_literal_prefix::<String>(lex.slice()))]
+    #[regex(r#"u8'([^'\\\r\n]|\\.)*'"#, |lex| unsupported_literal_prefix::<String>(lex.slice()))]
+    #[regex(r#"u'([^'\\\r\n]|\\.)*'"#, |lex| unsupported_literal_prefix::<String>(lex.slice()))]
+    #[regex(r#"U'([^'\\\r\n]|\\.)*'"#, |lex| unsupported_literal_prefix::<String>(lex.slice()))]
+    #[regex(r#"L'([^'\\\r\n]|\\.)*'"#, |lex| unsupported_literal_prefix::<String>(lex.slice()))]
     WideStringLiteral(String),
+    #[regex(r#""([^"\\\r\n]|\\.)*""#, |lex| parse_string_literal(lex.slice()))]
+    StringLiteral(String),
     /// char16_t string literal (u"..."), stores content as Rust chars (each becomes char16_t = u16)
     Char16StringLiteral(String),
+    #[regex(r#"'([^'\\\r\n]|\\.)*'"#, |lex| parse_char_literal(lex.slice()))]
     CharLiteral(char),
 
     // Identifier

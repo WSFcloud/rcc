@@ -34,6 +34,50 @@ pub fn print_tokens(src: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::token::LexingErrorType;
+
+    fn lex_kinds(src: &str) -> Vec<TokenKind> {
+        lexer_from_source(src).map(|(token, _)| token).collect()
+    }
+
+    #[test]
+    fn lexes_char_and_string_literals_with_escapes() {
+        let tokens = lex_kinds(r#"char c = '\n'; char *s = "hi\t\"x\"";"#);
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Char,
+                TokenKind::Identifier("c".to_string()),
+                TokenKind::Assign,
+                TokenKind::CharLiteral('\n'),
+                TokenKind::Semicolon,
+                TokenKind::Char,
+                TokenKind::Star,
+                TokenKind::Identifier("s".to_string()),
+                TokenKind::Assign,
+                TokenKind::StringLiteral("hi\t\"x\"".to_string()),
+                TokenKind::Semicolon,
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_char_literal() {
+        let tokens = lex_kinds("char c = 'ab';");
+        assert!(tokens.iter().any(|token| matches!(
+            token,
+            TokenKind::Error(LexingErrorType::InvalidCharLiteral(_))
+        )));
+    }
+
+    #[test]
+    fn rejects_wide_string_literal_prefix() {
+        let tokens = lex_kinds(r#"char *s = L"wide";"#);
+        assert!(tokens.iter().any(|token| matches!(
+            token,
+            TokenKind::Error(LexingErrorType::UnsupportedLiteralPrefix(_))
+        )));
+    }
 
     #[test]
     #[ignore]
