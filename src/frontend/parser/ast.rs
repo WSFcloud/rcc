@@ -20,6 +20,7 @@ pub struct FunctionDef {
     pub declarator: Declarator,
     pub declarations: Vec<Declaration>,
     pub body: CompoundStmt,
+    pub span: SourceSpan,
 }
 
 /// Declaration.
@@ -88,6 +89,7 @@ pub struct RecordSpecifier {
     pub tag: Option<String>,
     /// Present for definitions like `struct S { int x; };`.
     pub members: Option<Vec<RecordMemberDecl>>,
+    pub span: SourceSpan,
 }
 
 /// One declaration inside a record definition.
@@ -95,6 +97,7 @@ pub struct RecordSpecifier {
 pub struct RecordMemberDecl {
     pub specifiers: DeclSpec,
     pub declarators: Vec<Declarator>,
+    pub span: SourceSpan,
 }
 
 /// `enum` type specifier.
@@ -103,6 +106,7 @@ pub struct EnumSpecifier {
     pub tag: Option<String>,
     /// Present for definitions like `enum E { A, B = 2 };`.
     pub variants: Option<Vec<EnumVariant>>,
+    pub span: SourceSpan,
 }
 
 /// One enumerator.
@@ -110,10 +114,11 @@ pub struct EnumSpecifier {
 pub struct EnumVariant {
     pub name: String,
     pub value: Option<Expr>,
+    pub span: SourceSpan,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum TypeSpecifier {
+pub enum TypeSpecifierKind {
     Void,
     Char,
     Short,
@@ -127,6 +132,31 @@ pub enum TypeSpecifier {
     StructOrUnion(RecordSpecifier),
     Enum(EnumSpecifier),
     TypedefName(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeSpecifier {
+    pub kind: TypeSpecifierKind,
+    pub span: SourceSpan,
+}
+
+impl PartialEq for TypeSpecifier {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+    }
+}
+
+impl Eq for TypeSpecifier {}
+
+impl TypeSpecifier {
+    pub fn new(kind: TypeSpecifierKind, span: SourceSpan) -> Self {
+        Self { kind, span }
+    }
+
+    pub fn with_span(mut self, span: SourceSpan) -> Self {
+        self.span = span;
+        self
+    }
 }
 
 /// One declarator together with its optional initializer.
@@ -158,7 +188,7 @@ pub struct Pointer {
 /// - array suffixes
 /// - function suffixes
 #[derive(Debug, Clone, PartialEq)]
-pub enum DirectDeclarator {
+pub enum DirectDeclaratorKind {
     /// Plain identifier declarator.
     Ident(String),
     /// Abstract declarator without an identifier (e.g. unnamed parameter declarator).
@@ -177,6 +207,31 @@ pub enum DirectDeclarator {
         inner: Box<DirectDeclarator>,
         params: FunctionParams,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct DirectDeclarator {
+    pub kind: DirectDeclaratorKind,
+    pub span: SourceSpan,
+}
+
+impl PartialEq for DirectDeclarator {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+    }
+}
+
+impl Eq for DirectDeclarator {}
+
+impl DirectDeclarator {
+    pub fn new(kind: DirectDeclaratorKind, span: SourceSpan) -> Self {
+        Self { kind, span }
+    }
+
+    pub fn with_span(mut self, span: SourceSpan) -> Self {
+        self.span = span;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -208,14 +263,17 @@ pub enum FunctionParams {
 pub struct ParameterDecl {
     pub specifiers: DeclSpec,
     /// `declarator = None`: No declarator present (e.g. `int`).
-    /// Unnamed but structured declarators like `char *` use `DirectDeclarator::Abstract`.
+    /// Unnamed but structured declarators like `char *` use
+    /// `DirectDeclaratorKind::Abstract`.
     pub declarator: Option<Box<Declarator>>,
+    pub span: SourceSpan,
 }
 
 /// Wrapper node for initializers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Initializer {
     pub kind: InitializerKind,
+    pub span: SourceSpan,
 }
 
 /// Initializer forms.
@@ -232,13 +290,34 @@ pub enum InitializerKind {
 pub struct InitializerItem {
     pub designators: Vec<Designator>,
     pub init: Initializer,
+    pub span: SourceSpan,
 }
 
 /// One designator segment.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Designator {
+pub enum DesignatorKind {
     Index(Expr),
     Field(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct Designator {
+    pub kind: DesignatorKind,
+    pub span: SourceSpan,
+}
+
+impl PartialEq for Designator {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+    }
+}
+
+impl Eq for Designator {}
+
+impl Designator {
+    pub fn new(kind: DesignatorKind, span: SourceSpan) -> Self {
+        Self { kind, span }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -312,11 +391,6 @@ impl Stmt {
     pub fn new(kind: StmtKind, span: SourceSpan) -> Self {
         Self { kind, span }
     }
-
-    #[cfg(test)]
-    pub fn test_new(kind: StmtKind) -> Self {
-        Self::new(kind, SourceSpan::dummy())
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -366,41 +440,6 @@ impl Expr {
 
     pub fn var_with_span(name: String, span: SourceSpan) -> Self {
         Self::new(ExprKind::Var(name), span)
-    }
-
-    #[cfg(test)]
-    pub fn test_new(kind: ExprKind) -> Self {
-        Self::new(kind, SourceSpan::dummy())
-    }
-
-    #[cfg(test)]
-    pub fn int(value: u64) -> Self {
-        Self::int_with_span(value, SourceSpan::dummy())
-    }
-
-    #[cfg(test)]
-    pub fn int_with_base(value: u64, base: IntLiteralSuffix) -> Self {
-        Self::int_with_base_and_span(value, base, SourceSpan::dummy())
-    }
-
-    #[cfg(test)]
-    pub fn float(value: f64) -> Self {
-        Self::float_with_span(value, SourceSpan::dummy())
-    }
-
-    #[cfg(test)]
-    pub fn char(value: char) -> Self {
-        Self::char_with_span(value, SourceSpan::dummy())
-    }
-
-    #[cfg(test)]
-    pub fn string(value: String) -> Self {
-        Self::string_with_span(value, SourceSpan::dummy())
-    }
-
-    #[cfg(test)]
-    pub fn var(name: String) -> Self {
-        Self::var_with_span(name, SourceSpan::dummy())
     }
 }
 

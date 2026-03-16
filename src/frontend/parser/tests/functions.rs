@@ -13,8 +13,8 @@ fn parses_function_declarations() {
         let ExternalDecl::Declaration(decl) = &unit.items[0] else {
             panic!("expected declaration");
         };
-        let DirectDeclarator::Function { inner, params } =
-            decl.declarators[0].declarator.direct.as_ref()
+        let DirectDeclaratorKind::Function { inner, params } =
+            &decl.declarators[0].declarator.direct.kind
         else {
             panic!("expected function declarator");
         };
@@ -58,8 +58,8 @@ fn parses_array_parameter_variants() {
         let ExternalDecl::Declaration(decl) = &unit.items[0] else {
             panic!("expected declaration");
         };
-        let DirectDeclarator::Function { params, .. } =
-            decl.declarators[0].declarator.direct.as_ref()
+        let DirectDeclaratorKind::Function { params, .. } =
+            &decl.declarators[0].declarator.direct.kind
         else {
             panic!("expected function");
         };
@@ -70,12 +70,12 @@ fn parses_array_parameter_variants() {
             .declarator
             .as_ref()
             .expect("param declarator expected");
-        let DirectDeclarator::Array {
+        let DirectDeclaratorKind::Array {
             qualifiers: q,
             is_static: s,
             size: sz,
             ..
-        } = param_decl.direct.as_ref()
+        } = &param_decl.direct.kind
         else {
             panic!("expected array");
         };
@@ -91,11 +91,11 @@ fn parses_function_pointer_declarator() {
     let ExternalDecl::Declaration(decl) = &unit.items[0] else {
         panic!("expected declaration");
     };
-    let DirectDeclarator::Function { inner, .. } = decl.declarators[0].declarator.direct.as_ref()
+    let DirectDeclaratorKind::Function { inner, .. } = &decl.declarators[0].declarator.direct.kind
     else {
         panic!("expected function");
     };
-    let DirectDeclarator::Grouped(grouped) = inner.as_ref() else {
+    let DirectDeclaratorKind::Grouped(grouped) = &inner.kind else {
         panic!("expected grouped");
     };
     assert_eq!(grouped.pointers.len(), 1);
@@ -108,7 +108,7 @@ fn parses_function_pointer_parameter() {
     let ExternalDecl::Declaration(decl) = &unit.items[0] else {
         panic!("expected declaration");
     };
-    let DirectDeclarator::Function { params, .. } = decl.declarators[0].declarator.direct.as_ref()
+    let DirectDeclaratorKind::Function { params, .. } = &decl.declarators[0].declarator.direct.kind
     else {
         panic!("expected function");
     };
@@ -119,10 +119,10 @@ fn parses_function_pointer_parameter() {
         .declarator
         .as_ref()
         .expect("param declarator expected");
-    let DirectDeclarator::Function { inner, .. } = param_decl.direct.as_ref() else {
+    let DirectDeclaratorKind::Function { inner, .. } = &param_decl.direct.kind else {
         panic!("expected function pointer param");
     };
-    let DirectDeclarator::Grouped(grouped) = inner.as_ref() else {
+    let DirectDeclaratorKind::Grouped(grouped) = &inner.kind else {
         panic!("expected grouped");
     };
     assert_eq!(grouped.pointers.len(), 1);
@@ -134,7 +134,7 @@ fn preserves_unnamed_pointer_parameter() {
     let ExternalDecl::Declaration(decl) = &unit.items[0] else {
         panic!("expected declaration");
     };
-    let DirectDeclarator::Function { params, .. } = decl.declarators[0].declarator.direct.as_ref()
+    let DirectDeclaratorKind::Function { params, .. } = &decl.declarators[0].declarator.direct.kind
     else {
         panic!("expected function");
     };
@@ -164,4 +164,26 @@ fn parses_function_definition() {
     };
     assert_eq!(def.specifiers.ty, vec![TypeSpecifier::Int]);
     assert_eq!(def.body.items.len(), 1);
+}
+
+#[test]
+fn function_def_span_covers_signature_and_body() {
+    let src = "int foo(int x) { return x; }";
+    let unit = parse_source(src);
+    let ExternalDecl::FunctionDef(func) = &unit.items[0] else {
+        panic!("expected function definition");
+    };
+    assert_eq!(func.span.start, 0);
+    assert_eq!(func.span.end, src.len());
+}
+
+#[test]
+fn function_def_span_with_storage_class() {
+    let src = "static inline int helper(void) { return 42; }";
+    let unit = parse_source(src);
+    let ExternalDecl::FunctionDef(func) = &unit.items[0] else {
+        panic!("expected function definition");
+    };
+    assert_eq!(func.span.start, 0);
+    assert_eq!(func.span.end, src.len());
 }

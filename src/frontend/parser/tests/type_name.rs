@@ -26,7 +26,7 @@ fn parses_sizeof_with_abstract_array() {
             .declarator
             .as_ref()
             .expect("abstract array declarator expected");
-        let DirectDeclarator::Array { size, .. } = declarator.direct.as_ref() else {
+        let DirectDeclaratorKind::Array { size, .. } = &declarator.direct.kind else {
             panic!("expected array");
         };
         assert_eq!(size.as_ref(), &expected_size);
@@ -47,10 +47,10 @@ fn parses_cast_with_function_pointer() {
         .declarator
         .as_ref()
         .expect("function-pointer abstract declarator expected");
-    let DirectDeclarator::Function { inner, params } = declarator.direct.as_ref() else {
+    let DirectDeclaratorKind::Function { inner, params } = &declarator.direct.kind else {
         panic!("expected function");
     };
-    let DirectDeclarator::Grouped(grouped) = inner.as_ref() else {
+    let DirectDeclaratorKind::Grouped(grouped) = &inner.kind else {
         panic!("expected grouped");
     };
     assert_eq!(grouped.pointers.len(), 1);
@@ -81,7 +81,7 @@ fn parses_function_pointer_with_pointer_params() {
             _ => panic!("expected sizeof or cast"),
         };
         let declarator = ty.declarator.as_ref().expect("declarator expected");
-        let DirectDeclarator::Function { params, .. } = declarator.direct.as_ref() else {
+        let DirectDeclaratorKind::Function { params, .. } = &declarator.direct.kind else {
             panic!("expected function");
         };
         let FunctionParams::Prototype { params, .. } = params else {
@@ -107,7 +107,7 @@ fn parses_function_pointer_with_array_param() {
         panic!("expected sizeof");
     };
     let declarator = ty.declarator.as_ref().expect("declarator expected");
-    let DirectDeclarator::Function { params, .. } = declarator.direct.as_ref() else {
+    let DirectDeclaratorKind::Function { params, .. } = &declarator.direct.kind else {
         panic!("expected function");
     };
     let FunctionParams::Prototype { params, .. } = params else {
@@ -119,7 +119,7 @@ fn parses_function_pointer_with_array_param() {
         .as_ref()
         .expect("second param expected");
     assert_eq!(second_param.pointers.len(), 1);
-    let DirectDeclarator::Array { size, .. } = second_param.direct.as_ref() else {
+    let DirectDeclaratorKind::Array { size, .. } = &second_param.direct.kind else {
         panic!("expected array");
     };
     assert_eq!(size.as_ref(), &ArraySize::Unspecified);

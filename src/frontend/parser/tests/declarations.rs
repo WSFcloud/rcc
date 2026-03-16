@@ -25,7 +25,7 @@ fn parses_array_declarations() {
     let ExternalDecl::Declaration(decl1) = &unit.items[0] else {
         panic!("expected first declaration");
     };
-    let DirectDeclarator::Array { size, .. } = decl1.declarators[0].declarator.direct.as_ref()
+    let DirectDeclaratorKind::Array { size, .. } = &decl1.declarators[0].declarator.direct.kind
     else {
         panic!("expected array declarator");
     };
@@ -34,15 +34,15 @@ fn parses_array_declarations() {
     let ExternalDecl::Declaration(decl2) = &unit.items[1] else {
         panic!("expected second declaration");
     };
-    let DirectDeclarator::Array { inner, size, .. } =
-        decl2.declarators[0].declarator.direct.as_ref()
+    let DirectDeclaratorKind::Array { inner, size, .. } =
+        &decl2.declarators[0].declarator.direct.kind
     else {
         panic!("expected outer array");
     };
     assert_eq!(size.as_ref(), &ArraySize::Expr(Expr::int(3)));
-    let DirectDeclarator::Array {
+    let DirectDeclaratorKind::Array {
         size: inner_size, ..
-    } = inner.as_ref()
+    } = &inner.kind
     else {
         panic!("expected inner array");
     };
@@ -62,7 +62,7 @@ fn parses_struct_definition() {
     let ExternalDecl::Declaration(decl) = &unit.items[0] else {
         panic!("expected declaration");
     };
-    let TypeSpecifier::StructOrUnion(record) = &decl.specifiers.ty[0] else {
+    let TypeSpecifierKind::StructOrUnion(record) = &decl.specifiers.ty[0].kind else {
         panic!("expected record type");
     };
     assert_eq!(record.kind, RecordKind::Struct);
@@ -76,19 +76,19 @@ fn parses_struct_with_complex_members() {
     let ExternalDecl::Declaration(decl) = &unit.items[0] else {
         panic!("expected declaration");
     };
-    let TypeSpecifier::StructOrUnion(record) = &decl.specifiers.ty[0] else {
+    let TypeSpecifierKind::StructOrUnion(record) = &decl.specifiers.ty[0].kind else {
         panic!("expected struct");
     };
     let members = record.members.as_ref().expect("members expected");
     assert_eq!(members.len(), 3);
 
     // Function pointer member
-    let DirectDeclarator::Function { .. } = members[0].declarators[0].direct.as_ref() else {
+    let DirectDeclaratorKind::Function { .. } = &members[0].declarators[0].direct.kind else {
         panic!("expected function declarator");
     };
 
     // Array member
-    let DirectDeclarator::Array { size, .. } = members[1].declarators[0].direct.as_ref() else {
+    let DirectDeclaratorKind::Array { size, .. } = &members[1].declarators[0].direct.kind else {
         panic!("expected array");
     };
     assert_eq!(
@@ -133,7 +133,7 @@ fn parses_enum_definition() {
     let ExternalDecl::Declaration(enum_decl) = &unit.items[0] else {
         panic!("expected enum declaration");
     };
-    let TypeSpecifier::Enum(enum_spec) = &enum_decl.specifiers.ty[0] else {
+    let TypeSpecifierKind::Enum(enum_spec) = &enum_decl.specifiers.ty[0].kind else {
         panic!("expected enum specifier");
     };
     let variants = enum_spec.variants.as_ref().expect("variants expected");
@@ -147,7 +147,7 @@ fn parses_enum_complex_values() {
     let ExternalDecl::Declaration(decl) = &unit.items[0] else {
         panic!("expected enum");
     };
-    let TypeSpecifier::Enum(enum_spec) = &decl.specifiers.ty[0] else {
+    let TypeSpecifierKind::Enum(enum_spec) = &decl.specifiers.ty[0].kind else {
         panic!("expected enum");
     };
     let variants = enum_spec.variants.as_ref().expect("variants expected");
@@ -163,7 +163,7 @@ fn parses_enum_value_with_sizeof_abstract_array_type() {
     let ExternalDecl::Declaration(decl) = &unit.items[0] else {
         panic!("expected enum");
     };
-    let TypeSpecifier::Enum(enum_spec) = &decl.specifiers.ty[0] else {
+    let TypeSpecifierKind::Enum(enum_spec) = &decl.specifiers.ty[0].kind else {
         panic!("expected enum");
     };
     let variants = enum_spec.variants.as_ref().expect("variants expected");
@@ -174,7 +174,7 @@ fn parses_enum_value_with_sizeof_abstract_array_type() {
         panic!("expected sizeof(type)");
     };
     let declarator = ty.declarator.as_ref().expect("array declarator expected");
-    let DirectDeclarator::Array { size, .. } = declarator.direct.as_ref() else {
+    let DirectDeclaratorKind::Array { size, .. } = &declarator.direct.kind else {
         panic!("expected array declarator");
     };
     assert_eq!(size.as_ref(), &ArraySize::Expr(Expr::int(3)));
@@ -194,7 +194,7 @@ fn parses_nested_definitions() {
     let ExternalDecl::Declaration(decl) = &unit.items[0] else {
         panic!("expected declaration");
     };
-    let TypeSpecifier::StructOrUnion(outer) = &decl.specifiers.ty[0] else {
+    let TypeSpecifierKind::StructOrUnion(outer) = &decl.specifiers.ty[0].kind else {
         panic!("expected outer struct");
     };
     let members = outer.members.as_ref().expect("members expected");

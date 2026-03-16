@@ -2,11 +2,11 @@ use crate::common::span::SourceSpan;
 use crate::common::token::TokenKind;
 use crate::frontend::parser::ast::{
     ArraySize, AssignOp, BinaryOp, BlockItem, CompoundStmt, DeclSpec, Declaration, Declarator,
-    Designator, DirectDeclarator, EnumSpecifier, EnumVariant, Expr, ExprKind, ExternalDecl,
-    ForInit, FunctionDef, FunctionParams, FunctionSpecifier, InitDeclarator, Initializer,
-    InitializerItem, InitializerKind, IntLiteralSuffix, ParameterDecl, Pointer, RecordKind,
-    RecordMemberDecl, RecordSpecifier, Stmt, StmtKind, StorageClass, TranslationUnit, TypeName,
-    TypeQualifier, TypeSpecifier, UnaryOp,
+    Designator, DesignatorKind, DirectDeclarator, DirectDeclaratorKind, EnumSpecifier, EnumVariant,
+    Expr, ExprKind, ExternalDecl, ForInit, FunctionDef, FunctionParams, FunctionSpecifier,
+    InitDeclarator, Initializer, InitializerItem, InitializerKind, IntLiteralSuffix, ParameterDecl,
+    Pointer, RecordKind, RecordMemberDecl, RecordSpecifier, Stmt, StmtKind, StorageClass,
+    TranslationUnit, TypeName, TypeQualifier, TypeSpecifier, TypeSpecifierKind, UnaryOp,
 };
 use crate::frontend::parser::labels::ParserLabel;
 use crate::frontend::parser::typedefs::{BindingKind, Typedefs};
@@ -23,8 +23,20 @@ pub type ParseError<'tokens> = Rich<'tokens, TokenKind, Span>;
 type ParserExtra<'tokens, I> =
     extra::Full<ParseError<'tokens>, Typedefs, std::marker::PhantomData<I>>;
 
-fn span_to_source(span: Span) -> SourceSpan {
+fn parse_span_to_source_span(span: Span) -> SourceSpan {
     span.into()
+}
+
+fn type_spec(kind: TypeSpecifierKind, span: Span) -> TypeSpecifier {
+    TypeSpecifier::new(kind, parse_span_to_source_span(span))
+}
+
+fn direct_decl(kind: DirectDeclaratorKind, span: Span) -> DirectDeclarator {
+    DirectDeclarator::new(kind, parse_span_to_source_span(span))
+}
+
+fn designator(kind: DesignatorKind, span: Span) -> Designator {
+    Designator::new(kind, parse_span_to_source_span(span))
 }
 
 // ============================
@@ -86,8 +98,8 @@ fn fold_comma_expr(exprs: Vec<Expr>, context: &'static str) -> Expr {
     exprs.into_iter().reduce(Expr::comma).expect(context)
 }
 
-fn literal_expr_parser<'tokens, I>()
--> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
+fn literal_expr_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -117,7 +129,7 @@ where
         },
     ))
     .map_with(|token, extra| {
-        let span = span_to_source(extra.span());
+        let span = parse_span_to_source_span(extra.span());
         match token {
             LiteralExprToken::Int(value, suffix) => Expr::int_with_base_and_span(value, suffix, span),
             LiteralExprToken::Float(value) => Expr::float_with_span(value, span),
@@ -127,19 +139,19 @@ where
     })
 }
 
-fn identifier_expr_parser<'tokens, I>()
--> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
+fn identifier_expr_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
     select! {
         TokenKind::Identifier(name) => name,
     }
-    .map_with(|name, extra| Expr::var_with_span(name, span_to_source(extra.span())))
+    .map_with(|name, extra| Expr::var_with_span(name, parse_span_to_source_span(extra.span())))
 }
 
-fn prefix_expr_op_parser<'tokens, I>()
--> impl Parser<'tokens, I, (PrefixExprOp, SourceSpan), ParserExtra<'tokens, I>> + Clone
+fn prefix_expr_op_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, (PrefixExprOp, SourceSpan), ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -153,11 +165,11 @@ where
         just(TokenKind::Star).to(PrefixExprOp::Unary(UnaryOp::Deref)),
         just(TokenKind::Amp).to(PrefixExprOp::Unary(UnaryOp::AddressOf)),
     ))
-    .map_with(|op, extra| (op, span_to_source(extra.span())))
+    .map_with(|op, extra| (op, parse_span_to_source_span(extra.span())))
 }
 
-fn basic_postfix_expr_op_parser<'tokens, I>()
--> impl Parser<'tokens, I, (PostfixExprOp, SourceSpan), ParserExtra<'tokens, I>> + Clone
+fn basic_postfix_expr_op_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, (PostfixExprOp, SourceSpan), ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -165,11 +177,11 @@ where
         just(TokenKind::PlusPlus).to(PostfixExprOp::PostInc),
         just(TokenKind::MinusMinus).to(PostfixExprOp::PostDec),
     ))
-    .map_with(|op, extra| (op, span_to_source(extra.span())))
+    .map_with(|op, extra| (op, parse_span_to_source_span(extra.span())))
 }
 
-fn assignment_op_parser<'tokens, I>()
--> impl Parser<'tokens, I, AssignOp, ParserExtra<'tokens, I>> + Clone
+fn assignment_op_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, AssignOp, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -318,7 +330,7 @@ where
         .map_with(|args, extra| {
             (
                 PostfixExprOp::Call(args.unwrap_or_default()),
-                span_to_source(extra.span()),
+                parse_span_to_source_span(extra.span()),
             )
         })
 }
@@ -333,12 +345,12 @@ where
 {
     index_expr
         .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
-        .map_with(|index, extra| (PostfixExprOp::Index(index), span_to_source(extra.span())))
+        .map_with(|index, extra| (PostfixExprOp::Index(index), parse_span_to_source_span(extra.span())))
 }
 
 /// Parse member access postfix operators: `.field` and `->field`.
-fn member_postfix_expr_op_parser<'tokens, I>()
--> impl Parser<'tokens, I, (PostfixExprOp, SourceSpan), ParserExtra<'tokens, I>> + Clone
+fn member_postfix_expr_op_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, (PostfixExprOp, SourceSpan), ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -353,7 +365,7 @@ where
             .ignore_then(select! { TokenKind::Identifier(name) => name })
             .map(|field| PostfixExprOp::Member { field, deref: true }),
     ))
-    .map_with(|op, extra| (op, span_to_source(extra.span())))
+    .map_with(|op, extra| (op, parse_span_to_source_span(extra.span())))
 }
 
 /// Parse postfix-expression from a primary-expression and repeated postfix operators.
@@ -430,8 +442,8 @@ where
 ///
 /// `ALLOW_COMMA` controls whether top-level comma expressions are accepted.
 /// Parenthesized sub-expressions always parse as full `expression` grammar.
-fn expr_parser<'tokens, I, const ALLOW_COMMA: bool>()
--> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
+fn expr_parser<'tokens, I, const ALLOW_COMMA: bool>(
+) -> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -455,7 +467,7 @@ where
                         ty: Box::new(ty),
                         init: Box::new(init),
                     },
-                    span_to_source(extra.span()),
+                    parse_span_to_source_span(extra.span()),
                 )
             });
 
@@ -470,7 +482,7 @@ where
                 .map_with(|ty, extra| {
                     Expr::new(
                         ExprKind::SizeofType(Box::new(ty)),
-                        span_to_source(extra.span()),
+                        parse_span_to_source_span(extra.span()),
                     )
                 });
 
@@ -478,7 +490,7 @@ where
                 just(TokenKind::Sizeof)
                     .ignore_then(unary.clone())
                     .map_with(|expr, extra| {
-                        Expr::sizeof_expr(expr).with_span(span_to_source(extra.span()))
+                        Expr::sizeof_expr(expr).with_span(parse_span_to_source_span(extra.span()))
                     });
 
             let cast = type_name_parser()
@@ -490,7 +502,7 @@ where
                             ty: Box::new(ty),
                             expr: Box::new(expr),
                         },
-                        span_to_source(extra.span()),
+                        parse_span_to_source_span(extra.span()),
                     )
                 });
 
@@ -524,8 +536,8 @@ where
 }
 
 /// Parse an assignment-expression (comma not allowed at top level).
-fn assignment_expression_parser<'tokens, I>()
--> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
+fn assignment_expression_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -537,8 +549,8 @@ where
 // ============================
 
 /// Parse one type qualifier token.
-fn type_qualifier_parser<'tokens, I>()
--> impl Parser<'tokens, I, TypeQualifier, ParserExtra<'tokens, I>> + Clone
+fn type_qualifier_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, TypeQualifier, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -550,8 +562,8 @@ where
 }
 
 /// Parse a single pointer layer: `*` with optional qualifiers.
-fn pointer_layer_parser<'tokens, I>()
--> impl Parser<'tokens, I, Pointer, ParserExtra<'tokens, I>> + Clone
+fn pointer_layer_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, Pointer, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -565,8 +577,8 @@ where
 }
 
 /// Parse zero-or-more pointer layers for declarators.
-fn pointer_layers_parser<'tokens, I>()
--> impl Parser<'tokens, I, Vec<Pointer>, ParserExtra<'tokens, I>> + Clone
+fn pointer_layers_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, Vec<Pointer>, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -603,8 +615,8 @@ fn assemble_decl_spec(pieces: Vec<DeclSpecifierPiece>) -> DeclSpec {
     specifiers
 }
 
-fn typedef_name_type_specifier_parser<'tokens, I>()
--> impl Parser<'tokens, I, TypeSpecifier, ParserExtra<'tokens, I>> + Clone
+fn typedef_name_type_specifier_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, TypeSpecifier, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -612,37 +624,37 @@ where
         |token: TokenKind,
          extra: &mut chumsky::input::MapExtra<'tokens, '_, I, ParserExtra<'tokens, I>>| {
             match token {
-                TokenKind::Identifier(name) if extra.state().is_typedef_name(&name) => {
-                    Some(TypeSpecifier::TypedefName(name))
-                }
+                TokenKind::Identifier(name) if extra.state().is_typedef_name(&name) => Some(name),
                 _ => None,
             }
         },
     )
+    .map_with(|name, extra| type_spec(TypeSpecifierKind::TypedefName(name), extra.span()))
     .boxed()
 }
 
-fn builtin_type_specifier_parser<'tokens, I>()
--> impl Parser<'tokens, I, TypeSpecifier, ParserExtra<'tokens, I>> + Clone
+fn builtin_type_specifier_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, TypeSpecifier, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
     choice((
-        just(TokenKind::Void).to(TypeSpecifier::Void),
-        just(TokenKind::Char).to(TypeSpecifier::Char),
-        just(TokenKind::Short).to(TypeSpecifier::Short),
-        just(TokenKind::Int).to(TypeSpecifier::Int),
-        just(TokenKind::Long).to(TypeSpecifier::Long),
-        just(TokenKind::Float).to(TypeSpecifier::Float),
-        just(TokenKind::Double).to(TypeSpecifier::Double),
-        just(TokenKind::Signed).to(TypeSpecifier::Signed),
-        just(TokenKind::Unsigned).to(TypeSpecifier::Unsigned),
+        just(TokenKind::Void).to(TypeSpecifierKind::Void),
+        just(TokenKind::Char).to(TypeSpecifierKind::Char),
+        just(TokenKind::Short).to(TypeSpecifierKind::Short),
+        just(TokenKind::Int).to(TypeSpecifierKind::Int),
+        just(TokenKind::Long).to(TypeSpecifierKind::Long),
+        just(TokenKind::Float).to(TypeSpecifierKind::Float),
+        just(TokenKind::Double).to(TypeSpecifierKind::Double),
+        just(TokenKind::Signed).to(TypeSpecifierKind::Signed),
+        just(TokenKind::Unsigned).to(TypeSpecifierKind::Unsigned),
     ))
+    .map_with(|kind, extra| type_spec(kind, extra.span()))
     .boxed()
 }
 
-fn record_or_enum_tag_ref_type_specifier_parser<'tokens, I>()
--> impl Parser<'tokens, I, TypeSpecifier, ParserExtra<'tokens, I>> + Clone
+fn record_or_enum_tag_ref_type_specifier_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, TypeSpecifier, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -655,20 +667,32 @@ where
         just(TokenKind::Union).to(RecordKind::Union),
     ))
     .then(tag.clone())
-    .map(|(kind, tag)| {
-        TypeSpecifier::StructOrUnion(RecordSpecifier {
-            kind,
-            tag: Some(tag),
-            members: None,
-        })
+    .map_with(|(kind, tag), extra| {
+        let span = parse_span_to_source_span(extra.span());
+        type_spec(
+            TypeSpecifierKind::StructOrUnion(RecordSpecifier {
+                kind,
+                tag: Some(tag),
+                members: None,
+                span,
+            }),
+            extra.span(),
+        )
     });
 
-    let enum_ref = just(TokenKind::Enum).ignore_then(tag).map(|tag| {
-        TypeSpecifier::Enum(EnumSpecifier {
-            tag: Some(tag),
-            variants: None,
-        })
-    });
+    let enum_ref = just(TokenKind::Enum)
+        .ignore_then(tag)
+        .map_with(|tag, extra| {
+            let span = parse_span_to_source_span(extra.span());
+            type_spec(
+                TypeSpecifierKind::Enum(EnumSpecifier {
+                    tag: Some(tag),
+                    variants: None,
+                    span,
+                }),
+                extra.span(),
+            )
+        });
 
     choice((record_ref, enum_ref)).boxed()
 }
@@ -683,8 +707,8 @@ fn bind_enum_variants(enum_spec: &EnumSpecifier, state: &mut Typedefs) {
     }
 }
 
-fn enum_enumerator_name_parser<'tokens, I>()
--> impl Parser<'tokens, I, String, ParserExtra<'tokens, I>> + Clone
+fn enum_enumerator_name_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, String, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -703,8 +727,8 @@ where
     )
 }
 
-fn integer_literal_expr_parser<'tokens, I>()
--> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
+fn integer_literal_expr_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -717,7 +741,7 @@ where
         TokenKind::ULongLongLiteral(value) => (value, IntLiteralSuffix::ULongLong),
     }
     .map_with(|(value, suffix), extra| {
-        Expr::int_with_base_and_span(value, suffix, span_to_source(extra.span()))
+        Expr::int_with_base_and_span(value, suffix, parse_span_to_source_span(extra.span()))
     });
 
     choice((
@@ -725,14 +749,14 @@ where
         just(TokenKind::Minus)
             .ignore_then(int_literal)
             .map_with(|expr, extra| {
-                Expr::unary(UnaryOp::Minus, expr).with_span(span_to_source(extra.span()))
+                Expr::unary(UnaryOp::Minus, expr).with_span(parse_span_to_source_span(extra.span()))
             }),
     ))
     .boxed()
 }
 
-fn constant_expression_parser<'tokens, I>()
--> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
+fn constant_expression_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, Expr, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -762,7 +786,7 @@ where
                 .map(ConstAtom::Expr),
         ))
         .map_with(|value, extra| {
-            let span = span_to_source(extra.span());
+            let span = parse_span_to_source_span(extra.span());
             match value {
                 ConstAtom::Expr(expr) => expr,
                 ConstAtom::Char(ch) => Expr::char_with_span(ch, span),
@@ -780,7 +804,7 @@ where
                 .map_with(|ty, extra| {
                     Expr::new(
                         ExprKind::SizeofType(Box::new(ty)),
-                        span_to_source(extra.span()),
+                        parse_span_to_source_span(extra.span()),
                     )
                 });
 
@@ -788,7 +812,7 @@ where
                 just(TokenKind::Sizeof)
                     .ignore_then(unary.clone())
                     .map_with(|expr, extra| {
-                        Expr::sizeof_expr(expr).with_span(span_to_source(extra.span()))
+                        Expr::sizeof_expr(expr).with_span(parse_span_to_source_span(extra.span()))
                     });
 
             let prefix_op = choice((
@@ -797,7 +821,7 @@ where
                 just(TokenKind::Bang).to(UnaryOp::LogicalNot),
                 just(TokenKind::Tilde).to(UnaryOp::BitNot),
             ))
-            .map_with(|op, extra| (op, span_to_source(extra.span())));
+            .map_with(|op, extra| (op, parse_span_to_source_span(extra.span())));
 
             choice((
                 prefix_op.then(unary.clone()).map(|((op, op_span), expr)| {
@@ -815,8 +839,8 @@ where
     .boxed()
 }
 
-fn record_member_declarator_suffix_parser<'tokens, I>()
--> impl Parser<'tokens, I, DirectDeclaratorSuffix, ParserExtra<'tokens, I>> + Clone
+fn record_member_declarator_suffix_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, DirectDeclaratorSuffix, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -860,25 +884,31 @@ where
                     }
                     .or_not(),
                 )
-                .map(|(pointers, name)| match name {
+                .map_with(|(pointers, name), extra| match name {
                     Some(name) => Some(Declarator {
                         pointers,
-                        direct: Box::new(DirectDeclarator::Ident(name)),
+                        direct: Box::new(direct_decl(
+                            DirectDeclaratorKind::Ident(name),
+                            extra.span(),
+                        )),
                     }),
                     None if pointers.is_empty() => None,
                     None => Some(Declarator {
                         pointers,
-                        direct: Box::new(DirectDeclarator::Abstract),
+                        direct: Box::new(direct_decl(DirectDeclaratorKind::Abstract, extra.span())),
                     }),
                 }),
         )
-        .map(|(specifiers, declarator)| ParameterDecl {
+        .map_with(|(specifiers, declarator), extra| ParameterDecl {
             specifiers,
             declarator: declarator.map(Box::new),
+            span: parse_span_to_source_span(extra.span()),
         });
 
     let function_suffix =
-        function_params_list_parser(member_parameter).map(DirectDeclaratorSuffix::Function);
+        function_params_list_parser(member_parameter).map_with(|params, extra| {
+            DirectDeclaratorSuffix::Function(params, parse_span_to_source_span(extra.span()))
+        });
 
     let array_size = constant_expression_parser()
         .map(ArraySize::Expr)
@@ -887,31 +917,37 @@ where
 
     let array_suffix = array_size
         .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
-        .map(|size| {
-            DirectDeclaratorSuffix::Array(ArrayDeclaratorSuffix {
-                qualifiers: Vec::new(),
-                is_static: false,
-                size,
-            })
+        .map_with(|size, extra| {
+            DirectDeclaratorSuffix::Array(
+                ArrayDeclaratorSuffix {
+                    qualifiers: Vec::new(),
+                    is_static: false,
+                    size,
+                },
+                parse_span_to_source_span(extra.span()),
+            )
         });
 
     choice((function_suffix, array_suffix)).boxed()
 }
 
-fn record_member_declarator_parser<'tokens, I>()
--> impl Parser<'tokens, I, Declarator, ParserExtra<'tokens, I>> + Clone
+fn record_member_declarator_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, Declarator, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
     recursive(|declarator| {
         let direct_ident = select! {
-            TokenKind::Identifier(name) => DirectDeclarator::Ident(name),
-        };
+            TokenKind::Identifier(name) => name,
+        }
+        .map_with(|name, extra| direct_decl(DirectDeclaratorKind::Ident(name), extra.span()));
 
         let direct_grouped = declarator
             .clone()
             .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
-            .map(|decl| DirectDeclarator::Grouped(Box::new(decl)));
+            .map_with(|decl, extra| {
+                direct_decl(DirectDeclaratorKind::Grouped(Box::new(decl)), extra.span())
+            });
 
         let direct_base = choice((direct_ident, direct_grouped));
 
@@ -933,8 +969,8 @@ where
     .boxed()
 }
 
-fn record_member_declaration_parser<'tokens, I>()
--> impl Parser<'tokens, I, RecordMemberDecl, ParserExtra<'tokens, I>> + Clone
+fn record_member_declaration_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, RecordMemberDecl, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -967,11 +1003,16 @@ where
             ));
         }
 
-        Ok(TypeSpecifier::StructOrUnion(RecordSpecifier {
-            kind,
-            tag,
-            members,
-        }))
+        let node_span = parse_span_to_source_span(span);
+        Ok(TypeSpecifier::new(
+            TypeSpecifierKind::StructOrUnion(RecordSpecifier {
+                kind,
+                tag,
+                members,
+                span: node_span,
+            }),
+            node_span,
+        ))
     });
 
     let nested_enum_spec = just(TokenKind::Enum)
@@ -983,7 +1024,11 @@ where
                         .ignore_then(constant_expression_parser())
                         .or_not(),
                 )
-                .map(|(name, value)| EnumVariant { name, value })
+                .map_with(|(name, value), extra| EnumVariant {
+                    name,
+                    value,
+                    span: parse_span_to_source_span(extra.span()),
+                })
                 .separated_by(just(TokenKind::Comma))
                 .at_least(1)
                 .collect::<Vec<_>>()
@@ -999,10 +1044,18 @@ where
                 ));
             }
 
-            Ok(TypeSpecifier::Enum(EnumSpecifier { tag, variants }))
+            let node_span = parse_span_to_source_span(span);
+            Ok(TypeSpecifier::new(
+                TypeSpecifierKind::Enum(EnumSpecifier {
+                    tag,
+                    variants,
+                    span: node_span,
+                }),
+                node_span,
+            ))
         })
         .map_with(|ty, extra| {
-            if let TypeSpecifier::Enum(enum_spec) = &ty {
+            if let TypeSpecifierKind::Enum(enum_spec) = &ty.kind {
                 bind_enum_variants(enum_spec, extra.state());
             }
             ty
@@ -1049,17 +1102,18 @@ where
                     .collect::<Vec<_>>(),
             )
             .then_ignore(just(TokenKind::Semicolon))
-            .map(|(specifiers, declarators)| RecordMemberDecl {
+            .map_with(|(specifiers, declarators), extra| RecordMemberDecl {
                 specifiers,
                 declarators,
+                span: parse_span_to_source_span(extra.span()),
             }),
     );
 
     member_decl.boxed()
 }
 
-fn record_specifier_parser<'tokens, I>()
--> impl Parser<'tokens, I, TypeSpecifier, ParserExtra<'tokens, I>> + Clone
+fn record_specifier_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, TypeSpecifier, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -1089,17 +1143,22 @@ where
                 ));
             }
 
-            Ok(TypeSpecifier::StructOrUnion(RecordSpecifier {
-                kind,
-                tag,
-                members,
-            }))
+            let node_span = parse_span_to_source_span(span);
+            Ok(TypeSpecifier::new(
+                TypeSpecifierKind::StructOrUnion(RecordSpecifier {
+                    kind,
+                    tag,
+                    members,
+                    span: node_span,
+                }),
+                node_span,
+            ))
         })
         .boxed()
 }
 
-fn enum_specifier_parser<'tokens, I>()
--> impl Parser<'tokens, I, TypeSpecifier, ParserExtra<'tokens, I>> + Clone
+fn enum_specifier_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, TypeSpecifier, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -1114,7 +1173,11 @@ where
                 .ignore_then(constant_expression_parser())
                 .or_not(),
         )
-        .map(|(name, value)| EnumVariant { name, value });
+        .map_with(|(name, value), extra| EnumVariant {
+            name,
+            value,
+            span: parse_span_to_source_span(extra.span()),
+        });
 
     let variants = enumerator
         .separated_by(just(TokenKind::Comma))
@@ -1135,10 +1198,18 @@ where
                 ));
             }
 
-            Ok(TypeSpecifier::Enum(EnumSpecifier { tag, variants }))
+            let node_span = parse_span_to_source_span(span);
+            Ok(TypeSpecifier::new(
+                TypeSpecifierKind::Enum(EnumSpecifier {
+                    tag,
+                    variants,
+                    span: node_span,
+                }),
+                node_span,
+            ))
         })
         .map_with(|ty, extra| {
-            if let TypeSpecifier::Enum(enum_spec) = &ty {
+            if let TypeSpecifierKind::Enum(enum_spec) = &ty.kind {
                 bind_enum_variants(enum_spec, extra.state());
             }
             ty
@@ -1148,8 +1219,8 @@ where
 
 /// Parse declaration specifiers and keep the original sequence information
 /// grouped by category for later semantic validation.
-fn decl_spec_parser<'tokens, I>()
--> impl Parser<'tokens, I, DeclSpec, ParserExtra<'tokens, I>> + Clone
+fn decl_spec_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, DeclSpec, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -1216,11 +1287,11 @@ where
             .or_not(),
         )
         .then(array_suffixes)
-        .map(|((pointers, name), suffixes)| {
+        .map_with(|((pointers, name), suffixes), extra| {
             let direct_base = match name {
-                Some(name) => Some(DirectDeclarator::Ident(name)),
+                Some(name) => Some(direct_decl(DirectDeclaratorKind::Ident(name), extra.span())),
                 None if !suffixes.is_empty() || !pointers.is_empty() => {
-                    Some(DirectDeclarator::Abstract)
+                    Some(direct_decl(DirectDeclaratorKind::Abstract, extra.span()))
                 }
                 None => None,
             };
@@ -1249,19 +1320,21 @@ where
     let type_name_parameter_declarator =
         pointer_ident_array_declarator_parser(type_name_array_suffix.clone());
 
-    let type_name_parameter =
-        decl_spec
-            .clone()
-            .then(type_name_parameter_declarator)
-            .map(|(specifiers, declarator)| ParameterDecl {
-                specifiers,
-                declarator: declarator.map(Box::new),
-            });
+    let type_name_parameter = decl_spec
+        .clone()
+        .then(type_name_parameter_declarator)
+        .map_with(|(specifiers, declarator), extra| ParameterDecl {
+            specifiers,
+            declarator: declarator.map(Box::new),
+            span: parse_span_to_source_span(extra.span()),
+        });
 
     let type_name_function_params = function_params_list_parser(type_name_parameter);
 
     let type_name_suffix = choice((
-        type_name_function_params.map(DirectDeclaratorSuffix::Function),
+        type_name_function_params.map_with(|params, extra| {
+            DirectDeclaratorSuffix::Function(params, parse_span_to_source_span(extra.span()))
+        }),
         type_name_array_suffix,
     ));
 
@@ -1276,8 +1349,8 @@ where
         .boxed()
 }
 
-fn type_name_decl_spec_parser<'tokens, I>()
--> impl Parser<'tokens, I, DeclSpec, ParserExtra<'tokens, I>> + Clone
+fn type_name_decl_spec_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, DeclSpec, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -1320,8 +1393,8 @@ where
     type_name_with_decl_spec_and_size_expr_parser(decl_spec_parser(), size_expr)
 }
 
-fn type_name_parser<'tokens, I>()
--> impl Parser<'tokens, I, TypeName, ParserExtra<'tokens, I>> + Clone
+fn type_name_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, TypeName, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -1334,7 +1407,8 @@ fn is_void_parameter_decl(param: &ParameterDecl) -> bool {
         && param.specifiers.storage.is_empty()
         && param.specifiers.qualifiers.is_empty()
         && param.specifiers.function.is_empty()
-        && param.specifiers.ty == vec![TypeSpecifier::Void]
+        && param.specifiers.ty.len() == 1
+        && matches!(param.specifiers.ty[0].kind, TypeSpecifierKind::Void)
 }
 
 fn map_parameter_list(params: Option<Vec<ParameterDecl>>, variadic: bool) -> FunctionParams {
@@ -1353,8 +1427,8 @@ fn map_parameter_list(params: Option<Vec<ParameterDecl>>, variadic: bool) -> Fun
 /// Parse the variadic suffix `, ...` in function parameter lists.
 ///
 /// Returns `true` if the parameter list is variadic, `false` otherwise.
-fn variadic_suffix_parser<'tokens, I>()
--> impl Parser<'tokens, I, bool, ParserExtra<'tokens, I>> + Clone
+fn variadic_suffix_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, bool, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -1398,8 +1472,8 @@ where
         })
 }
 
-fn basic_parameter_declarator_parser<'tokens, I>()
--> impl Parser<'tokens, I, Option<Declarator>, ParserExtra<'tokens, I>> + Clone
+fn basic_parameter_declarator_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, Option<Declarator>, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -1409,16 +1483,17 @@ where
     .boxed()
 }
 
-fn simple_function_params_parser<'tokens, I>()
--> impl Parser<'tokens, I, FunctionParams, ParserExtra<'tokens, I>> + Clone
+fn simple_function_params_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, FunctionParams, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
     let parameter = decl_spec_parser()
         .then(basic_parameter_declarator_parser())
-        .map(|(specifiers, declarator)| ParameterDecl {
+        .map_with(|(specifiers, declarator), extra| ParameterDecl {
             specifiers,
             declarator: declarator.map(Box::new),
+            span: parse_span_to_source_span(extra.span()),
         });
 
     function_params_list_parser(parameter).boxed()
@@ -1432,8 +1507,8 @@ where
 /// Returns:
 /// - `None` when there is no declarator at all (e.g. parameter is just `int`).
 /// - `Some(Declarator { direct: Abstract, .. })` for unnamed abstract forms like `char *`.
-fn parameter_declarator_parser<'tokens, I>()
--> impl Parser<'tokens, I, Option<Declarator>, ParserExtra<'tokens, I>> + Clone
+fn parameter_declarator_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, Option<Declarator>, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -1443,18 +1518,24 @@ where
         .clone()
         .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
         .then(simple_function_params_parser())
-        .map(|(inner_declarator, params)| {
+        .map_with(|(inner_declarator, params), extra| {
             let inner_declarator = inner_declarator.unwrap_or(Declarator {
                 pointers: Vec::new(),
-                direct: Box::new(DirectDeclarator::Abstract),
+                direct: Box::new(direct_decl(DirectDeclaratorKind::Abstract, extra.span())),
             });
 
             Some(Declarator {
                 pointers: Vec::new(),
-                direct: Box::new(DirectDeclarator::Function {
-                    inner: Box::new(DirectDeclarator::Grouped(Box::new(inner_declarator))),
-                    params,
-                }),
+                direct: Box::new(direct_decl(
+                    DirectDeclaratorKind::Function {
+                        inner: Box::new(direct_decl(
+                            DirectDeclaratorKind::Grouped(Box::new(inner_declarator)),
+                            extra.span(),
+                        )),
+                        params,
+                    },
+                    extra.span(),
+                )),
             })
         });
 
@@ -1465,18 +1546,18 @@ where
 /// - `()` as old-style non-prototype
 /// - `(void)` as empty prototype
 /// - `(int x, char *p)` as named prototype
-fn function_params_parser<'tokens, I>()
--> impl Parser<'tokens, I, FunctionParams, ParserExtra<'tokens, I>> + Clone
+fn function_params_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, FunctionParams, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
-    let parameter =
-        decl_spec_parser()
-            .then(parameter_declarator_parser())
-            .map(|(specifiers, declarator)| ParameterDecl {
-                specifiers,
-                declarator: declarator.map(Box::new),
-            });
+    let parameter = decl_spec_parser()
+        .then(parameter_declarator_parser())
+        .map_with(|(specifiers, declarator), extra| ParameterDecl {
+            specifiers,
+            declarator: declarator.map(Box::new),
+            span: parse_span_to_source_span(extra.span()),
+        });
 
     function_params_list_parser(parameter).boxed()
 }
@@ -1529,15 +1610,15 @@ where
 
     choice((static_then_qualifiers, qualifiers_then_static, plain_array))
         .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
-        .map(DirectDeclaratorSuffix::Array)
+        .map_with(|array, extra| DirectDeclaratorSuffix::Array(array, parse_span_to_source_span(extra.span())))
 }
 
 #[derive(Clone)]
 enum DirectDeclaratorSuffix {
     /// Function suffix: `(params...)`
-    Function(FunctionParams),
+    Function(FunctionParams, SourceSpan),
     /// Array suffix: `[...]`
-    Array(ArrayDeclaratorSuffix),
+    Array(ArrayDeclaratorSuffix, SourceSpan),
 }
 
 fn fold_direct_declarator_suffixes(
@@ -1547,16 +1628,28 @@ fn fold_direct_declarator_suffixes(
     suffixes
         .into_iter()
         .fold(base, |inner, suffix| match suffix {
-            DirectDeclaratorSuffix::Function(params) => DirectDeclarator::Function {
-                inner: Box::new(inner),
-                params,
-            },
-            DirectDeclaratorSuffix::Array(array) => DirectDeclarator::Array {
-                inner: Box::new(inner),
-                qualifiers: array.qualifiers,
-                is_static: array.is_static,
-                size: Box::new(array.size),
-            },
+            DirectDeclaratorSuffix::Function(params, suffix_span) => {
+                let span = inner.span.join(suffix_span);
+                DirectDeclarator::new(
+                    DirectDeclaratorKind::Function {
+                        inner: Box::new(inner),
+                        params,
+                    },
+                    span,
+                )
+            }
+            DirectDeclaratorSuffix::Array(array, suffix_span) => {
+                let span = inner.span.join(suffix_span);
+                DirectDeclarator::new(
+                    DirectDeclaratorKind::Array {
+                        inner: Box::new(inner),
+                        qualifiers: array.qualifiers,
+                        is_static: array.is_static,
+                        size: Box::new(array.size),
+                    },
+                    span,
+                )
+            }
         })
 }
 
@@ -1571,7 +1664,9 @@ where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
     FP: Parser<'tokens, I, FunctionParams, ParserExtra<'tokens, I>> + Clone + 'tokens,
 {
-    let function_suffix = function_params.map(DirectDeclaratorSuffix::Function);
+    let function_suffix = function_params.map_with(|params, extra| {
+        DirectDeclaratorSuffix::Function(params, parse_span_to_source_span(extra.span()))
+    });
 
     // Supports array declarator forms with optional qualifiers/static:
     // `[]`, `[e]`, `[const]`, `[static e]`, `[const static e]`, `[static const e]`.
@@ -1586,8 +1681,8 @@ where
 ///
 /// This parser is intentionally suffix-only so declarator parsing can build:
 /// `base-ident + suffix*` and fold left-to-right.
-fn direct_declarator_suffix_parser<'tokens, I>()
--> impl Parser<'tokens, I, DirectDeclaratorSuffix, ParserExtra<'tokens, I>> + Clone
+fn direct_declarator_suffix_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, DirectDeclaratorSuffix, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -1605,7 +1700,9 @@ where
         let grouped_base = abstract_declarator
             .clone()
             .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
-            .map(|decl| DirectDeclarator::Grouped(Box::new(decl)));
+            .map_with(|decl, extra| {
+                direct_decl(DirectDeclaratorKind::Grouped(Box::new(decl)), extra.span())
+            });
 
         let grouped_with_suffix = grouped_base
             .then(suffix.clone().repeated().collect::<Vec<_>>())
@@ -1616,7 +1713,12 @@ where
             .repeated()
             .at_least(1)
             .collect::<Vec<_>>()
-            .map(|suffixes| fold_direct_declarator_suffixes(DirectDeclarator::Abstract, suffixes));
+            .map_with(|suffixes, extra| {
+                fold_direct_declarator_suffixes(
+                    direct_decl(DirectDeclaratorKind::Abstract, extra.span()),
+                    suffixes,
+                )
+            });
 
         let direct = choice((grouped_with_suffix, implicit_abstract_with_suffix));
 
@@ -1629,9 +1731,9 @@ where
 
         let pointer_only = pointer_layers_parser()
             .filter(|pointers| !pointers.is_empty())
-            .map(|pointers| Declarator {
+            .map_with(|pointers, extra| Declarator {
                 pointers,
-                direct: Box::new(DirectDeclarator::Abstract),
+                direct: Box::new(direct_decl(DirectDeclaratorKind::Abstract, extra.span())),
             });
 
         choice((with_direct, pointer_only))
@@ -1641,21 +1743,24 @@ where
 
 /// Parse the currently supported declarator subset:
 /// zero-or-more pointer stars, then identifier and postfix direct-declarator suffixes.
-fn declarator_parser<'tokens, I>()
--> impl Parser<'tokens, I, Declarator, ParserExtra<'tokens, I>> + Clone
+fn declarator_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, Declarator, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
     recursive(|declarator| {
         let direct_ident = select! {
-            TokenKind::Identifier(name) => DirectDeclarator::Ident(name),
+            TokenKind::Identifier(name) => name,
         }
+        .map_with(|name, extra| direct_decl(DirectDeclaratorKind::Ident(name), extra.span()))
         .labelled(ParserLabel::IdentifierDeclarator.as_str());
 
         let direct_grouped = declarator
             .clone()
             .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
-            .map(|decl| DirectDeclarator::Grouped(Box::new(decl)));
+            .map_with(|decl, extra| {
+                direct_decl(DirectDeclaratorKind::Grouped(Box::new(decl)), extra.span())
+            });
 
         let direct_base = choice((direct_ident, direct_grouped));
 
@@ -1677,13 +1782,12 @@ where
 }
 
 fn direct_declarator_name(direct: &DirectDeclarator) -> Option<&str> {
-    match direct {
-        DirectDeclarator::Ident(name) => Some(name),
-        DirectDeclarator::Abstract => None,
-        DirectDeclarator::Grouped(declarator) => declarator_name(declarator),
-        DirectDeclarator::Array { inner, .. } | DirectDeclarator::Function { inner, .. } => {
-            direct_declarator_name(inner)
-        }
+    match &direct.kind {
+        DirectDeclaratorKind::Ident(name) => Some(name),
+        DirectDeclaratorKind::Abstract => None,
+        DirectDeclaratorKind::Grouped(declarator) => declarator_name(declarator),
+        DirectDeclaratorKind::Array { inner, .. }
+        | DirectDeclaratorKind::Function { inner, .. } => direct_declarator_name(inner),
     }
 }
 
@@ -1727,13 +1831,13 @@ where
 }
 
 fn function_params_from_direct_declarator(direct: &DirectDeclarator) -> Option<&FunctionParams> {
-    match direct {
-        DirectDeclarator::Function { params, .. } => Some(params),
-        DirectDeclarator::Array { inner, .. } => function_params_from_direct_declarator(inner),
-        DirectDeclarator::Grouped(declarator) => {
+    match &direct.kind {
+        DirectDeclaratorKind::Function { params, .. } => Some(params),
+        DirectDeclaratorKind::Array { inner, .. } => function_params_from_direct_declarator(inner),
+        DirectDeclaratorKind::Grouped(declarator) => {
             function_params_from_direct_declarator(declarator.direct.as_ref())
         }
-        DirectDeclarator::Ident(_) | DirectDeclarator::Abstract => None,
+        DirectDeclaratorKind::Ident(_) | DirectDeclaratorKind::Abstract => None,
     }
 }
 
@@ -1768,19 +1872,20 @@ where
 {
     let mut initializer = Recursive::declare();
 
-    let scalar = scalar_expr.map(|expr| Initializer {
+    let scalar = scalar_expr.map_with(|expr, extra| Initializer {
         kind: InitializerKind::Expr(expr),
+        span: parse_span_to_source_span(extra.span()),
     });
 
     let designator = choice((
         constant_expression_parser()
             .delimited_by(just(TokenKind::LBracket), just(TokenKind::RBracket))
-            .map(Designator::Index),
+            .map_with(|expr, extra| designator(DesignatorKind::Index(expr), extra.span())),
         just(TokenKind::Dot)
             .ignore_then(select! {
                 TokenKind::Identifier(field) => field,
             })
-            .map(Designator::Field),
+            .map_with(|field, extra| designator(DesignatorKind::Field(field), extra.span())),
     ));
 
     let initializer_item = designator
@@ -1789,10 +1894,15 @@ where
         .collect::<Vec<_>>()
         .then_ignore(just(TokenKind::Assign))
         .then(initializer.clone())
-        .map(|(designators, init)| InitializerItem { designators, init })
-        .or(initializer.clone().map(|init| InitializerItem {
+        .map_with(|(designators, init), extra| InitializerItem {
+            designators,
+            init,
+            span: parse_span_to_source_span(extra.span()),
+        })
+        .or(initializer.clone().map_with(|init, extra| InitializerItem {
             designators: Vec::new(),
             init,
+            span: parse_span_to_source_span(extra.span()),
         }));
 
     let aggregate_items = initializer_item
@@ -1804,8 +1914,9 @@ where
     let aggregate = aggregate_items
         .clone()
         .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
-        .map(|items| Initializer {
+        .map_with(|items, extra| Initializer {
             kind: InitializerKind::Aggregate(items),
+            span: parse_span_to_source_span(extra.span()),
         });
 
     initializer.define(choice((aggregate, scalar)).boxed());
@@ -1813,8 +1924,9 @@ where
     if require_braces {
         aggregate_items
             .delimited_by(just(TokenKind::LBrace), just(TokenKind::RBrace))
-            .map(|items| Initializer {
+            .map_with(|items, extra| Initializer {
                 kind: InitializerKind::Aggregate(items),
+                span: parse_span_to_source_span(extra.span()),
             })
             .boxed()
     } else {
@@ -1822,8 +1934,8 @@ where
     }
 }
 
-fn initializer_parser<'tokens, I>()
--> impl Parser<'tokens, I, Initializer, ParserExtra<'tokens, I>> + Clone
+fn initializer_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, Initializer, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -1831,8 +1943,8 @@ where
 }
 
 /// Parse a declaration statement ending with `;`.
-fn declaration_parser<'tokens, I>()
--> impl Parser<'tokens, I, Declaration, ParserExtra<'tokens, I>> + Clone
+fn declaration_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, Declaration, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -1910,7 +2022,7 @@ where
         .then_ignore(just(TokenKind::RBrace))
         .map_with(|(_, items), extra| {
             extra.state().pop_scope();
-            let span = span_to_source(extra.span());
+            let span = parse_span_to_source_span(extra.span());
             Stmt::new(StmtKind::Compound(CompoundStmt { items, span }), span)
         })
         .labelled(ParserLabel::CompoundStatement.as_str())
@@ -1931,7 +2043,7 @@ where
                 Some(expr) => StmtKind::Expr(expr),
                 None => StmtKind::Empty,
             };
-            Stmt::new(kind, span_to_source(extra.span()))
+            Stmt::new(kind, parse_span_to_source_span(extra.span()))
         })
         .labelled(ParserLabel::ExpressionStatement.as_str())
 }
@@ -1947,7 +2059,7 @@ where
     just(TokenKind::Return)
         .ignore_then(expr.or_not())
         .then_ignore(just(TokenKind::Semicolon))
-        .map_with(|expr, extra| Stmt::new(StmtKind::Return(expr), span_to_source(extra.span())))
+        .map_with(|expr, extra| Stmt::new(StmtKind::Return(expr), parse_span_to_source_span(extra.span())))
         .labelled(ParserLabel::ReturnStatement.as_str())
 }
 
@@ -1972,7 +2084,7 @@ where
                     then_branch: Box::new(then_branch),
                     else_branch: else_branch.map(Box::new),
                 },
-                span_to_source(extra.span()),
+                parse_span_to_source_span(extra.span()),
             )
         })
         .labelled(ParserLabel::IfStatement.as_str())
@@ -1997,7 +2109,7 @@ where
                     cond,
                     body: Box::new(body),
                 },
-                span_to_source(extra.span()),
+                parse_span_to_source_span(extra.span()),
             )
         })
         .labelled(ParserLabel::WhileStatement.as_str())
@@ -2024,7 +2136,7 @@ where
                     body: Box::new(body),
                     cond,
                 },
-                span_to_source(extra.span()),
+                parse_span_to_source_span(extra.span()),
             )
         })
         .labelled(ParserLabel::DoWhileStatement.as_str())
@@ -2080,7 +2192,7 @@ where
                     step,
                     body: Box::new(body),
                 },
-                span_to_source(extra.span()),
+                parse_span_to_source_span(extra.span()),
             )
         })
         .labelled(ParserLabel::ForStatement.as_str())
@@ -2105,7 +2217,7 @@ where
                     expr,
                     body: Box::new(body),
                 },
-                span_to_source(extra.span()),
+                parse_span_to_source_span(extra.span()),
             )
         })
         .labelled(ParserLabel::SwitchStatement.as_str())
@@ -2130,7 +2242,7 @@ where
                     expr,
                     stmt: Box::new(stmt),
                 },
-                span_to_source(extra.span()),
+                parse_span_to_source_span(extra.span()),
             )
         })
         .labelled(ParserLabel::CaseStatement.as_str())
@@ -2152,7 +2264,7 @@ where
                 StmtKind::Default {
                     stmt: Box::new(stmt),
                 },
-                span_to_source(extra.span()),
+                parse_span_to_source_span(extra.span()),
             )
         })
         .labelled(ParserLabel::DefaultStatement.as_str())
@@ -2177,39 +2289,39 @@ where
                 label,
                 stmt: Box::new(stmt),
             },
-            span_to_source(extra.span()),
+            parse_span_to_source_span(extra.span()),
         )
     })
     .labelled(ParserLabel::LabelStatement.as_str())
 }
 
 /// Parse `break;`.
-fn break_statement_parser<'tokens, I>()
--> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
+fn break_statement_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
     just(TokenKind::Break)
         .then_ignore(just(TokenKind::Semicolon))
-        .map_with(|_, extra| Stmt::new(StmtKind::Break, span_to_source(extra.span())))
+        .map_with(|_, extra| Stmt::new(StmtKind::Break, parse_span_to_source_span(extra.span())))
         .labelled(ParserLabel::BreakStatement.as_str())
 }
 
 /// Parse `continue;`.
-fn continue_statement_parser<'tokens, I>()
--> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
+fn continue_statement_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
     just(TokenKind::Continue)
         .then_ignore(just(TokenKind::Semicolon))
-        .map_with(|_, extra| Stmt::new(StmtKind::Continue, span_to_source(extra.span())))
+        .map_with(|_, extra| Stmt::new(StmtKind::Continue, parse_span_to_source_span(extra.span())))
         .labelled(ParserLabel::ContinueStatement.as_str())
 }
 
 /// Parse `goto identifier;`.
-fn goto_statement_parser<'tokens, I>()
--> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
+fn goto_statement_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, Stmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -2218,7 +2330,7 @@ where
             TokenKind::Identifier(name) => name,
         })
         .then_ignore(just(TokenKind::Semicolon))
-        .map_with(|name, extra| Stmt::new(StmtKind::Goto(name), span_to_source(extra.span())))
+        .map_with(|name, extra| Stmt::new(StmtKind::Goto(name), parse_span_to_source_span(extra.span())))
         .labelled(ParserLabel::GotoStatement.as_str())
 }
 
@@ -2264,8 +2376,8 @@ where
 }
 
 /// Parse one block item as either a declaration or a statement.
-fn block_item_parser<'tokens, I>()
--> impl Parser<'tokens, I, BlockItem, ParserExtra<'tokens, I>> + Clone
+fn block_item_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, BlockItem, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -2276,8 +2388,8 @@ where
 ///
 /// Function parameters and the outermost compound block share one scope in C.
 /// `function_definition_parser` enters that scope before parsing this body.
-fn function_body_parser<'tokens, I>()
--> impl Parser<'tokens, I, CompoundStmt, ParserExtra<'tokens, I>> + Clone
+fn function_body_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, CompoundStmt, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -2290,7 +2402,7 @@ where
         .then_ignore(just(TokenKind::RBrace))
         .map_with(|items, extra| CompoundStmt {
             items,
-            span: span_to_source(extra.span()),
+            span: parse_span_to_source_span(extra.span()),
         })
         .labelled(ParserLabel::CompoundStatement.as_str())
 }
@@ -2299,8 +2411,8 @@ where
 // Translation unit parsing
 // ============================
 
-fn function_definition_parser<'tokens, I>()
--> impl Parser<'tokens, I, FunctionDef, ParserExtra<'tokens, I>> + Clone
+fn function_definition_parser<'tokens, I>(
+) -> impl Parser<'tokens, I, FunctionDef, ParserExtra<'tokens, I>> + Clone
 where
     I: ValueInput<'tokens, Token = TokenKind, Span = Span>,
 {
@@ -2335,6 +2447,7 @@ where
                 declarator,
                 declarations: Vec::new(),
                 body,
+                span: parse_span_to_source_span(extra.span()),
             }
         })
 }

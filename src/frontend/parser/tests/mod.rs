@@ -35,8 +35,8 @@ fn parse_statement_source_error(src: &str) -> Vec<ParseError<'_>> {
 }
 
 fn assert_direct_ident(direct: &DirectDeclarator, expected: &str) {
-    match direct {
-        DirectDeclarator::Ident(name) => assert_eq!(name, expected),
+    match &direct.kind {
+        DirectDeclaratorKind::Ident(name) => assert_eq!(name, expected),
         other => panic!("expected identifier declarator, got {other:?}"),
     }
 }
@@ -58,6 +58,181 @@ fn expect_return_expr(item: &BlockItem) -> &Expr {
         panic!("expected return expression");
     };
     expr
+}
+
+impl TypeSpecifier {
+    pub fn test_new(kind: TypeSpecifierKind) -> Self {
+        Self::new(kind, SourceSpan::dummy())
+    }
+
+    #[allow(non_upper_case_globals)]
+    pub const Void: Self = Self {
+        kind: TypeSpecifierKind::Void,
+        span: SourceSpan { start: 0, end: 0 },
+    };
+
+    #[allow(non_upper_case_globals)]
+    pub const Char: Self = Self {
+        kind: TypeSpecifierKind::Char,
+        span: SourceSpan { start: 0, end: 0 },
+    };
+
+    #[allow(non_upper_case_globals)]
+    pub const Short: Self = Self {
+        kind: TypeSpecifierKind::Short,
+        span: SourceSpan { start: 0, end: 0 },
+    };
+
+    #[allow(non_upper_case_globals)]
+    pub const Int: Self = Self {
+        kind: TypeSpecifierKind::Int,
+        span: SourceSpan { start: 0, end: 0 },
+    };
+
+    #[allow(non_upper_case_globals)]
+    pub const Long: Self = Self {
+        kind: TypeSpecifierKind::Long,
+        span: SourceSpan { start: 0, end: 0 },
+    };
+
+    #[allow(non_upper_case_globals)]
+    pub const Float: Self = Self {
+        kind: TypeSpecifierKind::Float,
+        span: SourceSpan { start: 0, end: 0 },
+    };
+
+    #[allow(non_upper_case_globals)]
+    pub const Double: Self = Self {
+        kind: TypeSpecifierKind::Double,
+        span: SourceSpan { start: 0, end: 0 },
+    };
+
+    #[allow(non_upper_case_globals)]
+    pub const Signed: Self = Self {
+        kind: TypeSpecifierKind::Signed,
+        span: SourceSpan { start: 0, end: 0 },
+    };
+
+    #[allow(non_upper_case_globals)]
+    pub const Unsigned: Self = Self {
+        kind: TypeSpecifierKind::Unsigned,
+        span: SourceSpan { start: 0, end: 0 },
+    };
+
+    #[allow(non_upper_case_globals)]
+    pub const Bool: Self = Self {
+        kind: TypeSpecifierKind::Bool,
+        span: SourceSpan { start: 0, end: 0 },
+    };
+
+    #[allow(non_snake_case)]
+    pub fn TypedefName(name: String) -> Self {
+        Self::test_new(TypeSpecifierKind::TypedefName(name))
+    }
+
+    #[allow(non_snake_case)]
+    pub fn StructOrUnion(record: RecordSpecifier) -> Self {
+        Self::test_new(TypeSpecifierKind::StructOrUnion(record))
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Enum(enum_spec: EnumSpecifier) -> Self {
+        Self::test_new(TypeSpecifierKind::Enum(enum_spec))
+    }
+}
+
+impl DirectDeclarator {
+    pub fn test_new(kind: DirectDeclaratorKind) -> Self {
+        Self::new(kind, SourceSpan::dummy())
+    }
+
+    #[allow(non_upper_case_globals)]
+    pub const Abstract: Self = Self {
+        kind: DirectDeclaratorKind::Abstract,
+        span: SourceSpan { start: 0, end: 0 },
+    };
+
+    #[allow(non_snake_case)]
+    pub fn Ident(name: String) -> Self {
+        Self::test_new(DirectDeclaratorKind::Ident(name))
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Grouped(declarator: Box<Declarator>) -> Self {
+        Self::test_new(DirectDeclaratorKind::Grouped(declarator))
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Array(
+        inner: Box<DirectDeclarator>,
+        qualifiers: Vec<TypeQualifier>,
+        is_static: bool,
+        size: Box<ArraySize>,
+    ) -> Self {
+        Self::test_new(DirectDeclaratorKind::Array {
+            inner,
+            qualifiers,
+            is_static,
+            size,
+        })
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Function(inner: Box<DirectDeclarator>, params: FunctionParams) -> Self {
+        Self::test_new(DirectDeclaratorKind::Function { inner, params })
+    }
+}
+
+impl Designator {
+    pub fn test_new(kind: DesignatorKind) -> Self {
+        Self::new(kind, SourceSpan::dummy())
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Index(expr: Expr) -> Self {
+        Self::test_new(DesignatorKind::Index(expr))
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Field(field: String) -> Self {
+        Self::test_new(DesignatorKind::Field(field))
+    }
+}
+
+impl Stmt {
+    pub fn test_new(kind: StmtKind) -> Self {
+        Self::new(kind, SourceSpan::dummy())
+    }
+}
+
+impl Expr {
+    pub fn test_new(kind: ExprKind) -> Self {
+        Self::new(kind, SourceSpan::dummy())
+    }
+
+    pub fn int(value: u64) -> Self {
+        Self::int_with_span(value, SourceSpan::dummy())
+    }
+
+    pub fn int_with_base(value: u64, base: IntLiteralSuffix) -> Self {
+        Self::int_with_base_and_span(value, base, SourceSpan::dummy())
+    }
+
+    pub fn float(value: f64) -> Self {
+        Self::float_with_span(value, SourceSpan::dummy())
+    }
+
+    pub fn char(value: char) -> Self {
+        Self::char_with_span(value, SourceSpan::dummy())
+    }
+
+    pub fn string(value: String) -> Self {
+        Self::string_with_span(value, SourceSpan::dummy())
+    }
+
+    pub fn var(name: String) -> Self {
+        Self::var_with_span(name, SourceSpan::dummy())
+    }
 }
 
 mod control_flow;

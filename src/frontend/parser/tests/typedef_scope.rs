@@ -74,7 +74,7 @@ fn enum_shadows_typedef() {
     let BlockItem::Decl(enum_decl) = &def.body.items[0] else {
         panic!("expected enum");
     };
-    let TypeSpecifier::Enum(enum_spec) = &enum_decl.specifiers.ty[0] else {
+    let TypeSpecifierKind::Enum(enum_spec) = &enum_decl.specifiers.ty[0].kind else {
         panic!("expected enum");
     };
     let variants = enum_spec.variants.as_ref().expect("variants expected");
@@ -106,7 +106,7 @@ fn parameter_shadows_typedef() {
     let ExternalDecl::FunctionDef(def) = &unit.items[1] else {
         panic!("expected function");
     };
-    let DirectDeclarator::Function { params, .. } = def.declarator.direct.as_ref() else {
+    let DirectDeclaratorKind::Function { params, .. } = &def.declarator.direct.kind else {
         panic!("expected function declarator");
     };
     let FunctionParams::Prototype { params, .. } = params else {

@@ -110,7 +110,7 @@ fn parses_case_sizeof_with_abstract_array_type() {
         panic!("expected sizeof(type)");
     };
     let declarator = ty.declarator.as_ref().expect("array declarator expected");
-    let DirectDeclarator::Array { size, .. } = declarator.direct.as_ref() else {
+    let DirectDeclaratorKind::Array { size, .. } = &declarator.direct.kind else {
         panic!("expected array declarator");
     };
     assert_eq!(size.as_ref(), &ArraySize::Expr(Expr::int(3)));
