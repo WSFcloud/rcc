@@ -447,7 +447,7 @@ pub fn assignment_compatible_with_const(
 }
 
 /// Checks if a type is an integer type.
-fn is_integer(kind: &TypeKind) -> bool {
+pub fn is_integer(kind: &TypeKind) -> bool {
     matches!(
         kind,
         TypeKind::Bool
@@ -460,6 +460,159 @@ fn is_integer(kind: &TypeKind) -> bool {
             | TypeKind::LongLong { .. }
             | TypeKind::Enum(_)
     )
+}
+
+/// Checks if a semantic type id is a pointer.
+pub fn is_pointer(ty: TypeId, arena: &TypeArena) -> bool {
+    matches!(arena.get(ty).kind, TypeKind::Pointer { .. })
+}
+
+/// Checks if a semantic type id is a scalar type (arithmetic or pointer).
+pub fn is_scalar(ty: TypeId, arena: &TypeArena) -> bool {
+    let kind = &arena.get(ty).kind;
+    is_arithmetic(kind) || matches!(kind, TypeKind::Pointer { .. })
+}
+
+/// Checks whether a type is exactly `void*` (ignoring top-level qualifiers on the pointer).
+pub fn is_void_pointer(ty: TypeId, arena: &TypeArena) -> bool {
+    match &arena.get(ty).kind {
+        TypeKind::Pointer { pointee } => matches!(arena.get(*pointee).kind, TypeKind::Void),
+        _ => false,
+    }
+}
+
+/// Drops top-level qualifiers from a type.
+pub fn unqualified(ty: TypeId, arena: &mut TypeArena) -> TypeId {
+    let mut cloned = arena.get(ty).clone();
+    cloned.quals = Qualifiers::default();
+    arena.intern(cloned)
+}
+
+/// Applies integer promotions (C99 6.3.1.1, simplified LP64 model).
+pub fn integer_promotion(ty: TypeId, arena: &mut TypeArena) -> TypeId {
+    let kind = arena.get(ty).kind.clone();
+    let promoted_kind = match kind {
+        TypeKind::Bool
+        | TypeKind::Char
+        | TypeKind::SignedChar
+        | TypeKind::UnsignedChar
+        | TypeKind::Short { .. }
+        | TypeKind::Enum(_) => TypeKind::Int { signed: true },
+        other => other,
+    };
+
+    arena.intern(Type {
+        kind: promoted_kind,
+        quals: Qualifiers::default(),
+    })
+}
+
+/// Applies the usual arithmetic conversions and returns the common type.
+pub fn usual_arithmetic_conversions(a: TypeId, b: TypeId, arena: &mut TypeArena) -> TypeId {
+    let lhs = integer_promotion(a, arena);
+    let rhs = integer_promotion(b, arena);
+
+    let lhs_kind = arena.get(lhs).kind.clone();
+    let rhs_kind = arena.get(rhs).kind.clone();
+
+    // Floating-point conversions first.
+    if matches!(lhs_kind, TypeKind::Double) || matches!(rhs_kind, TypeKind::Double) {
+        return arena.intern(Type {
+            kind: TypeKind::Double,
+            quals: Qualifiers::default(),
+        });
+    }
+    if matches!(lhs_kind, TypeKind::Float) || matches!(rhs_kind, TypeKind::Float) {
+        return arena.intern(Type {
+            kind: TypeKind::Float,
+            quals: Qualifiers::default(),
+        });
+    }
+
+    if lhs_kind == rhs_kind {
+        return arena.intern(Type {
+            kind: lhs_kind,
+            quals: Qualifiers::default(),
+        });
+    }
+
+    let lhs_signed = integer_signedness(&lhs_kind).unwrap_or(true);
+    let rhs_signed = integer_signedness(&rhs_kind).unwrap_or(true);
+    let lhs_rank = integer_rank(&lhs_kind);
+    let rhs_rank = integer_rank(&rhs_kind);
+    let lhs_bits = integer_bits(&lhs_kind);
+    let rhs_bits = integer_bits(&rhs_kind);
+
+    let common_kind = if lhs_signed == rhs_signed {
+        if lhs_rank >= rhs_rank {
+            lhs_kind
+        } else {
+            rhs_kind
+        }
+    } else {
+        let (signed_kind, signed_rank, signed_bits, unsigned_kind, unsigned_rank, unsigned_bits) =
+            if lhs_signed {
+                (lhs_kind, lhs_rank, lhs_bits, rhs_kind, rhs_rank, rhs_bits)
+            } else {
+                (rhs_kind, rhs_rank, rhs_bits, lhs_kind, lhs_rank, lhs_bits)
+            };
+
+        if unsigned_rank >= signed_rank {
+            unsigned_kind
+        } else if signed_bits > unsigned_bits {
+            signed_kind
+        } else {
+            unsigned_variant_of(&signed_kind)
+        }
+    };
+
+    arena.intern(Type {
+        kind: common_kind,
+        quals: Qualifiers::default(),
+    })
+}
+
+/// Computes `sizeof` in bytes for semantic types under the simplified LP64
+/// data model used by sema.
+///
+/// Struct layout is modeled as field-size summation without padding; union
+/// layout is modeled as max-field-size.
+pub fn type_size_of(ty: TypeId, types: &TypeArena, records: &RecordArena) -> Option<u64> {
+    let t = types.get(ty);
+    match &t.kind {
+        TypeKind::Bool | TypeKind::Char | TypeKind::SignedChar | TypeKind::UnsignedChar => Some(1),
+        TypeKind::Short { .. } => Some(2),
+        TypeKind::Int { .. } | TypeKind::Enum(_) | TypeKind::Float => Some(4),
+        TypeKind::Long { .. } | TypeKind::LongLong { .. } | TypeKind::Double => Some(8),
+        TypeKind::Pointer { .. } => Some(8),
+        TypeKind::Array { elem, len } => match len {
+            ArrayLen::Known(n) => type_size_of(*elem, types, records)?.checked_mul(*n),
+            _ => None,
+        },
+        TypeKind::Record(record_id) => {
+            let record = records.get(*record_id);
+            if !record.is_complete {
+                return None;
+            }
+            match record.kind {
+                crate::frontend::parser::ast::RecordKind::Struct => {
+                    let mut total = 0u64;
+                    for field in &record.fields {
+                        total = total.checked_add(type_size_of(field.ty, types, records)?)?;
+                    }
+                    Some(total)
+                }
+                crate::frontend::parser::ast::RecordKind::Union => {
+                    let mut max_size = 0u64;
+                    for field in &record.fields {
+                        max_size = max_size.max(type_size_of(field.ty, types, records)?);
+                    }
+                    Some(max_size)
+                }
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Computes the composite type of two compatible types (C99 6.2.7).
@@ -544,7 +697,7 @@ pub fn composite_type(a: TypeId, b: TypeId, arena: &mut TypeArena) -> Option<Typ
 }
 
 /// Checks if a type is an arithmetic type (integer or floating-point).
-fn is_arithmetic(kind: &TypeKind) -> bool {
+pub fn is_arithmetic(kind: &TypeKind) -> bool {
     matches!(
         kind,
         TypeKind::Bool
@@ -559,6 +712,55 @@ fn is_arithmetic(kind: &TypeKind) -> bool {
             | TypeKind::Double
             | TypeKind::Enum(_)
     )
+}
+
+fn integer_rank(kind: &TypeKind) -> u8 {
+    match kind {
+        TypeKind::Bool => 1,
+        TypeKind::Char | TypeKind::SignedChar | TypeKind::UnsignedChar => 2,
+        TypeKind::Short { .. } => 3,
+        TypeKind::Int { .. } | TypeKind::Enum(_) => 4,
+        TypeKind::Long { .. } => 5,
+        TypeKind::LongLong { .. } => 6,
+        _ => 0,
+    }
+}
+
+fn integer_bits(kind: &TypeKind) -> u8 {
+    match kind {
+        TypeKind::Bool => 1,
+        TypeKind::Char | TypeKind::SignedChar | TypeKind::UnsignedChar => 8,
+        TypeKind::Short { .. } => 16,
+        TypeKind::Int { .. } | TypeKind::Enum(_) => 32,
+        TypeKind::Long { .. } | TypeKind::LongLong { .. } => 64,
+        _ => 0,
+    }
+}
+
+fn integer_signedness(kind: &TypeKind) -> Option<bool> {
+    match kind {
+        TypeKind::Bool => Some(false),
+        TypeKind::Char | TypeKind::SignedChar => Some(true),
+        TypeKind::UnsignedChar => Some(false),
+        TypeKind::Short { signed }
+        | TypeKind::Int { signed }
+        | TypeKind::Long { signed }
+        | TypeKind::LongLong { signed } => Some(*signed),
+        TypeKind::Enum(_) => Some(true),
+        _ => None,
+    }
+}
+
+fn unsigned_variant_of(kind: &TypeKind) -> TypeKind {
+    match kind {
+        TypeKind::Bool => TypeKind::Bool,
+        TypeKind::Char | TypeKind::SignedChar | TypeKind::UnsignedChar => TypeKind::UnsignedChar,
+        TypeKind::Short { .. } => TypeKind::Short { signed: false },
+        TypeKind::Int { .. } | TypeKind::Enum(_) => TypeKind::Int { signed: false },
+        TypeKind::Long { .. } => TypeKind::Long { signed: false },
+        TypeKind::LongLong { .. } => TypeKind::LongLong { signed: false },
+        other => other.clone(),
+    }
 }
 
 /// An enum definition.
@@ -649,5 +851,55 @@ mod tests {
             ptr_ty,
             &arena
         ));
+    }
+
+    #[test]
+    fn integer_promotion_promotes_unsigned_char_to_int() {
+        let mut arena = TypeArena::new();
+        let uchar_ty = arena.intern(Type {
+            kind: TypeKind::UnsignedChar,
+            quals: Qualifiers::default(),
+        });
+
+        let promoted = integer_promotion(uchar_ty, &mut arena);
+        assert!(matches!(
+            arena.get(promoted).kind,
+            TypeKind::Int { signed: true }
+        ));
+    }
+
+    #[test]
+    fn usual_arithmetic_conversions_choose_unsigned_long() {
+        let mut arena = TypeArena::new();
+        let int_ty = arena.intern(Type {
+            kind: TypeKind::Int { signed: true },
+            quals: Qualifiers::default(),
+        });
+        let ulong_ty = arena.intern(Type {
+            kind: TypeKind::Long { signed: false },
+            quals: Qualifiers::default(),
+        });
+
+        let common = usual_arithmetic_conversions(int_ty, ulong_ty, &mut arena);
+        assert!(matches!(
+            arena.get(common).kind,
+            TypeKind::Long { signed: false }
+        ));
+    }
+
+    #[test]
+    fn unqualified_removes_top_level_quals() {
+        let mut arena = TypeArena::new();
+        let const_int = arena.intern(Type {
+            kind: TypeKind::Int { signed: true },
+            quals: Qualifiers {
+                is_const: true,
+                is_volatile: false,
+                is_restrict: false,
+            },
+        });
+
+        let plain = unqualified(const_int, &mut arena);
+        assert_eq!(arena.get(plain).quals, Qualifiers::default());
     }
 }

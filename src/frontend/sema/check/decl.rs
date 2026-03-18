@@ -12,7 +12,8 @@ use crate::frontend::sema::symbols::{
 };
 use crate::frontend::sema::typed_ast::TypedDeclaration;
 use crate::frontend::sema::types::{
-    ArrayLen, EnumConstant, EnumDef, FieldDef, Qualifiers, RecordDef, TagId, Type, TypeId, TypeKind,
+    ArrayLen, EnumConstant, EnumDef, FieldDef, Qualifiers, RecordDef, TagId, Type, TypeId,
+    TypeKind, type_size_of,
 };
 
 /// Pass 1 entry for declaration processing at translation-unit scope.
@@ -934,7 +935,8 @@ fn evaluate_integer_constant_expr(
         }
         ExprKind::SizeofType(ty_name) => {
             let ty = build_type_from_type_name(cx, ty_name, expr.span);
-            let size = type_size_of(cx, ty).ok_or_else(|| IceEvalError::non_constant(expr.span))?;
+            let size = type_size_of(ty, &cx.types, &cx.records)
+                .ok_or_else(|| IceEvalError::non_constant(expr.span))?;
             i64::try_from(size).map_err(|_| IceEvalError::signed_overflow(expr.span))
         }
         ExprKind::SizeofExpr(inner) => {
@@ -1342,7 +1344,7 @@ fn int_type(cx: &mut SemaContext<'_>) -> TypeId {
 }
 
 /// Build semantic type from parser `TypeName` node.
-fn build_type_from_type_name(
+pub(crate) fn build_type_from_type_name(
     cx: &mut SemaContext<'_>,
     ty_name: &TypeName,
     span: SourceSpan,
@@ -1352,47 +1354,6 @@ fn build_type_from_type_name(
         apply_declarator_with_base(cx, base_ty, declarator)
     } else {
         base_ty
-    }
-}
-
-/// Compute static type size in bytes for semantic type nodes.
-///
-/// Simplified ABI: uses common LP64/ILP32-compatible sizes.
-fn type_size_of(cx: &SemaContext<'_>, ty: TypeId) -> Option<u64> {
-    let t = cx.types.get(ty);
-    match &t.kind {
-        TypeKind::Bool | TypeKind::Char | TypeKind::SignedChar | TypeKind::UnsignedChar => Some(1),
-        TypeKind::Short { .. } => Some(2),
-        TypeKind::Int { .. } | TypeKind::Enum(_) | TypeKind::Float => Some(4),
-        TypeKind::Long { .. } | TypeKind::Pointer { .. } => Some(8),
-        TypeKind::LongLong { .. } | TypeKind::Double => Some(8),
-        TypeKind::Array { elem, len } => match len {
-            ArrayLen::Known(n) => type_size_of(cx, *elem)?.checked_mul(*n),
-            _ => None,
-        },
-        TypeKind::Record(record_id) => {
-            let record = cx.records.get(*record_id);
-            if !record.is_complete {
-                return None;
-            }
-            match record.kind {
-                RecordKind::Struct => {
-                    let mut total = 0u64;
-                    for field in &record.fields {
-                        total = total.checked_add(type_size_of(cx, field.ty)?)?;
-                    }
-                    Some(total)
-                }
-                RecordKind::Union => {
-                    let mut max_size = 0u64;
-                    for field in &record.fields {
-                        max_size = max_size.max(type_size_of(cx, field.ty)?);
-                    }
-                    Some(max_size)
-                }
-            }
-        }
-        _ => None,
     }
 }
 

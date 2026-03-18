@@ -1,8 +1,7 @@
 use crate::common::span::SourceSpan;
-use crate::frontend::parser::ast::RecordKind;
 use crate::frontend::sema::diagnostic::{SemaDiagnostic, SemaDiagnosticCode};
 use crate::frontend::sema::typed_ast::{BinaryOp, ConstValue, TypedExpr, TypedExprKind, UnaryOp};
-use crate::frontend::sema::types::{ArrayLen, RecordArena, TypeArena, TypeId, TypeKind};
+use crate::frontend::sema::types::{RecordArena, TypeArena, TypeId, TypeKind, type_size_of};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstExprContext {
@@ -79,7 +78,7 @@ fn eval_const_expr_inner(
             cast_const_value(value, *to, expr.span, env)
         }
         TypedExprKind::SizeofType { ty } => {
-            let size = type_size_of(env, *ty).ok_or_else(|| {
+            let size = type_size_of(*ty, env.types, env.records).ok_or_else(|| {
                 non_constant_diag(expr.span, "operand of sizeof has incomplete type")
             })?;
             Ok(ConstValue::UInt(size))
@@ -296,44 +295,6 @@ fn const_to_i64(value: ConstValue, span: SourceSpan) -> Result<i64, SemaDiagnost
     }
 }
 
-fn type_size_of(env: &ConstEvalEnv<'_>, ty: TypeId) -> Option<u64> {
-    let ty = env.types.get(ty);
-    match &ty.kind {
-        TypeKind::Bool | TypeKind::Char | TypeKind::SignedChar | TypeKind::UnsignedChar => Some(1),
-        TypeKind::Short { .. } => Some(2),
-        TypeKind::Int { .. } | TypeKind::Enum(_) | TypeKind::Float => Some(4),
-        TypeKind::Long { .. } | TypeKind::LongLong { .. } | TypeKind::Double => Some(8),
-        TypeKind::Pointer { .. } => Some(8),
-        TypeKind::Array { elem, len } => match len {
-            ArrayLen::Known(n) => type_size_of(env, *elem)?.checked_mul(*n),
-            _ => None,
-        },
-        TypeKind::Record(record_id) => {
-            let record = env.records.get(*record_id);
-            if !record.is_complete {
-                return None;
-            }
-            match record.kind {
-                RecordKind::Struct => {
-                    let mut total = 0u64;
-                    for field in &record.fields {
-                        total = total.checked_add(type_size_of(env, field.ty)?)?;
-                    }
-                    Some(total)
-                }
-                RecordKind::Union => {
-                    let mut max_size = 0u64;
-                    for field in &record.fields {
-                        max_size = max_size.max(type_size_of(env, field.ty)?);
-                    }
-                    Some(max_size)
-                }
-            }
-        }
-        _ => None,
-    }
-}
-
 fn non_constant_diag(span: SourceSpan, message: &str) -> SemaDiagnostic {
     SemaDiagnostic::new(
         SemaDiagnosticCode::NonConstantInRequiredContext,
@@ -361,6 +322,7 @@ fn signed_overflow_diag(span: SourceSpan) -> SemaDiagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frontend::parser::ast::RecordKind;
     use crate::frontend::sema::typed_ast::ValueCategory;
     use crate::frontend::sema::types::{FieldDef, Qualifiers, RecordDef, Type, TypeKind};
 

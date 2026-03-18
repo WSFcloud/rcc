@@ -1,101 +1,994 @@
-use crate::frontend::parser::ast::{Expr, ExprKind, Literal};
+use crate::common::span::SourceSpan;
+use crate::frontend::parser::ast::{
+    AssignOp as AstAssignOp, BinaryOp as AstBinaryOp, Expr, ExprKind, IntLiteralSuffix, Literal,
+    TypeName, UnaryOp as AstUnaryOp,
+};
+use crate::frontend::sema::check::decl;
 use crate::frontend::sema::context::SemaContext;
 use crate::frontend::sema::diagnostic::{SemaDiagnostic, SemaDiagnosticCode};
 use crate::frontend::sema::init;
 use crate::frontend::sema::symbols::SymbolKind;
-use crate::frontend::sema::typed_ast::{ConstValue, TypedExpr, TypedExprKind, ValueCategory};
+use crate::frontend::sema::typed_ast::{
+    AssignOp, BinaryOp, ConstValue, TypedExpr, TypedExprKind, UnaryOp, ValueCategory,
+};
+use crate::frontend::sema::types::{
+    ArrayLen, FunctionStyle, Qualifiers, Type, TypeId, TypeKind, assignment_compatible_with_const,
+    integer_promotion, is_arithmetic, is_integer, is_scalar, type_size_of, types_compatible,
+    unqualified, usual_arithmetic_conversions,
+};
+
+#[derive(Clone, Copy)]
+/// Controls which standard conversions should be applied to an expression.
+///
+/// Different contexts in C enable/disable parts of the conversion pipeline.
+/// For example, `sizeof` suppresses array/function decay and lvalue-to-rvalue.
+struct ConversionOptions {
+    decay_arrays: bool,
+    decay_functions: bool,
+    lvalue_to_rvalue: bool,
+}
+
+impl ConversionOptions {
+    /// Full conversion set for ordinary expression contexts.
+    const STANDARD: Self = Self {
+        decay_arrays: true,
+        decay_functions: true,
+        lvalue_to_rvalue: true,
+    };
+
+    /// Conversion behavior for `sizeof` operands.
+    const SIZEOF_OPERAND: Self = Self {
+        decay_arrays: false,
+        decay_functions: false,
+        lvalue_to_rvalue: false,
+    };
+
+    /// Conversion behavior for address-of operands.
+    const ADDRESS_OPERAND: Self = Self {
+        decay_arrays: false,
+        decay_functions: false,
+        lvalue_to_rvalue: false,
+    };
+}
+
+/// Lowers an expression and immediately applies context-specific conversions.
+fn lower_and_convert(
+    cx: &mut SemaContext<'_>,
+    expr: &Expr,
+    options: ConversionOptions,
+) -> TypedExpr {
+    let lowered = lower_expr(cx, expr);
+    apply_standard_conversions(cx, lowered, options)
+}
 
 /// Lower parser expressions into typed expressions.
-///
-/// This is the main entry point for expression type-checking.
-/// In the framework stage, most expressions are lowered to opaque nodes.
-///
-/// Currently implemented:
-/// - Variable references with symbol lookup
-/// - Literal expressions with constant values
-/// - Recursive lowering of subexpressions
-///
-/// # TODO
-/// - Implement full type checking for all expression kinds
-/// - Implement implicit conversions and usual arithmetic conversions
-/// - Implement constant expression evaluation
-/// - Implement lvalue/rvalue analysis
 pub fn lower_expr(cx: &mut SemaContext<'_>, expr: &Expr) -> TypedExpr {
     match &expr.kind {
         ExprKind::Var(name) => lower_variable_expr(cx, name, expr.span),
         ExprKind::Literal(lit) => lower_literal_expr(cx, lit, expr.span),
-        ExprKind::Unary { expr: inner, .. }
-        | ExprKind::SizeofExpr(inner)
-        | ExprKind::PreInc(inner)
-        | ExprKind::PreDec(inner)
-        | ExprKind::PostInc(inner)
-        | ExprKind::PostDec(inner) => {
-            let _ = lower_expr(cx, inner);
-            TypedExpr::opaque(expr.span, cx.error_type())
-        }
-        ExprKind::Binary { left, right, .. }
-        | ExprKind::Assign { left, right, .. }
-        | ExprKind::Comma { left, right } => {
-            let _ = lower_expr(cx, left);
-            let _ = lower_expr(cx, right);
-            TypedExpr::opaque(expr.span, cx.error_type())
-        }
+        ExprKind::Unary { op, expr: inner } => lower_unary_expr(cx, *op, inner, expr.span),
+        ExprKind::Binary { left, op, right } => lower_binary_expr(cx, left, *op, right, expr.span),
+        ExprKind::Assign { left, op, right } => lower_assign_expr(cx, left, *op, right, expr.span),
+        ExprKind::Comma { left, right } => lower_comma_expr(cx, left, right, expr.span),
         ExprKind::Conditional {
             cond,
             then_expr,
             else_expr,
-        } => {
-            let _ = lower_expr(cx, cond);
-            let _ = lower_expr(cx, then_expr);
-            let _ = lower_expr(cx, else_expr);
-            TypedExpr::opaque(expr.span, cx.error_type())
+        } => lower_conditional_expr(cx, cond, then_expr, else_expr, expr.span),
+        ExprKind::Index { base, index } => lower_index_expr(cx, base, index, expr.span),
+        ExprKind::Member { base, field, deref } => {
+            lower_member_expr(cx, base, field, *deref, expr.span)
         }
-        ExprKind::Index { base, index } => {
-            let _ = lower_expr(cx, base);
-            let _ = lower_expr(cx, index);
-            TypedExpr::opaque(expr.span, cx.error_type())
-        }
-        ExprKind::Member { base, .. } => {
-            let _ = lower_expr(cx, base);
-            todo!("member id resolution in expr::lower_expr")
-        }
-        ExprKind::Call { callee, args } => {
-            let _ = lower_expr(cx, callee);
-            for arg in args {
-                let _ = lower_expr(cx, arg);
-            }
-            TypedExpr::opaque(expr.span, cx.error_type())
-        }
-        ExprKind::Cast { expr: inner, .. } => {
-            let lowered = lower_expr(cx, inner);
-            let _ = lowered;
-            todo!("explicit cast validity and conversion checks in expr::lower_expr")
-        }
-        ExprKind::SizeofType(_) => {
-            todo!("sizeof(type-name) evaluation and size_t typing")
-        }
-        ExprKind::CompoundLiteral { init, .. } => {
-            let _ = init::lower_initializer(cx, cx.error_type(), init);
-            todo!("compound literal typing and storage duration in expr::lower_expr")
+        ExprKind::Call { callee, args } => lower_call_expr(cx, callee, args, expr.span),
+        ExprKind::Cast { ty, expr: inner } => lower_cast_expr(cx, ty, inner, expr.span),
+        ExprKind::SizeofExpr(inner) => lower_sizeof_expr(cx, inner, expr.span),
+        ExprKind::SizeofType(ty_name) => lower_sizeof_type_expr(cx, ty_name, expr.span),
+        ExprKind::PreInc(inner) => lower_inc_dec_expr(cx, inner, true, true, expr.span),
+        ExprKind::PreDec(inner) => lower_inc_dec_expr(cx, inner, false, true, expr.span),
+        ExprKind::PostInc(inner) => lower_inc_dec_expr(cx, inner, true, false, expr.span),
+        ExprKind::PostDec(inner) => lower_inc_dec_expr(cx, inner, false, false, expr.span),
+        ExprKind::CompoundLiteral { ty, init } => {
+            lower_compound_literal_expr(cx, ty, init, expr.span)
         }
     }
 }
 
-/// Lowers a variable reference expression.
-///
-/// This performs symbol lookup with declaration-before-use checking.
-/// If the symbol is an enum constant, its compile-time value is attached.
-///
-/// # Errors
-/// Emits `UndefinedSymbol` if the variable is not declared or declared after use.
-fn lower_variable_expr(
+/// Lowers unary expressions and enforces operator-specific operand constraints.
+fn lower_unary_expr(
     cx: &mut SemaContext<'_>,
-    name: &str,
-    span: crate::common::span::SourceSpan,
+    op: AstUnaryOp,
+    inner: &Expr,
+    span: SourceSpan,
 ) -> TypedExpr {
+    let raw = lower_expr(cx, inner);
+    match op {
+        AstUnaryOp::Plus => {
+            let operand = apply_standard_conversions(cx, raw, ConversionOptions::STANDARD);
+            if !is_arithmetic_type(cx, operand.ty) {
+                return emit_type_mismatch(cx, span, "unary '+' requires arithmetic operand");
+            }
+            let mut result_ty = operand.ty;
+            if is_integer(&cx.types.get(operand.ty).kind) {
+                result_ty = integer_promotion(operand.ty, &mut cx.types);
+            }
+            let operand = cast_if_needed(operand, result_ty);
+            TypedExpr {
+                kind: TypedExprKind::Unary {
+                    op: UnaryOp::Plus,
+                    operand: Box::new(operand.clone()),
+                },
+                ty: result_ty,
+                value_category: ValueCategory::RValue,
+                const_value: operand.const_value,
+                span,
+            }
+        }
+        AstUnaryOp::Minus => {
+            let operand = apply_standard_conversions(cx, raw, ConversionOptions::STANDARD);
+            if !is_arithmetic_type(cx, operand.ty) {
+                return emit_type_mismatch(cx, span, "unary '-' requires arithmetic operand");
+            }
+            let mut result_ty = operand.ty;
+            if is_integer(&cx.types.get(operand.ty).kind) {
+                result_ty = integer_promotion(operand.ty, &mut cx.types);
+            }
+            let operand = cast_if_needed(operand, result_ty);
+            let const_value = if matches!(
+                cx.types.get(result_ty).kind,
+                TypeKind::Float | TypeKind::Double
+            ) {
+                operand.const_value.and_then(|v| match v {
+                    ConstValue::FloatBits(bits) => {
+                        Some(ConstValue::FloatBits((-f64::from_bits(bits)).to_bits()))
+                    }
+                    _ => None,
+                })
+            } else {
+                const_int_value(operand.const_value)
+                    .and_then(|v| v.checked_neg())
+                    .map(ConstValue::Int)
+            };
+            TypedExpr {
+                kind: TypedExprKind::Unary {
+                    op: UnaryOp::Minus,
+                    operand: Box::new(operand),
+                },
+                ty: result_ty,
+                value_category: ValueCategory::RValue,
+                const_value,
+                span,
+            }
+        }
+        AstUnaryOp::LogicalNot => {
+            let operand = apply_standard_conversions(cx, raw, ConversionOptions::STANDARD);
+            if !is_scalar(operand.ty, &cx.types) {
+                return emit_type_mismatch(cx, span, "logical '!' requires scalar operand");
+            }
+            let int_ty = int_type(cx);
+            let const_value = operand.const_value.and_then(|v| match v {
+                ConstValue::Int(i) => Some(ConstValue::Int(i64::from(i == 0))),
+                ConstValue::UInt(u) => Some(ConstValue::Int(i64::from(u == 0))),
+                ConstValue::FloatBits(bits) => {
+                    Some(ConstValue::Int(i64::from(f64::from_bits(bits) == 0.0)))
+                }
+                ConstValue::NullPtr => Some(ConstValue::Int(1)),
+                ConstValue::Addr { .. } => Some(ConstValue::Int(0)),
+            });
+            TypedExpr {
+                kind: TypedExprKind::Unary {
+                    op: UnaryOp::LogicalNot,
+                    operand: Box::new(operand),
+                },
+                ty: int_ty,
+                value_category: ValueCategory::RValue,
+                const_value,
+                span,
+            }
+        }
+        AstUnaryOp::BitNot => {
+            let operand = apply_standard_conversions(cx, raw, ConversionOptions::STANDARD);
+            if !is_integer(&cx.types.get(operand.ty).kind) {
+                return emit_type_mismatch(cx, span, "bitwise '~' requires integer operand");
+            }
+            let result_ty = integer_promotion(operand.ty, &mut cx.types);
+            let operand = cast_if_needed(operand, result_ty);
+            let const_value = const_int_value(operand.const_value).map(|v| ConstValue::Int(!v));
+            TypedExpr {
+                kind: TypedExprKind::Unary {
+                    op: UnaryOp::BitwiseNot,
+                    operand: Box::new(operand),
+                },
+                ty: result_ty,
+                value_category: ValueCategory::RValue,
+                const_value,
+                span,
+            }
+        }
+        AstUnaryOp::AddressOf => {
+            let operand = apply_standard_conversions(cx, raw, ConversionOptions::ADDRESS_OPERAND);
+            if !matches!(
+                operand.value_category,
+                ValueCategory::LValue
+                    | ValueCategory::ArrayDesignator
+                    | ValueCategory::FunctionDesignator
+            ) {
+                return emit_type_mismatch(
+                    cx,
+                    span,
+                    "operator '&' requires an lvalue, array, or function designator",
+                );
+            }
+
+            let ptr_ty = cx.types.intern(Type {
+                kind: TypeKind::Pointer {
+                    pointee: operand.ty,
+                },
+                quals: Qualifiers::default(),
+            });
+            TypedExpr {
+                kind: TypedExprKind::Unary {
+                    op: UnaryOp::AddrOf,
+                    operand: Box::new(operand),
+                },
+                ty: ptr_ty,
+                value_category: ValueCategory::RValue,
+                const_value: None,
+                span,
+            }
+        }
+        AstUnaryOp::Deref => {
+            let operand = apply_standard_conversions(cx, raw, ConversionOptions::STANDARD);
+            let TypeKind::Pointer { pointee } = cx.types.get(operand.ty).kind else {
+                return emit_type_mismatch(cx, span, "operator '*' requires pointer operand");
+            };
+            TypedExpr {
+                kind: TypedExprKind::Unary {
+                    op: UnaryOp::Deref,
+                    operand: Box::new(operand),
+                },
+                ty: pointee,
+                value_category: value_category_for_designator_type(cx, pointee),
+                const_value: None,
+                span,
+            }
+        }
+    }
+}
+
+/// Lowers pre/post increment and decrement expressions.
+///
+/// The operand must be a modifiable lvalue of arithmetic or pointer type.
+fn lower_inc_dec_expr(
+    cx: &mut SemaContext<'_>,
+    inner: &Expr,
+    increment: bool,
+    prefix: bool,
+    span: SourceSpan,
+) -> TypedExpr {
+    let operand = lower_expr(cx, inner);
+    if !is_modifiable_lvalue(cx, &operand) {
+        return emit_type_mismatch(cx, span, "increment/decrement requires a modifiable lvalue");
+    }
+
+    let operand_ty = operand.ty;
+    let operand_kind = &cx.types.get(operand_ty).kind;
+    if !is_arithmetic(operand_kind) && !matches!(operand_kind, TypeKind::Pointer { .. }) {
+        return emit_type_mismatch(
+            cx,
+            span,
+            "increment/decrement operand must be arithmetic or pointer",
+        );
+    }
+
+    let op = match (increment, prefix) {
+        (true, true) => UnaryOp::PreInc,
+        (false, true) => UnaryOp::PreDec,
+        (true, false) => UnaryOp::PostInc,
+        (false, false) => UnaryOp::PostDec,
+    };
+
+    TypedExpr {
+        kind: TypedExprKind::Unary {
+            op,
+            operand: Box::new(operand),
+        },
+        ty: operand_ty,
+        value_category: ValueCategory::RValue,
+        const_value: None,
+        span,
+    }
+}
+
+/// Lowers binary expressions, applying usual arithmetic conversions and
+/// pointer-specific rules where required.
+fn lower_binary_expr(
+    cx: &mut SemaContext<'_>,
+    left_ast: &Expr,
+    op: AstBinaryOp,
+    right_ast: &Expr,
+    span: SourceSpan,
+) -> TypedExpr {
+    let mut left = lower_and_convert(cx, left_ast, ConversionOptions::STANDARD);
+    let mut right = lower_and_convert(cx, right_ast, ConversionOptions::STANDARD);
+
+    let (typed_op, result_ty) = match op {
+        AstBinaryOp::Mul | AstBinaryOp::Div | AstBinaryOp::Mod => {
+            if !is_arithmetic_type(cx, left.ty) || !is_arithmetic_type(cx, right.ty) {
+                return emit_type_mismatch(
+                    cx,
+                    span,
+                    "arithmetic binary operator requires arithmetic operands",
+                );
+            }
+            if matches!(op, AstBinaryOp::Mod)
+                && (!is_integer(&cx.types.get(left.ty).kind)
+                    || !is_integer(&cx.types.get(right.ty).kind))
+            {
+                return emit_type_mismatch(cx, span, "operator '%' requires integer operands");
+            }
+            let common = usual_arithmetic_conversions(left.ty, right.ty, &mut cx.types);
+            left = cast_if_needed(left, common);
+            right = cast_if_needed(right, common);
+            (map_binary_op(op), common)
+        }
+        AstBinaryOp::Add => {
+            if is_arithmetic_type(cx, left.ty) && is_arithmetic_type(cx, right.ty) {
+                let common = usual_arithmetic_conversions(left.ty, right.ty, &mut cx.types);
+                left = cast_if_needed(left, common);
+                right = cast_if_needed(right, common);
+                (BinaryOp::Add, common)
+            } else if is_pointer_type(cx, left.ty) && is_integer(&cx.types.get(right.ty).kind) {
+                (BinaryOp::Add, left.ty)
+            } else if is_pointer_type(cx, right.ty) && is_integer(&cx.types.get(left.ty).kind) {
+                (BinaryOp::Add, right.ty)
+            } else {
+                return emit_type_mismatch(
+                    cx,
+                    span,
+                    "operator '+' requires arithmetic operands or pointer+integer",
+                );
+            }
+        }
+        AstBinaryOp::Sub => {
+            if is_arithmetic_type(cx, left.ty) && is_arithmetic_type(cx, right.ty) {
+                let common = usual_arithmetic_conversions(left.ty, right.ty, &mut cx.types);
+                left = cast_if_needed(left, common);
+                right = cast_if_needed(right, common);
+                (BinaryOp::Sub, common)
+            } else if is_pointer_type(cx, left.ty) && is_integer(&cx.types.get(right.ty).kind) {
+                (BinaryOp::Sub, left.ty)
+            } else if is_pointer_type(cx, left.ty) && is_pointer_type(cx, right.ty) {
+                let Some(lp) = pointee_of_pointer(cx, left.ty) else {
+                    return emit_type_mismatch(cx, span, "invalid pointer subtraction");
+                };
+                let Some(rp) = pointee_of_pointer(cx, right.ty) else {
+                    return emit_type_mismatch(cx, span, "invalid pointer subtraction");
+                };
+                if !types_compatible(lp, rp, &cx.types) {
+                    return emit_type_mismatch(
+                        cx,
+                        span,
+                        "pointer subtraction requires compatible pointee types",
+                    );
+                }
+                (BinaryOp::Sub, long_type(cx, true))
+            } else {
+                return emit_type_mismatch(
+                    cx,
+                    span,
+                    "operator '-' requires arithmetic operands, pointer-integer, or pointer-pointer",
+                );
+            }
+        }
+        AstBinaryOp::Shl | AstBinaryOp::Shr => {
+            if !is_integer(&cx.types.get(left.ty).kind) || !is_integer(&cx.types.get(right.ty).kind)
+            {
+                return emit_type_mismatch(cx, span, "shift operators require integer operands");
+            }
+            let left_promoted = integer_promotion(left.ty, &mut cx.types);
+            let right_promoted = integer_promotion(right.ty, &mut cx.types);
+            left = cast_if_needed(left, left_promoted);
+            right = cast_if_needed(right, right_promoted);
+            (map_binary_op(op), left_promoted)
+        }
+        AstBinaryOp::BitAnd | AstBinaryOp::BitOr | AstBinaryOp::BitXor => {
+            if !is_integer(&cx.types.get(left.ty).kind) || !is_integer(&cx.types.get(right.ty).kind)
+            {
+                return emit_type_mismatch(cx, span, "bitwise operators require integer operands");
+            }
+            let common = usual_arithmetic_conversions(left.ty, right.ty, &mut cx.types);
+            left = cast_if_needed(left, common);
+            right = cast_if_needed(right, common);
+            (map_binary_op(op), common)
+        }
+        AstBinaryOp::Lt
+        | AstBinaryOp::Le
+        | AstBinaryOp::Gt
+        | AstBinaryOp::Ge
+        | AstBinaryOp::Eq
+        | AstBinaryOp::Ne => {
+            if is_arithmetic_type(cx, left.ty) && is_arithmetic_type(cx, right.ty) {
+                let common = usual_arithmetic_conversions(left.ty, right.ty, &mut cx.types);
+                left = cast_if_needed(left, common);
+                right = cast_if_needed(right, common);
+            } else if is_pointer_type(cx, left.ty) && is_pointer_type(cx, right.ty) {
+                // Accept pointer comparisons in V1.
+            } else if is_pointer_type(cx, left.ty) && is_null_pointer_constant(&right) {
+                right = cast_if_needed(right, left.ty);
+            } else if is_pointer_type(cx, right.ty) && is_null_pointer_constant(&left) {
+                left = cast_if_needed(left, right.ty);
+            } else {
+                return emit_type_mismatch(
+                    cx,
+                    span,
+                    "comparison requires arithmetic or pointer-compatible operands",
+                );
+            }
+            (map_binary_op(op), int_type(cx))
+        }
+        AstBinaryOp::LogicalAnd | AstBinaryOp::LogicalOr => {
+            if !is_scalar(left.ty, &cx.types) || !is_scalar(right.ty, &cx.types) {
+                return emit_type_mismatch(cx, span, "logical operators require scalar operands");
+            }
+            (map_binary_op(op), int_type(cx))
+        }
+    };
+
+    TypedExpr {
+        kind: TypedExprKind::Binary {
+            op: typed_op,
+            left: Box::new(left),
+            right: Box::new(right),
+        },
+        ty: result_ty,
+        value_category: ValueCategory::RValue,
+        const_value: None,
+        span,
+    }
+}
+
+/// Lowers assignment and compound-assignment expressions.
+///
+/// This routine validates modifiable-lvalue constraints for the left operand
+/// and checks assignment compatibility after required intermediate conversions.
+fn lower_assign_expr(
+    cx: &mut SemaContext<'_>,
+    left_ast: &Expr,
+    op: AstAssignOp,
+    right_ast: &Expr,
+    span: SourceSpan,
+) -> TypedExpr {
+    let lhs = lower_expr(cx, left_ast);
+    let lhs_ty = lhs.ty;
+    if !is_modifiable_lvalue(cx, &lhs) {
+        return emit_type_mismatch(
+            cx,
+            span,
+            "assignment requires a modifiable lvalue on the left",
+        );
+    }
+
+    let mut rhs = lower_and_convert(cx, right_ast, ConversionOptions::STANDARD);
+
+    if matches!(op, AstAssignOp::Assign) {
+        let rhs_const_int = const_int_value(rhs.const_value);
+        if !assignment_compatible_with_const(rhs.ty, rhs_const_int, lhs_ty, &cx.types) {
+            return emit_type_mismatch(cx, span, "incompatible assignment operands");
+        }
+        rhs = cast_if_needed(rhs, lhs_ty);
+        return TypedExpr {
+            kind: TypedExprKind::Assign {
+                op: AssignOp::Assign,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            },
+            ty: lhs_ty,
+            value_category: ValueCategory::RValue,
+            const_value: None,
+            span,
+        };
+    }
+
+    let lhs_rvalue = apply_standard_conversions(cx, lhs.clone(), ConversionOptions::STANDARD);
+    let compound_result_ty = match op {
+        AstAssignOp::AddAssign => {
+            if is_arithmetic_type(cx, lhs_rvalue.ty) && is_arithmetic_type(cx, rhs.ty) {
+                usual_arithmetic_conversions(lhs_rvalue.ty, rhs.ty, &mut cx.types)
+            } else if is_pointer_type(cx, lhs_rvalue.ty) && is_integer(&cx.types.get(rhs.ty).kind) {
+                lhs_rvalue.ty
+            } else {
+                return emit_type_mismatch(
+                    cx,
+                    span,
+                    "'+=' requires arithmetic operands or pointer+integer",
+                );
+            }
+        }
+        AstAssignOp::SubAssign => {
+            if is_arithmetic_type(cx, lhs_rvalue.ty) && is_arithmetic_type(cx, rhs.ty) {
+                usual_arithmetic_conversions(lhs_rvalue.ty, rhs.ty, &mut cx.types)
+            } else if is_pointer_type(cx, lhs_rvalue.ty) && is_integer(&cx.types.get(rhs.ty).kind) {
+                lhs_rvalue.ty
+            } else {
+                return emit_type_mismatch(
+                    cx,
+                    span,
+                    "'-=' requires arithmetic operands or pointer-integer",
+                );
+            }
+        }
+        AstAssignOp::MulAssign | AstAssignOp::DivAssign => {
+            if !is_arithmetic_type(cx, lhs_rvalue.ty) || !is_arithmetic_type(cx, rhs.ty) {
+                return emit_type_mismatch(
+                    cx,
+                    span,
+                    "compound assignment requires arithmetic operands",
+                );
+            }
+            usual_arithmetic_conversions(lhs_rvalue.ty, rhs.ty, &mut cx.types)
+        }
+        AstAssignOp::ModAssign => {
+            if !is_integer(&cx.types.get(lhs_rvalue.ty).kind)
+                || !is_integer(&cx.types.get(rhs.ty).kind)
+            {
+                return emit_type_mismatch(cx, span, "'%=' requires integer operands");
+            }
+            usual_arithmetic_conversions(lhs_rvalue.ty, rhs.ty, &mut cx.types)
+        }
+        AstAssignOp::ShlAssign | AstAssignOp::ShrAssign => {
+            if !is_integer(&cx.types.get(lhs_rvalue.ty).kind)
+                || !is_integer(&cx.types.get(rhs.ty).kind)
+            {
+                return emit_type_mismatch(
+                    cx,
+                    span,
+                    "shift compound assignment requires integer operands",
+                );
+            }
+            integer_promotion(lhs_rvalue.ty, &mut cx.types)
+        }
+        AstAssignOp::BitAndAssign | AstAssignOp::BitXorAssign | AstAssignOp::BitOrAssign => {
+            if !is_integer(&cx.types.get(lhs_rvalue.ty).kind)
+                || !is_integer(&cx.types.get(rhs.ty).kind)
+            {
+                return emit_type_mismatch(
+                    cx,
+                    span,
+                    "bitwise compound assignment requires integer operands",
+                );
+            }
+            usual_arithmetic_conversions(lhs_rvalue.ty, rhs.ty, &mut cx.types)
+        }
+        AstAssignOp::Assign => unreachable!(),
+    };
+
+    if !assignment_compatible_with_const(compound_result_ty, None, lhs_ty, &cx.types) {
+        return emit_type_mismatch(
+            cx,
+            span,
+            "compound assignment result is not assignable to left operand",
+        );
+    }
+
+    TypedExpr {
+        kind: TypedExprKind::Assign {
+            op: map_assign_op(op),
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        },
+        ty: lhs_rvalue.ty,
+        value_category: ValueCategory::RValue,
+        const_value: None,
+        span,
+    }
+}
+
+/// Lowers the conditional operator (`cond ? then : else`) and derives the
+/// composite result type for the two branch expressions.
+fn lower_conditional_expr(
+    cx: &mut SemaContext<'_>,
+    cond_ast: &Expr,
+    then_ast: &Expr,
+    else_ast: &Expr,
+    span: SourceSpan,
+) -> TypedExpr {
+    let cond = lower_and_convert(cx, cond_ast, ConversionOptions::STANDARD);
+    if !is_scalar(cond.ty, &cx.types) {
+        return emit_type_mismatch(cx, span, "conditional expression requires scalar condition");
+    }
+
+    let mut then_expr = lower_and_convert(cx, then_ast, ConversionOptions::STANDARD);
+    let mut else_expr = lower_and_convert(cx, else_ast, ConversionOptions::STANDARD);
+
+    let result_ty = if is_arithmetic_type(cx, then_expr.ty) && is_arithmetic_type(cx, else_expr.ty)
+    {
+        let common = usual_arithmetic_conversions(then_expr.ty, else_expr.ty, &mut cx.types);
+        then_expr = cast_if_needed(then_expr, common);
+        else_expr = cast_if_needed(else_expr, common);
+        common
+    } else if types_compatible(then_expr.ty, else_expr.ty, &cx.types) {
+        then_expr.ty
+    } else if is_pointer_type(cx, then_expr.ty) && is_pointer_type(cx, else_expr.ty) {
+        if types_compatible(then_expr.ty, else_expr.ty, &cx.types) {
+            then_expr.ty
+        } else if is_void_pointer_type(cx, then_expr.ty) {
+            then_expr.ty
+        } else if is_void_pointer_type(cx, else_expr.ty) {
+            else_expr.ty
+        } else {
+            return emit_type_mismatch(
+                cx,
+                span,
+                "conditional pointer operands must have compatible pointee types",
+            );
+        }
+    } else if is_pointer_type(cx, then_expr.ty) && is_null_pointer_constant(&else_expr) {
+        then_expr.ty
+    } else if is_pointer_type(cx, else_expr.ty) && is_null_pointer_constant(&then_expr) {
+        else_expr.ty
+    } else {
+        return emit_type_mismatch(cx, span, "conditional branches have incompatible types");
+    };
+
+    then_expr = cast_if_needed(then_expr, result_ty);
+    else_expr = cast_if_needed(else_expr, result_ty);
+
+    TypedExpr {
+        kind: TypedExprKind::Conditional {
+            cond: Box::new(cond),
+            then_expr: Box::new(then_expr),
+            else_expr: Box::new(else_expr),
+        },
+        ty: result_ty,
+        value_category: ValueCategory::RValue,
+        const_value: None,
+        span,
+    }
+}
+
+/// Lowers a function call expression and validates argument compatibility.
+fn lower_call_expr(
+    cx: &mut SemaContext<'_>,
+    callee_ast: &Expr,
+    args_ast: &[Expr],
+    span: SourceSpan,
+) -> TypedExpr {
+    let callee_raw = lower_expr(cx, callee_ast);
+    let callee = apply_standard_conversions(cx, callee_raw, ConversionOptions::STANDARD);
+
+    let function_ty = match &cx.types.get(callee.ty).kind {
+        TypeKind::Function(func) => func.clone(),
+        TypeKind::Pointer { pointee } => match &cx.types.get(*pointee).kind {
+            TypeKind::Function(func) => func.clone(),
+            _ => {
+                return emit_type_mismatch(
+                    cx,
+                    span,
+                    "call expression requires function or pointer-to-function callee",
+                );
+            }
+        },
+        _ => {
+            return emit_type_mismatch(
+                cx,
+                span,
+                "call expression requires function or pointer-to-function callee",
+            );
+        }
+    };
+
+    let mut args = Vec::with_capacity(args_ast.len());
+    for arg in args_ast {
+        args.push(lower_and_convert(cx, arg, ConversionOptions::STANDARD));
+    }
+
+    if matches!(function_ty.style, FunctionStyle::Prototype) {
+        if !function_ty.variadic && args.len() != function_ty.params.len() {
+            cx.emit(SemaDiagnostic::new(
+                SemaDiagnosticCode::TypeMismatch,
+                format!(
+                    "function expects {} arguments but {} provided",
+                    function_ty.params.len(),
+                    args.len()
+                ),
+                span,
+            ));
+        } else if function_ty.variadic && args.len() < function_ty.params.len() {
+            cx.emit(SemaDiagnostic::new(
+                SemaDiagnosticCode::TypeMismatch,
+                format!(
+                    "function expects at least {} arguments but {} provided",
+                    function_ty.params.len(),
+                    args.len()
+                ),
+                span,
+            ));
+        }
+
+        for (idx, param_ty) in function_ty.params.iter().copied().enumerate() {
+            if idx >= args.len() {
+                break;
+            }
+            let arg_const = const_int_value(args[idx].const_value);
+            if !assignment_compatible_with_const(args[idx].ty, arg_const, param_ty, &cx.types) {
+                cx.emit(SemaDiagnostic::new(
+                    SemaDiagnosticCode::TypeMismatch,
+                    format!("argument {} has incompatible type", idx + 1),
+                    args[idx].span,
+                ));
+                args[idx] = TypedExpr::opaque(args[idx].span, cx.error_type());
+            } else {
+                args[idx] = cast_if_needed(args[idx].clone(), param_ty);
+            }
+        }
+
+        if function_ty.variadic {
+            for arg in args.iter_mut().skip(function_ty.params.len()) {
+                *arg = default_argument_promotion(cx, arg.clone());
+            }
+        }
+    } else {
+        for arg in &mut args {
+            *arg = default_argument_promotion(cx, arg.clone());
+        }
+    }
+
+    TypedExpr {
+        kind: TypedExprKind::Call {
+            func: Box::new(callee),
+            args,
+        },
+        ty: function_ty.ret,
+        value_category: ValueCategory::RValue,
+        const_value: None,
+        span,
+    }
+}
+
+/// Lowers record member access via `.` and `->`.
+fn lower_member_expr(
+    cx: &mut SemaContext<'_>,
+    base_ast: &Expr,
+    field_name: &str,
+    deref: bool,
+    span: SourceSpan,
+) -> TypedExpr {
+    let base = lower_expr(cx, base_ast);
+
+    let (record_id, base_expr, base_is_lvalue) = if deref {
+        let base_converted = apply_standard_conversions(cx, base, ConversionOptions::STANDARD);
+        let TypeKind::Pointer { pointee } = cx.types.get(base_converted.ty).kind else {
+            return emit_type_mismatch(cx, span, "'->' requires pointer-to-record operand");
+        };
+        let TypeKind::Record(record_id) = cx.types.get(pointee).kind else {
+            return emit_type_mismatch(cx, span, "'->' requires pointer-to-record operand");
+        };
+        (record_id, base_converted, true)
+    } else {
+        let TypeKind::Record(record_id) = cx.types.get(base.ty).kind else {
+            return emit_type_mismatch(cx, span, "'.' requires record operand");
+        };
+        (
+            record_id,
+            base.clone(),
+            matches!(
+                base.value_category,
+                ValueCategory::LValue | ValueCategory::ArrayDesignator
+            ),
+        )
+    };
+
+    let record = cx.records.get(record_id);
+    let Some((field_idx, field)) = record
+        .fields
+        .iter()
+        .enumerate()
+        .find(|(_, field)| field.name.as_deref() == Some(field_name))
+    else {
+        return emit_type_mismatch(
+            cx,
+            span,
+            format!("record has no member named '{field_name}'"),
+        );
+    };
+
+    let value_category = if base_is_lvalue {
+        value_category_for_designator_type(cx, field.ty)
+    } else {
+        ValueCategory::RValue
+    };
+
+    TypedExpr {
+        kind: TypedExprKind::MemberAccess {
+            base: Box::new(base_expr),
+            field: crate::frontend::sema::types::FieldId(field_idx as u32),
+            deref,
+        },
+        ty: field.ty,
+        value_category,
+        const_value: None,
+        span,
+    }
+}
+
+/// Lowers array subscripting (`base[index]`), accepting both `ptr + int` and
+/// the commuted `int + ptr` form.
+fn lower_index_expr(
+    cx: &mut SemaContext<'_>,
+    base_ast: &Expr,
+    index_ast: &Expr,
+    span: SourceSpan,
+) -> TypedExpr {
+    let base = lower_and_convert(cx, base_ast, ConversionOptions::STANDARD);
+    let index = lower_and_convert(cx, index_ast, ConversionOptions::STANDARD);
+
+    let pointee = if let Some(pointee) = pointee_of_pointer(cx, base.ty) {
+        if !is_integer(&cx.types.get(index.ty).kind) {
+            return emit_type_mismatch(cx, span, "array index must have integer type");
+        }
+        pointee
+    } else if let Some(pointee) = pointee_of_pointer(cx, index.ty) {
+        if !is_integer(&cx.types.get(base.ty).kind) {
+            return emit_type_mismatch(cx, span, "array index must have integer type");
+        }
+        pointee
+    } else {
+        return emit_type_mismatch(
+            cx,
+            span,
+            "subscripted value must be pointer and index must be integer",
+        );
+    };
+
+    TypedExpr {
+        kind: TypedExprKind::Index {
+            base: Box::new(base),
+            index: Box::new(index),
+        },
+        ty: pointee,
+        value_category: value_category_for_designator_type(cx, pointee),
+        const_value: None,
+        span,
+    }
+}
+
+/// Lowers explicit cast expressions and validates allowed cast categories.
+fn lower_cast_expr(
+    cx: &mut SemaContext<'_>,
+    ty_name: &TypeName,
+    inner: &Expr,
+    span: SourceSpan,
+) -> TypedExpr {
+    let to = decl::build_type_from_type_name(cx, ty_name, span);
+    let expr = lower_and_convert(cx, inner, ConversionOptions::STANDARD);
+
+    if !is_valid_cast(cx, expr.ty, to) {
+        cx.emit(SemaDiagnostic::new(
+            SemaDiagnosticCode::InvalidCast,
+            "invalid cast between operand and target type",
+            span,
+        ));
+        return TypedExpr::opaque(span, cx.error_type());
+    }
+
+    TypedExpr {
+        kind: TypedExprKind::Cast {
+            expr: Box::new(expr),
+            to,
+        },
+        ty: to,
+        value_category: ValueCategory::RValue,
+        const_value: None,
+        span,
+    }
+}
+
+/// Lowers `sizeof(type-name)` expressions.
+fn lower_sizeof_type_expr(
+    cx: &mut SemaContext<'_>,
+    ty_name: &TypeName,
+    span: SourceSpan,
+) -> TypedExpr {
+    let ty = decl::build_type_from_type_name(cx, ty_name, span);
+    lower_sizeof_ty(cx, ty, span)
+}
+
+/// Lowers `sizeof(expr)` expressions without applying decay conversions to the
+/// operand, matching C semantics.
+fn lower_sizeof_expr(cx: &mut SemaContext<'_>, inner: &Expr, span: SourceSpan) -> TypedExpr {
+    let operand = lower_and_convert(cx, inner, ConversionOptions::SIZEOF_OPERAND);
+    lower_sizeof_ty(cx, operand.ty, span)
+}
+
+/// Builds a typed `sizeof` expression from a resolved operand type.
+fn lower_sizeof_ty(cx: &mut SemaContext<'_>, ty: TypeId, span: SourceSpan) -> TypedExpr {
+    let Some(size) = type_size_of(ty, &cx.types, &cx.records) else {
+        cx.emit(SemaDiagnostic::new(
+            SemaDiagnosticCode::IncompleteType,
+            "operand of sizeof has incomplete or unsupported type",
+            span,
+        ));
+        return TypedExpr::opaque(span, cx.error_type());
+    };
+
+    TypedExpr {
+        kind: TypedExprKind::SizeofType { ty },
+        ty: size_t_type(cx),
+        value_category: ValueCategory::RValue,
+        const_value: Some(ConstValue::UInt(size)),
+        span,
+    }
+}
+
+/// Lowers comma expressions, preserving only the right operand's type/value.
+fn lower_comma_expr(
+    cx: &mut SemaContext<'_>,
+    left_ast: &Expr,
+    right_ast: &Expr,
+    span: SourceSpan,
+) -> TypedExpr {
+    let left = lower_and_convert(cx, left_ast, ConversionOptions::STANDARD);
+    let right = lower_and_convert(cx, right_ast, ConversionOptions::STANDARD);
+    TypedExpr {
+        kind: TypedExprKind::Comma {
+            left: Box::new(left),
+            right: Box::new(right.clone()),
+        },
+        ty: right.ty,
+        value_category: ValueCategory::RValue,
+        const_value: right.const_value,
+        span,
+    }
+}
+
+/// Lowers compound literal expressions.
+///
+/// Aggregate/designator-heavy forms are intentionally deferred to Phase 5.
+fn lower_compound_literal_expr(
+    cx: &mut SemaContext<'_>,
+    ty_name: &TypeName,
+    init: &crate::frontend::parser::ast::Initializer,
+    span: SourceSpan,
+) -> TypedExpr {
+    let ty = decl::build_type_from_type_name(cx, ty_name, span);
+
+    let typed_init = match &init.kind {
+        crate::frontend::parser::ast::InitializerKind::Expr(_) => {
+            init::lower_initializer(cx, ty, init)
+        }
+        crate::frontend::parser::ast::InitializerKind::Aggregate(_) => {
+            // Phase 5 will handle aggregate/designator compound literals.
+            cx.emit(SemaDiagnostic::new(
+                SemaDiagnosticCode::InvalidInitializer,
+                "aggregate compound literals are not supported yet",
+                span,
+            ));
+            crate::frontend::sema::typed_ast::TypedInitializer::ZeroInit { ty }
+        }
+    };
+
+    TypedExpr {
+        kind: TypedExprKind::CompoundLiteral {
+            ty,
+            init: Box::new(typed_init),
+        },
+        ty,
+        value_category: value_category_for_designator_type(cx, ty),
+        const_value: None,
+        span,
+    }
+}
+
+/// Lowers a variable reference expression.
+fn lower_variable_expr(cx: &mut SemaContext<'_>, name: &str, span: SourceSpan) -> TypedExpr {
     if let Some(symbol_id) = cx.resolve_ordinary(name, span) {
         let symbol = cx.symbol(symbol_id);
         let mut typed = TypedExpr::symbol(symbol_id, span, symbol.ty());
+        typed.value_category = match symbol.kind() {
+            SymbolKind::EnumConst => ValueCategory::RValue,
+            _ => value_category_for_designator_type(cx, symbol.ty()),
+        };
+
         if symbol.kind() == SymbolKind::EnumConst
             && let Some(value) = cx.lookup_enum_const_value(symbol_id)
         {
@@ -113,34 +1006,724 @@ fn lower_variable_expr(
     TypedExpr::opaque(span, cx.error_type())
 }
 
-/// Lowers a literal expression.
-///
-/// This extracts compile-time constant values from literals.
-/// In the framework stage, type inference from suffixes is deferred.
-///
-/// # TODO
-/// - Implement proper literal typing based on suffixes (U, L, LL, F, etc.)
-/// - Implement overflow checking for integer literals
-/// - Implement proper string literal handling
-fn lower_literal_expr(
-    cx: &mut SemaContext<'_>,
-    lit: &Literal,
-    span: crate::common::span::SourceSpan,
-) -> TypedExpr {
-    // Literal typing and suffix handling are deferred. We still keep useful
-    // compile-time values so const-eval scaffolding can run in tests.
-    let const_value = match lit {
-        Literal::Int { value, .. } => Some(ConstValue::UInt(*value)),
-        Literal::Char(ch) => Some(ConstValue::Int(*ch as i64)),
-        Literal::Float(value) => Some(ConstValue::FloatBits(value.to_bits())),
-        _ => None,
-    };
+/// Lowers a literal expression with basic C type inference.
+fn lower_literal_expr(cx: &mut SemaContext<'_>, lit: &Literal, span: SourceSpan) -> TypedExpr {
+    match lit {
+        Literal::Int { value, base } => {
+            let (ty, value) = infer_int_literal_type_and_value(cx, *value, *base);
+            TypedExpr::literal(value, span, ty)
+        }
+        Literal::Char(ch) => TypedExpr::literal(ConstValue::Int(*ch as i64), span, int_type(cx)),
+        Literal::Float(value) => {
+            let ty = double_type(cx);
+            TypedExpr::literal(ConstValue::FloatBits(value.to_bits()), span, ty)
+        }
+        Literal::String(value) => {
+            let char_ty = cx.types.intern(Type {
+                kind: TypeKind::Char,
+                quals: Qualifiers {
+                    is_const: true,
+                    is_volatile: false,
+                    is_restrict: false,
+                },
+            });
+            let arr_ty = cx.types.intern(Type {
+                kind: TypeKind::Array {
+                    elem: char_ty,
+                    len: ArrayLen::Known(value.len() as u64 + 1),
+                },
+                quals: Qualifiers::default(),
+            });
+            TypedExpr {
+                kind: TypedExprKind::Opaque,
+                ty: arr_ty,
+                value_category: ValueCategory::ArrayDesignator,
+                const_value: None,
+                span,
+            }
+        }
+    }
+}
 
-    TypedExpr {
-        kind: TypedExprKind::Opaque,
-        ty: cx.error_type(),
-        value_category: ValueCategory::RValue,
-        const_value,
+/// Infers integer-literal type/value pairs under the simplified LP64 model used
+/// by this semantic pass.
+fn infer_int_literal_type_and_value(
+    cx: &mut SemaContext<'_>,
+    value: u64,
+    suffix: IntLiteralSuffix,
+) -> (TypeId, ConstValue) {
+    match suffix {
+        IntLiteralSuffix::Int => {
+            if value <= i32::MAX as u64 {
+                (int_type(cx), ConstValue::Int(value as i64))
+            } else if value <= i64::MAX as u64 {
+                (long_type(cx, true), ConstValue::Int(value as i64))
+            } else {
+                (long_long_type(cx, false), ConstValue::UInt(value))
+            }
+        }
+        IntLiteralSuffix::UInt => {
+            if value <= u32::MAX as u64 {
+                (int_type_unsigned(cx), ConstValue::UInt(value))
+            } else {
+                (long_type(cx, false), ConstValue::UInt(value))
+            }
+        }
+        IntLiteralSuffix::Long => {
+            if value <= i64::MAX as u64 {
+                (long_type(cx, true), ConstValue::Int(value as i64))
+            } else {
+                (long_type(cx, false), ConstValue::UInt(value))
+            }
+        }
+        IntLiteralSuffix::ULong => (long_type(cx, false), ConstValue::UInt(value)),
+        IntLiteralSuffix::LongLong => {
+            if value <= i64::MAX as u64 {
+                (long_long_type(cx, true), ConstValue::Int(value as i64))
+            } else {
+                (long_long_type(cx, false), ConstValue::UInt(value))
+            }
+        }
+        IntLiteralSuffix::ULongLong => (long_long_type(cx, false), ConstValue::UInt(value)),
+    }
+}
+
+/// Applies context-dependent standard conversions:
+/// array-to-pointer, function-to-pointer, and lvalue-to-rvalue.
+fn apply_standard_conversions(
+    cx: &mut SemaContext<'_>,
+    mut expr: TypedExpr,
+    options: ConversionOptions,
+) -> TypedExpr {
+    if options.decay_arrays && matches!(expr.value_category, ValueCategory::ArrayDesignator) {
+        if let TypeKind::Array { elem, .. } = cx.types.get(expr.ty).kind {
+            let ptr_ty = cx.types.intern(Type {
+                kind: TypeKind::Pointer { pointee: elem },
+                quals: Qualifiers::default(),
+            });
+            let span = expr.span;
+            expr = TypedExpr::implicit_cast(expr, ptr_ty, span);
+        }
+    }
+
+    if options.decay_functions && matches!(expr.value_category, ValueCategory::FunctionDesignator) {
+        let ptr_ty = cx.types.intern(Type {
+            kind: TypeKind::Pointer { pointee: expr.ty },
+            quals: Qualifiers::default(),
+        });
+        let span = expr.span;
+        expr = TypedExpr::implicit_cast(expr, ptr_ty, span);
+    }
+
+    if options.lvalue_to_rvalue && matches!(expr.value_category, ValueCategory::LValue) {
+        let to = unqualified(expr.ty, &mut cx.types);
+        let span = expr.span;
+        expr = TypedExpr::implicit_cast(expr, to, span);
+    }
+
+    expr
+}
+
+/// Inserts an implicit cast only when source and destination types differ.
+fn cast_if_needed(expr: TypedExpr, to: TypeId) -> TypedExpr {
+    if expr.ty == to {
+        expr
+    } else {
+        let span = expr.span;
+        TypedExpr::implicit_cast(expr, to, span)
+    }
+}
+
+/// Maps parser binary operators to typed-AST binary operators.
+fn map_binary_op(op: AstBinaryOp) -> BinaryOp {
+    match op {
+        AstBinaryOp::Mul => BinaryOp::Mul,
+        AstBinaryOp::Div => BinaryOp::Div,
+        AstBinaryOp::Mod => BinaryOp::Mod,
+        AstBinaryOp::Add => BinaryOp::Add,
+        AstBinaryOp::Sub => BinaryOp::Sub,
+        AstBinaryOp::Shl => BinaryOp::Shl,
+        AstBinaryOp::Shr => BinaryOp::Shr,
+        AstBinaryOp::Lt => BinaryOp::Lt,
+        AstBinaryOp::Le => BinaryOp::Le,
+        AstBinaryOp::Gt => BinaryOp::Gt,
+        AstBinaryOp::Ge => BinaryOp::Ge,
+        AstBinaryOp::Eq => BinaryOp::Eq,
+        AstBinaryOp::Ne => BinaryOp::Ne,
+        AstBinaryOp::BitAnd => BinaryOp::BitwiseAnd,
+        AstBinaryOp::BitXor => BinaryOp::BitwiseXor,
+        AstBinaryOp::BitOr => BinaryOp::BitwiseOr,
+        AstBinaryOp::LogicalAnd => BinaryOp::LogicalAnd,
+        AstBinaryOp::LogicalOr => BinaryOp::LogicalOr,
+    }
+}
+
+/// Maps parser assignment operators to typed-AST assignment operators.
+fn map_assign_op(op: AstAssignOp) -> AssignOp {
+    match op {
+        AstAssignOp::Assign => AssignOp::Assign,
+        AstAssignOp::AddAssign => AssignOp::AddAssign,
+        AstAssignOp::SubAssign => AssignOp::SubAssign,
+        AstAssignOp::MulAssign => AssignOp::MulAssign,
+        AstAssignOp::DivAssign => AssignOp::DivAssign,
+        AstAssignOp::ModAssign => AssignOp::ModAssign,
+        AstAssignOp::ShlAssign => AssignOp::ShlAssign,
+        AstAssignOp::ShrAssign => AssignOp::ShrAssign,
+        AstAssignOp::BitAndAssign => AssignOp::AndAssign,
+        AstAssignOp::BitXorAssign => AssignOp::XorAssign,
+        AstAssignOp::BitOrAssign => AssignOp::OrAssign,
+    }
+}
+
+/// Checks whether an explicit cast is allowed in this implementation level.
+fn is_valid_cast(cx: &SemaContext<'_>, from: TypeId, to: TypeId) -> bool {
+    let from_kind = &cx.types.get(from).kind;
+    let to_kind = &cx.types.get(to).kind;
+
+    if matches!(from_kind, TypeKind::Error) || matches!(to_kind, TypeKind::Error) {
+        return true;
+    }
+
+    if matches!(to_kind, TypeKind::Void) {
+        return true;
+    }
+
+    if is_arithmetic(from_kind) && is_arithmetic(to_kind) {
+        return true;
+    }
+
+    if matches!(from_kind, TypeKind::Pointer { .. }) && matches!(to_kind, TypeKind::Pointer { .. })
+    {
+        return true;
+    }
+
+    if matches!(from_kind, TypeKind::Pointer { .. }) && is_integer(to_kind) {
+        return true;
+    }
+
+    if is_integer(from_kind) && matches!(to_kind, TypeKind::Pointer { .. }) {
+        return true;
+    }
+
+    false
+}
+
+/// Emits a `TypeMismatch` diagnostic and returns an error-typed placeholder.
+fn emit_type_mismatch(
+    cx: &mut SemaContext<'_>,
+    span: SourceSpan,
+    message: impl Into<String>,
+) -> TypedExpr {
+    cx.emit(SemaDiagnostic::new(
+        SemaDiagnosticCode::TypeMismatch,
+        message,
         span,
+    ));
+    TypedExpr::opaque(span, cx.error_type())
+}
+
+/// Returns whether an expression is a modifiable lvalue.
+fn is_modifiable_lvalue(cx: &SemaContext<'_>, expr: &TypedExpr) -> bool {
+    if !matches!(expr.value_category, ValueCategory::LValue) {
+        return false;
+    }
+    let ty = cx.types.get(expr.ty);
+    if ty.quals.is_const {
+        return false;
+    }
+    !matches!(
+        ty.kind,
+        TypeKind::Array { .. } | TypeKind::Function(_) | TypeKind::Void
+    )
+}
+
+/// Derives value category from a type for symbol/member/index designators.
+fn value_category_for_designator_type(cx: &SemaContext<'_>, ty: TypeId) -> ValueCategory {
+    match cx.types.get(ty).kind {
+        TypeKind::Function(_) => ValueCategory::FunctionDesignator,
+        TypeKind::Array { .. } => ValueCategory::ArrayDesignator,
+        _ => ValueCategory::LValue,
+    }
+}
+
+/// Returns true when `ty` is a pointer type.
+fn is_pointer_type(cx: &SemaContext<'_>, ty: TypeId) -> bool {
+    matches!(cx.types.get(ty).kind, TypeKind::Pointer { .. })
+}
+
+/// Returns the pointee type if `ty` is a pointer.
+fn pointee_of_pointer(cx: &SemaContext<'_>, ty: TypeId) -> Option<TypeId> {
+    match cx.types.get(ty).kind {
+        TypeKind::Pointer { pointee } => Some(pointee),
+        _ => None,
+    }
+}
+
+/// Returns true when `ty` is arithmetic.
+fn is_arithmetic_type(cx: &SemaContext<'_>, ty: TypeId) -> bool {
+    is_arithmetic(&cx.types.get(ty).kind)
+}
+
+/// Returns true when `ty` is `void*` (ignoring top-level qualifiers).
+fn is_void_pointer_type(cx: &SemaContext<'_>, ty: TypeId) -> bool {
+    match cx.types.get(ty).kind {
+        TypeKind::Pointer { pointee } => matches!(cx.types.get(pointee).kind, TypeKind::Void),
+        _ => false,
+    }
+}
+
+/// Returns true when the typed expression is an integer zero constant.
+fn is_null_pointer_constant(expr: &TypedExpr) -> bool {
+    matches!(
+        expr.const_value,
+        Some(ConstValue::Int(0)) | Some(ConstValue::UInt(0))
+    )
+}
+
+/// Extracts an `i64` integer value from const-value payloads when representable.
+fn const_int_value(value: Option<ConstValue>) -> Option<i64> {
+    match value {
+        Some(ConstValue::Int(v)) => Some(v),
+        Some(ConstValue::UInt(v)) => i64::try_from(v).ok(),
+        _ => None,
+    }
+}
+
+/// Applies default argument promotions used by variadic and non-prototype calls.
+fn default_argument_promotion(cx: &mut SemaContext<'_>, expr: TypedExpr) -> TypedExpr {
+    match cx.types.get(expr.ty).kind {
+        TypeKind::Float => cast_if_needed(expr, double_type(cx)),
+        _ if is_integer(&cx.types.get(expr.ty).kind) => {
+            let promoted = integer_promotion(expr.ty, &mut cx.types);
+            cast_if_needed(expr, promoted)
+        }
+        _ => expr,
+    }
+}
+
+/// Returns canonical `int`.
+fn int_type(cx: &mut SemaContext<'_>) -> TypeId {
+    cx.types.intern(Type {
+        kind: TypeKind::Int { signed: true },
+        quals: Qualifiers::default(),
+    })
+}
+
+/// Returns canonical `unsigned int`.
+fn int_type_unsigned(cx: &mut SemaContext<'_>) -> TypeId {
+    cx.types.intern(Type {
+        kind: TypeKind::Int { signed: false },
+        quals: Qualifiers::default(),
+    })
+}
+
+/// Returns canonical `long` / `unsigned long`.
+fn long_type(cx: &mut SemaContext<'_>, signed: bool) -> TypeId {
+    cx.types.intern(Type {
+        kind: TypeKind::Long { signed },
+        quals: Qualifiers::default(),
+    })
+}
+
+/// Returns canonical `long long` / `unsigned long long`.
+fn long_long_type(cx: &mut SemaContext<'_>, signed: bool) -> TypeId {
+    cx.types.intern(Type {
+        kind: TypeKind::LongLong { signed },
+        quals: Qualifiers::default(),
+    })
+}
+
+/// Returns canonical `double`.
+fn double_type(cx: &mut SemaContext<'_>) -> TypeId {
+    cx.types.intern(Type {
+        kind: TypeKind::Double,
+        quals: Qualifiers::default(),
+    })
+}
+
+/// Returns canonical `size_t` (modeled as `unsigned long` in LP64).
+fn size_t_type(cx: &mut SemaContext<'_>) -> TypeId {
+    long_type(cx, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::span::SourceSpan;
+    use crate::frontend::parser::ast::{
+        BinaryOp as AstBinaryOp, Expr, IntLiteralSuffix, RecordKind,
+    };
+    use crate::frontend::sema::symbols::{DefinitionStatus, Linkage, Symbol, SymbolId};
+    use crate::frontend::sema::types::{FieldDef, FunctionType, RecordDef, RecordId};
+
+    fn new_cx() -> SemaContext<'static> {
+        SemaContext::new("test.c", "")
+    }
+
+    fn bind_symbol(cx: &mut SemaContext<'_>, name: &str, ty: TypeId) -> SymbolId {
+        let sym = Symbol::new(
+            name.to_string(),
+            SymbolKind::Object,
+            ty,
+            Linkage::None,
+            DefinitionStatus::Defined,
+            SourceSpan::dummy(),
+        );
+        let id = cx.insert_symbol(sym);
+        let _ = cx.insert_ordinary(name.to_string(), id);
+        id
+    }
+
+    fn int_ty(cx: &mut SemaContext<'_>) -> TypeId {
+        cx.types.intern(Type {
+            kind: TypeKind::Int { signed: true },
+            quals: Qualifiers::default(),
+        })
+    }
+
+    fn unsigned_char_ty(cx: &mut SemaContext<'_>) -> TypeId {
+        cx.types.intern(Type {
+            kind: TypeKind::UnsignedChar,
+            quals: Qualifiers::default(),
+        })
+    }
+
+    fn record_ty_with_field(
+        cx: &mut SemaContext<'_>,
+        field_name: &str,
+        field_ty: TypeId,
+    ) -> TypeId {
+        let rec_id: RecordId = cx.records.insert(RecordDef {
+            tag: Some("S".to_string()),
+            kind: RecordKind::Struct,
+            fields: vec![FieldDef {
+                name: Some(field_name.to_string()),
+                ty: field_ty,
+                bit_width: None,
+            }],
+            is_complete: true,
+        });
+        cx.types.intern(Type {
+            kind: TypeKind::Record(rec_id),
+            quals: Qualifiers::default(),
+        })
+    }
+
+    #[test]
+    fn infers_uint_literal_type() {
+        let mut cx = new_cx();
+        let expr = Expr::int_with_base_and_span(7, IntLiteralSuffix::UInt, SourceSpan::dummy());
+        let typed = lower_expr(&mut cx, &expr);
+        assert!(matches!(
+            cx.types.get(typed.ty).kind,
+            TypeKind::Int { signed: false }
+        ));
+        assert_eq!(typed.const_value, Some(ConstValue::UInt(7)));
+    }
+
+    #[test]
+    fn propagates_unary_constant_values() {
+        let mut cx = new_cx();
+
+        let minus = Expr::unary(
+            crate::frontend::parser::ast::UnaryOp::Minus,
+            Expr::int_with_span(1, SourceSpan::dummy()),
+        );
+        let logical_not = Expr::unary(
+            crate::frontend::parser::ast::UnaryOp::LogicalNot,
+            Expr::int_with_span(0, SourceSpan::dummy()),
+        );
+        let bit_not = Expr::unary(
+            crate::frontend::parser::ast::UnaryOp::BitNot,
+            Expr::int_with_span(1, SourceSpan::dummy()),
+        );
+
+        assert_eq!(
+            lower_expr(&mut cx, &minus).const_value,
+            Some(ConstValue::Int(-1))
+        );
+        assert_eq!(
+            lower_expr(&mut cx, &logical_not).const_value,
+            Some(ConstValue::Int(1))
+        );
+        assert_eq!(
+            lower_expr(&mut cx, &bit_not).const_value,
+            Some(ConstValue::Int(-2))
+        );
+    }
+
+    #[test]
+    fn index_expression_yields_element_lvalue() {
+        let mut cx = new_cx();
+        let int_ty = int_ty(&mut cx);
+        let arr_ty = cx.types.intern(Type {
+            kind: TypeKind::Array {
+                elem: int_ty,
+                len: ArrayLen::Known(4),
+            },
+            quals: Qualifiers::default(),
+        });
+        bind_symbol(&mut cx, "arr", arr_ty);
+
+        let expr = Expr::index(
+            Expr::var_with_span("arr".to_string(), SourceSpan::dummy()),
+            Expr::int_with_span(1, SourceSpan::dummy()),
+        );
+        let typed = lower_expr(&mut cx, &expr);
+        assert_eq!(typed.ty, int_ty);
+        assert_eq!(typed.value_category, ValueCategory::LValue);
+    }
+
+    #[test]
+    fn sizeof_array_operand_does_not_decay() {
+        let mut cx = new_cx();
+        let int_ty = int_ty(&mut cx);
+        let arr_ty = cx.types.intern(Type {
+            kind: TypeKind::Array {
+                elem: int_ty,
+                len: ArrayLen::Known(4),
+            },
+            quals: Qualifiers::default(),
+        });
+        bind_symbol(&mut cx, "arr", arr_ty);
+
+        let expr = Expr::sizeof_expr(Expr::var_with_span("arr".to_string(), SourceSpan::dummy()));
+        let typed = lower_expr(&mut cx, &expr);
+        assert_eq!(typed.const_value, Some(ConstValue::UInt(16)));
+    }
+
+    #[test]
+    fn member_access_resolves_field_type() {
+        let mut cx = new_cx();
+        let int_ty = int_ty(&mut cx);
+        let rec_ty = record_ty_with_field(&mut cx, "x", int_ty);
+        bind_symbol(&mut cx, "s", rec_ty);
+
+        let expr = Expr::member(
+            Expr::var_with_span("s".to_string(), SourceSpan::dummy()),
+            "x".to_string(),
+            false,
+        );
+        let typed = lower_expr(&mut cx, &expr);
+        assert_eq!(typed.ty, int_ty);
+        assert_eq!(typed.value_category, ValueCategory::LValue);
+    }
+
+    #[test]
+    fn function_call_argument_mismatch_reports_error() {
+        let mut cx = new_cx();
+        let int_ty = int_ty(&mut cx);
+        let fn_ty = cx.types.intern(Type {
+            kind: TypeKind::Function(FunctionType {
+                ret: int_ty,
+                params: vec![int_ty],
+                variadic: false,
+                style: FunctionStyle::Prototype,
+            }),
+            quals: Qualifiers::default(),
+        });
+        let sym = Symbol::new(
+            "f".to_string(),
+            SymbolKind::Function,
+            fn_ty,
+            Linkage::External,
+            DefinitionStatus::Declared,
+            SourceSpan::dummy(),
+        );
+        let sym_id = cx.insert_symbol(sym);
+        let _ = cx.insert_ordinary("f".to_string(), sym_id);
+
+        let expr = Expr::call(
+            Expr::var_with_span("f".to_string(), SourceSpan::dummy()),
+            Vec::new(),
+        );
+        let _ = lower_expr(&mut cx, &expr);
+        let diags = cx.take_diagnostics();
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == SemaDiagnosticCode::TypeMismatch),
+            "expected TypeMismatch diagnostics, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn variadic_call_requires_fixed_arguments() {
+        let mut cx = new_cx();
+        let int_ty = int_ty(&mut cx);
+        let fn_ty = cx.types.intern(Type {
+            kind: TypeKind::Function(FunctionType {
+                ret: int_ty,
+                params: vec![int_ty],
+                variadic: true,
+                style: FunctionStyle::Prototype,
+            }),
+            quals: Qualifiers::default(),
+        });
+        let sym = Symbol::new(
+            "printf_like".to_string(),
+            SymbolKind::Function,
+            fn_ty,
+            Linkage::External,
+            DefinitionStatus::Declared,
+            SourceSpan::dummy(),
+        );
+        let sym_id = cx.insert_symbol(sym);
+        let _ = cx.insert_ordinary("printf_like".to_string(), sym_id);
+
+        let expr = Expr::call(
+            Expr::var_with_span("printf_like".to_string(), SourceSpan::dummy()),
+            Vec::new(),
+        );
+        let _ = lower_expr(&mut cx, &expr);
+        let diags = cx.take_diagnostics();
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == SemaDiagnosticCode::TypeMismatch),
+            "expected TypeMismatch diagnostics, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_pointer_addition_reports_error() {
+        let mut cx = new_cx();
+        let int_ty = int_ty(&mut cx);
+        let ptr_ty = cx.types.intern(Type {
+            kind: TypeKind::Pointer { pointee: int_ty },
+            quals: Qualifiers::default(),
+        });
+        bind_symbol(&mut cx, "p", ptr_ty);
+        bind_symbol(&mut cx, "q", ptr_ty);
+
+        let expr = Expr::binary(
+            Expr::var_with_span("p".to_string(), SourceSpan::dummy()),
+            AstBinaryOp::Add,
+            Expr::var_with_span("q".to_string(), SourceSpan::dummy()),
+        );
+        let _ = lower_expr(&mut cx, &expr);
+
+        let diags = cx.take_diagnostics();
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == SemaDiagnosticCode::TypeMismatch),
+            "expected TypeMismatch diagnostics, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn pointer_assignment_accepts_null_pointer_constant() {
+        let mut cx = new_cx();
+        let int_ty = int_ty(&mut cx);
+        let ptr_ty = cx.types.intern(Type {
+            kind: TypeKind::Pointer { pointee: int_ty },
+            quals: Qualifiers::default(),
+        });
+        bind_symbol(&mut cx, "p", ptr_ty);
+
+        let expr = Expr::assign(
+            Expr::var_with_span("p".to_string(), SourceSpan::dummy()),
+            AstAssignOp::Assign,
+            Expr::int_with_span(0, SourceSpan::dummy()),
+        );
+        let typed = lower_expr(&mut cx, &expr);
+        assert_eq!(typed.ty, ptr_ty);
+
+        let diags = cx.take_diagnostics();
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.code == SemaDiagnosticCode::TypeMismatch),
+            "did not expect TypeMismatch diagnostics, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn prototype_pointer_param_accepts_null_pointer_constant() {
+        let mut cx = new_cx();
+        let int_ty = int_ty(&mut cx);
+        let ptr_ty = cx.types.intern(Type {
+            kind: TypeKind::Pointer { pointee: int_ty },
+            quals: Qualifiers::default(),
+        });
+        let fn_ty = cx.types.intern(Type {
+            kind: TypeKind::Function(FunctionType {
+                ret: int_ty,
+                params: vec![ptr_ty],
+                variadic: false,
+                style: FunctionStyle::Prototype,
+            }),
+            quals: Qualifiers::default(),
+        });
+        let sym = Symbol::new(
+            "f".to_string(),
+            SymbolKind::Function,
+            fn_ty,
+            Linkage::External,
+            DefinitionStatus::Declared,
+            SourceSpan::dummy(),
+        );
+        let sym_id = cx.insert_symbol(sym);
+        let _ = cx.insert_ordinary("f".to_string(), sym_id);
+
+        let expr = Expr::call(
+            Expr::var_with_span("f".to_string(), SourceSpan::dummy()),
+            vec![Expr::int_with_span(0, SourceSpan::dummy())],
+        );
+        let _ = lower_expr(&mut cx, &expr);
+
+        let diags = cx.take_diagnostics();
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.code == SemaDiagnosticCode::TypeMismatch),
+            "did not expect TypeMismatch diagnostics, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nonprototype_call_applies_default_argument_promotions() {
+        let mut cx = new_cx();
+        let int_ty = int_ty(&mut cx);
+        let uchar_ty = unsigned_char_ty(&mut cx);
+        bind_symbol(&mut cx, "c", uchar_ty);
+
+        let fn_ty = cx.types.intern(Type {
+            kind: TypeKind::Function(FunctionType {
+                ret: int_ty,
+                params: Vec::new(),
+                variadic: false,
+                style: FunctionStyle::NonPrototype,
+            }),
+            quals: Qualifiers::default(),
+        });
+        let sym = Symbol::new(
+            "f".to_string(),
+            SymbolKind::Function,
+            fn_ty,
+            Linkage::External,
+            DefinitionStatus::Declared,
+            SourceSpan::dummy(),
+        );
+        let sym_id = cx.insert_symbol(sym);
+        let _ = cx.insert_ordinary("f".to_string(), sym_id);
+
+        let expr = Expr::call(
+            Expr::var_with_span("f".to_string(), SourceSpan::dummy()),
+            vec![Expr::var_with_span("c".to_string(), SourceSpan::dummy())],
+        );
+        let typed = lower_expr(&mut cx, &expr);
+
+        match typed.kind {
+            TypedExprKind::Call { args, .. } => {
+                assert_eq!(args.len(), 1);
+                assert!(matches!(
+                    cx.types.get(args[0].ty).kind,
+                    TypeKind::Int { .. }
+                ));
+            }
+            other => panic!("expected call expression, got {other:?}"),
+        }
     }
 }
