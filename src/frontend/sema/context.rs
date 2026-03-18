@@ -123,6 +123,13 @@ impl<'a> SemaContext<'a> {
         self.symbol_table.get_ordinary(name).copied()
     }
 
+    /// Looks up an ordinary symbol only in the current scope.
+    pub fn lookup_ordinary_in_current_scope(&self, name: &str) -> Option<SymbolId> {
+        self.symbol_table
+            .get_ordinary_in_current_scope(name)
+            .copied()
+    }
+
     /// Resolves a symbol with declaration-before-use checking.
     ///
     /// Returns `None` if the symbol is declared after the use site.

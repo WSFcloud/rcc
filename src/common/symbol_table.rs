@@ -50,6 +50,12 @@ impl<O, T, L> SymbolTable<O, T, L> {
         self.ordinary.get(name)
     }
 
+    /// Lookup an ordinary symbol only in the current scope.
+    #[must_use]
+    pub fn get_ordinary_in_current_scope(&self, name: &str) -> Option<&O> {
+        self.ordinary.get_in_current_scope(name)
+    }
+
     pub fn insert_tag(&mut self, name: String, id: T) -> Result<(), (String, T)> {
         self.tags.insert_unique(name, id)
     }

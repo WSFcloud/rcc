@@ -8,6 +8,23 @@ fn reports_extern_after_static_linkage_conflict() {
 }
 
 #[test]
+fn inherits_internal_linkage_from_prior_static_object_declaration() {
+    let src = "static int value; int value;";
+    let result = analyze_source(src).expect("sema should succeed");
+    let symbol = result.symbols.get(SymbolId(0));
+    assert_eq!(symbol.linkage(), Linkage::Internal);
+}
+
+#[test]
+fn inherits_internal_linkage_from_prior_static_function_declaration() {
+    let src = "static int f(void); int f(void);";
+    let result = analyze_source(src).expect("sema should succeed");
+    let symbol = result.symbols.get(SymbolId(0));
+    assert_eq!(symbol.linkage(), Linkage::Internal);
+    assert_eq!(symbol.kind(), SymbolKind::Function);
+}
+
+#[test]
 fn finalizes_tentative_definition_at_tu_end() {
     let src = "int global_value;";
     let result = analyze_source(src).expect("sema should succeed");
@@ -31,6 +48,13 @@ fn reports_incomplete_element_type_for_tentative_array_definition() {
 }
 
 #[test]
+fn rejects_typedef_without_declarator() {
+    let src = "typedef int;";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::TypeMismatch);
+}
+
+#[test]
 fn supports_typedef_and_tagged_record_types() {
     let src = r#"
         typedef int my_int;
@@ -41,6 +65,13 @@ fn supports_typedef_and_tagged_record_types() {
 
     let result = analyze_source(src);
     assert!(result.is_ok(), "unexpected diagnostics: {result:?}");
+}
+
+#[test]
+fn rejects_void_parameter_in_multi_parameter_prototype() {
+    let src = "int f(void, int);";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::TypeMismatch);
 }
 
 #[test]

@@ -112,7 +112,12 @@ pub fn ensure_function_symbol(cx: &mut SemaContext<'_>, func: &FunctionDef) -> O
         }
     };
 
-    let linkage = match infer_linkage(cx.scope_level(), storage, None) {
+    let existing_id = cx.lookup_ordinary(name);
+    let linkage = match infer_linkage(
+        cx.scope_level(),
+        storage,
+        existing_id.map(|id| cx.symbol(id)),
+    ) {
         Ok(l) => l,
         Err(err) => {
             cx.emit(linkage_error_to_diag(err, func.span));
@@ -121,7 +126,7 @@ pub fn ensure_function_symbol(cx: &mut SemaContext<'_>, func: &FunctionDef) -> O
     };
 
     // Check for existing symbol and merge.
-    if let Some(existing_id) = cx.lookup_ordinary(name) {
+    if let Some(existing_id) = existing_id {
         let decl_info = crate::frontend::sema::symbols::DeclInfo {
             name,
             kind: SymbolKind::Function,
@@ -207,6 +212,14 @@ fn declare_file_scope_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) 
 
     // Handle declarations without declarators (e.g., `struct S {};` or `enum E { A };`).
     if decl.declarators.is_empty() {
+        if is_typedef {
+            cx.emit(SemaDiagnostic::new(
+                SemaDiagnosticCode::TypeMismatch,
+                "typedef declaration requires at least one declarator",
+                declaration_span(decl),
+            ));
+            return;
+        }
         // Trigger type resolution to register tags.
         let _ = resolve_base_type(cx, &decl.specifiers, declaration_span(decl), false);
         return;
@@ -257,7 +270,12 @@ fn declare_file_scope_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) 
             SymbolKind::Object
         };
 
-        let linkage = match infer_linkage(cx.scope_level(), storage, None) {
+        let existing_id = cx.lookup_ordinary(name);
+        let linkage = match infer_linkage(
+            cx.scope_level(),
+            storage,
+            existing_id.map(|id| cx.symbol(id)),
+        ) {
             Ok(l) => l,
             Err(err) => {
                 cx.emit(linkage_error_to_diag(err, init_decl.declarator.direct.span));
@@ -277,7 +295,7 @@ fn declare_file_scope_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) 
         };
 
         // Check for existing symbol and merge if compatible.
-        if let Some(existing_id) = cx.lookup_ordinary(name) {
+        if let Some(existing_id) = existing_id {
             let decl_info = crate::frontend::sema::symbols::DeclInfo {
                 name,
                 kind,
@@ -309,18 +327,26 @@ fn declare_file_scope_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) 
 }
 
 /// Validate and normalize storage-class specifiers.
+///
+/// `typedef` is syntactically a storage class but semantically not one;
+/// it is filtered out here so callers can treat the result as a true storage class.
 fn normalize_storage(
     specifiers: &DeclSpec,
     span: SourceSpan,
 ) -> Result<Option<StorageClass>, SemaDiagnostic> {
-    if specifiers.storage.len() > 1 {
+    let real_storage: Vec<_> = specifiers
+        .storage
+        .iter()
+        .filter(|s| !matches!(s, StorageClass::Typedef))
+        .collect();
+    if real_storage.len() > 1 {
         return Err(SemaDiagnostic::new(
             SemaDiagnosticCode::InvalidLinkageMerge,
             "multiple storage-class specifiers are not yet normalized",
             span,
         ));
     }
-    Ok(specifiers.storage.first().copied())
+    Ok(real_storage.first().map(|s| **s))
 }
 
 /// Build full declaration type from specifiers and declarator.
@@ -406,19 +432,27 @@ fn build_function_type(
             // Special case: single void parameter means zero parameters.
             let param_types = if params.len() == 1 && params[0].declarator.is_none() {
                 let base_ty = resolve_base_type(cx, &params[0].specifiers, params[0].span, true);
-                if matches!(cx.types.get(base_ty).kind, TypeKind::Void) {
+                if is_void_type(cx, base_ty) {
                     Vec::new()
                 } else {
                     vec![normalize_function_parameter_type(cx, base_ty)]
                 }
             } else {
-                params
-                    .iter()
-                    .map(|p| {
-                        let ty = build_parameter_type(cx, p);
-                        normalize_function_parameter_type(cx, ty)
-                    })
-                    .collect()
+                let mut lowered = Vec::with_capacity(params.len());
+                for param in params {
+                    let ty = build_parameter_type(cx, param);
+                    if is_void_type(cx, ty) {
+                        cx.emit(SemaDiagnostic::new(
+                            SemaDiagnosticCode::TypeMismatch,
+                            "parameter list with 'void' must contain exactly one unnamed parameter",
+                            param.span,
+                        ));
+                        lowered.push(cx.error_type());
+                    } else {
+                        lowered.push(normalize_function_parameter_type(cx, ty));
+                    }
+                }
+                lowered
             };
 
             cx.types.intern(Type {
@@ -466,6 +500,10 @@ fn normalize_function_parameter_type(cx: &mut SemaContext<'_>, param_ty: TypeId)
         }),
         _ => param_ty,
     }
+}
+
+fn is_void_type(cx: &SemaContext<'_>, ty: TypeId) -> bool {
+    matches!(cx.types.get(ty).kind, TypeKind::Void)
 }
 
 /// Convert array-size syntax node into semantic array length.
@@ -882,6 +920,14 @@ fn resolve_typedef_name_type(
     Ok(symbol.ty())
 }
 
+/// Return the keyword string for a record kind.
+fn record_kind_str(kind: RecordKind) -> &'static str {
+    match kind {
+        RecordKind::Struct => "struct",
+        RecordKind::Union => "union",
+    }
+}
+
 /// Resolve a `struct`/`union` specifier into semantic record type.
 ///
 /// Three cases:
@@ -909,39 +955,27 @@ fn resolve_record_specifier_type(
                             SemaDiagnosticCode::RedeclarationConflict,
                             format!(
                                 "'{tag_name}' defined as a {} but was previously declared as a {}",
-                                if record_spec.kind == RecordKind::Struct {
-                                    "struct"
-                                } else {
-                                    "union"
-                                },
-                                if existing_rec.kind == RecordKind::Struct {
-                                    "struct"
-                                } else {
-                                    "union"
-                                }
+                                record_kind_str(record_spec.kind),
+                                record_kind_str(existing_rec.kind),
                             ),
                             span,
                         ));
                     }
                     if has_body {
-                        // Complete the existing forward declaration.
-                        let fields =
-                            lower_record_fields(cx, record_spec.members.as_deref().unwrap());
-                        let rec = cx.records.get_mut(record_id);
-                        if rec.is_complete {
+                        if cx.records.get(record_id).is_complete {
                             return Err(SemaDiagnostic::new(
                                 SemaDiagnosticCode::RedeclarationConflict,
                                 format!(
                                     "redefinition of '{} {tag_name}'",
-                                    if record_spec.kind == RecordKind::Struct {
-                                        "struct"
-                                    } else {
-                                        "union"
-                                    }
+                                    record_kind_str(record_spec.kind),
                                 ),
                                 span,
                             ));
                         }
+                        // Complete the existing forward declaration.
+                        let fields =
+                            lower_record_fields(cx, record_spec.members.as_deref().unwrap());
+                        let rec = cx.records.get_mut(record_id);
                         rec.fields = fields;
                         rec.is_complete = true;
                     }
@@ -1161,7 +1195,7 @@ fn lower_enum_variants(
         };
 
         // Check for duplicate enumerator names.
-        if cx.lookup_ordinary(&variant.name).is_some() {
+        if cx.lookup_ordinary_in_current_scope(&variant.name).is_some() {
             cx.emit(SemaDiagnostic::new(
                 SemaDiagnosticCode::RedeclarationConflict,
                 format!("redefinition of enumerator '{}'", variant.name),

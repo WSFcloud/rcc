@@ -305,6 +305,18 @@ pub fn merge_declarations(
         ));
     }
 
+    // C99 6.9p5: at most one definition per external-linkage identifier.
+    if existing.status() == DefinitionStatus::Defined
+        && new_decl.status == DefinitionStatus::Defined
+    {
+        return Err(SemaDiagnostic::new(
+            SemaDiagnosticCode::RedeclarationConflict,
+            format!("redefinition of '{}'", new_decl.name),
+            new_decl.span,
+        )
+        .with_secondary(existing.decl_span(), "previous definition is here"));
+    }
+
     let Some(merged_ty) = composite_type(existing.ty(), new_decl.ty, type_arena) else {
         return Err(SemaDiagnostic::new(
             SemaDiagnosticCode::IncompatibleTypes,
