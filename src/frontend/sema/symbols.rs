@@ -223,6 +223,7 @@ pub struct DeclInfo<'a> {
 /// - The storage class is invalid for the scope
 /// - The linkage conflicts with a previous declaration
 pub fn infer_linkage(
+    kind: SymbolKind,
     scope_level: ScopeLevel,
     storage_class: Option<StorageClass>,
     existing: Option<&Symbol>,
@@ -251,7 +252,13 @@ pub fn infer_linkage(
             Some(other) => Err(LinkageError::InvalidStorageClass(other)),
         },
         ScopeLevel::Block => match storage_class {
-            None => Ok(Linkage::None),
+            None => match kind {
+                // Block-scope object declarations without storage class have no linkage.
+                SymbolKind::Object => Ok(Linkage::None),
+                // Block-scope function declarations still denote external/internal entities.
+                SymbolKind::Function => Ok(existing.map_or(Linkage::External, Symbol::linkage)),
+                SymbolKind::Typedef | SymbolKind::EnumConst => Ok(Linkage::None),
+            },
             Some(StorageClass::Extern) => Ok(existing.map_or(Linkage::External, Symbol::linkage)),
             Some(other) => Err(LinkageError::InvalidStorageClass(other)),
         },
@@ -421,6 +428,7 @@ mod tests {
         );
 
         let result = infer_linkage(
+            SymbolKind::Object,
             ScopeLevel::File,
             Some(StorageClass::Extern),
             Some(&existing),

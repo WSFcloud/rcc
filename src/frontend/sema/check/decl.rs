@@ -7,13 +7,15 @@ use crate::frontend::parser::ast::{
 };
 use crate::frontend::sema::context::SemaContext;
 use crate::frontend::sema::diagnostic::{SemaDiagnostic, SemaDiagnosticCode};
+use crate::frontend::sema::init;
 use crate::frontend::sema::symbols::{
     DefinitionStatus, Linkage, LinkageError, Symbol, SymbolId, SymbolKind, infer_linkage,
 };
+use crate::frontend::sema::typed_ast::ConstValue;
 use crate::frontend::sema::typed_ast::TypedDeclaration;
 use crate::frontend::sema::types::{
     ArrayLen, EnumConstant, EnumDef, FieldDef, Qualifiers, RecordDef, TagId, Type, TypeId,
-    TypeKind, type_size_of,
+    TypeKind, assignment_compatible_with_const, type_size_of,
 };
 
 /// Pass 1 entry for declaration processing at translation-unit scope.
@@ -115,6 +117,7 @@ pub fn ensure_function_symbol(cx: &mut SemaContext<'_>, func: &FunctionDef) -> O
 
     let existing_id = cx.lookup_ordinary(name);
     let linkage = match infer_linkage(
+        SymbolKind::Function,
         cx.scope_level(),
         storage,
         existing_id.map(|id| cx.symbol(id)),
@@ -160,10 +163,244 @@ pub fn ensure_function_symbol(cx: &mut SemaContext<'_>, func: &FunctionDef) -> O
 }
 
 /// Lower one local declaration inside a block scope.
-///
-/// TODO: implement local declaration lowering, duplicate checks, and initializer checks.
-pub fn lower_local_declaration(_cx: &mut SemaContext<'_>, _decl: &Declaration) -> TypedDeclaration {
-    todo!("sema decl: lower local declaration");
+pub fn lower_local_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) -> TypedDeclaration {
+    let mut symbols = Vec::new();
+    let span = declaration_span(decl);
+
+    let storage = match normalize_storage(&decl.specifiers, span) {
+        Ok(s) => s,
+        Err(diag) => {
+            cx.emit(diag);
+            return TypedDeclaration { symbols, span };
+        }
+    };
+    let is_typedef = decl.specifiers.storage.contains(&StorageClass::Typedef);
+
+    // Handle declarations without declarators (e.g., block-scope tag declarations).
+    if decl.declarators.is_empty() {
+        if is_typedef {
+            cx.emit(SemaDiagnostic::new(
+                SemaDiagnosticCode::TypeMismatch,
+                "typedef declaration requires at least one declarator",
+                span,
+            ));
+        }
+        let _ = resolve_base_type(cx, &decl.specifiers, span, false);
+        return TypedDeclaration { symbols, span };
+    }
+
+    let base_ty = resolve_base_type(cx, &decl.specifiers, span, false);
+
+    for init_decl in &decl.declarators {
+        let Some(name) = declarator_ident(&init_decl.declarator) else {
+            continue;
+        };
+        let ty = apply_declarator_with_base(cx, base_ty, &init_decl.declarator);
+
+        if is_typedef {
+            if init_decl.init.is_some() {
+                cx.emit(SemaDiagnostic::new(
+                    SemaDiagnosticCode::InvalidInitializer,
+                    "typedef declaration cannot have an initializer",
+                    init_decl.declarator.direct.span,
+                ));
+            }
+
+            if let Some(existing_id) = cx.lookup_ordinary_in_current_scope(name) {
+                let existing = cx.symbol(existing_id);
+                if existing.kind() == SymbolKind::Typedef && existing.ty() == ty {
+                    symbols.push(existing_id);
+                    continue;
+                }
+                cx.emit(SemaDiagnostic::new(
+                    SemaDiagnosticCode::RedeclarationConflict,
+                    format!("redefinition of '{name}'"),
+                    init_decl.declarator.direct.span,
+                ));
+                continue;
+            }
+
+            let sym = Symbol::new(
+                name.to_string(),
+                SymbolKind::Typedef,
+                ty,
+                Linkage::None,
+                DefinitionStatus::Defined,
+                init_decl.declarator.direct.span,
+            );
+            let sym_id = cx.insert_symbol(sym);
+            if let Err((dup_name, _)) = cx.insert_ordinary(name.to_string(), sym_id) {
+                cx.emit(SemaDiagnostic::new(
+                    SemaDiagnosticCode::RedeclarationConflict,
+                    format!("redeclaration of '{dup_name}'"),
+                    init_decl.declarator.direct.span,
+                ));
+                continue;
+            }
+            symbols.push(sym_id);
+            continue;
+        }
+
+        let kind = if matches!(cx.types.get(ty).kind, TypeKind::Function(_)) {
+            SymbolKind::Function
+        } else {
+            SymbolKind::Object
+        };
+
+        if kind == SymbolKind::Object
+            && storage != Some(StorageClass::Extern)
+            && !is_complete_type(ty, cx)
+        {
+            cx.emit(SemaDiagnostic::new(
+                SemaDiagnosticCode::IncompleteType,
+                format!("declaration of '{name}' has incomplete type"),
+                init_decl.declarator.direct.span,
+            ));
+        }
+
+        if let Some(init) = &init_decl.init {
+            if kind == SymbolKind::Function {
+                cx.emit(SemaDiagnostic::new(
+                    SemaDiagnosticCode::InvalidInitializer,
+                    "function declaration cannot have an initializer",
+                    init.span,
+                ));
+            }
+
+            if storage == Some(StorageClass::Extern) {
+                cx.emit(SemaDiagnostic::new(
+                    SemaDiagnosticCode::InvalidInitializer,
+                    "extern declaration cannot have an initializer",
+                    init.span,
+                ));
+            }
+
+            match &init.kind {
+                crate::frontend::parser::ast::InitializerKind::Expr(_) => {
+                    let typed_init = init::lower_initializer(cx, ty, init);
+                    if let crate::frontend::sema::typed_ast::TypedInitializer::Expr(value) =
+                        typed_init
+                        && !assignment_compatible_with_const(
+                            value.ty,
+                            const_int_value(value.const_value),
+                            ty,
+                            &cx.types,
+                        )
+                    {
+                        cx.emit(SemaDiagnostic::new(
+                            SemaDiagnosticCode::TypeMismatch,
+                            format!("initializer for '{name}' has incompatible type"),
+                            value.span,
+                        ));
+                    }
+                }
+                crate::frontend::parser::ast::InitializerKind::Aggregate(_) => {
+                    cx.emit(SemaDiagnostic::new(
+                        SemaDiagnosticCode::InvalidInitializer,
+                        "aggregate initializers are not supported yet",
+                        init.span,
+                    ));
+                }
+            }
+        }
+
+        let existing_in_current = cx.lookup_ordinary_in_current_scope(name);
+        if let Some(existing_id) = existing_in_current {
+            let existing = cx.symbol(existing_id);
+            if kind == SymbolKind::Object && existing.linkage() == Linkage::None {
+                cx.emit(
+                    SemaDiagnostic::new(
+                        SemaDiagnosticCode::RedeclarationConflict,
+                        format!("redeclaration of '{name}' in the same block scope"),
+                        init_decl.declarator.direct.span,
+                    )
+                    .with_secondary(existing.decl_span(), "previous declaration is here"),
+                );
+                continue;
+            }
+        }
+
+        let visible_linkage_entity = cx.lookup_ordinary(name).filter(|id| {
+            let sym = cx.symbol(*id);
+            if sym.linkage() == Linkage::None {
+                return false;
+            }
+            if kind == SymbolKind::Function {
+                sym.kind() == SymbolKind::Function
+            } else {
+                true
+            }
+        });
+
+        let merge_target = if let Some(existing_id) = existing_in_current {
+            Some(existing_id)
+        } else if kind == SymbolKind::Function || storage == Some(StorageClass::Extern) {
+            visible_linkage_entity
+        } else {
+            None
+        };
+
+        let linkage = match infer_linkage(
+            kind,
+            cx.scope_level(),
+            storage,
+            merge_target.map(|id| cx.symbol(id)),
+        ) {
+            Ok(l) => l,
+            Err(err) => {
+                cx.emit(linkage_error_to_diag(err, init_decl.declarator.direct.span));
+                continue;
+            }
+        };
+
+        let status = if init_decl.init.is_some() {
+            DefinitionStatus::Defined
+        } else {
+            DefinitionStatus::Declared
+        };
+
+        if let Some(existing_id) = merge_target {
+            let decl_info = crate::frontend::sema::symbols::DeclInfo {
+                name,
+                kind,
+                ty,
+                linkage,
+                status,
+                span: init_decl.declarator.direct.span,
+            };
+            if let Err(diag) = crate::frontend::sema::symbols::merge_declarations(
+                cx.symbols.get_mut(existing_id),
+                &decl_info,
+                &mut cx.types,
+            ) {
+                cx.emit(diag);
+                continue;
+            }
+            symbols.push(existing_id);
+            continue;
+        }
+
+        let sym = Symbol::new(
+            name.to_string(),
+            kind,
+            ty,
+            linkage,
+            status,
+            init_decl.declarator.direct.span,
+        );
+        let sym_id = cx.insert_symbol(sym);
+        if let Err((dup_name, _)) = cx.insert_ordinary(name.to_string(), sym_id) {
+            cx.emit(SemaDiagnostic::new(
+                SemaDiagnosticCode::RedeclarationConflict,
+                format!("redeclaration of '{dup_name}'"),
+                init_decl.declarator.direct.span,
+            ));
+            continue;
+        }
+        symbols.push(sym_id);
+    }
+
+    TypedDeclaration { symbols, span }
 }
 
 /// Extract the identifier from a declarator.
@@ -273,6 +510,7 @@ fn declare_file_scope_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) 
 
         let existing_id = cx.lookup_ordinary(name);
         let linkage = match infer_linkage(
+            kind,
             cx.scope_level(),
             storage,
             existing_id.map(|id| cx.symbol(id)),
@@ -488,7 +726,10 @@ fn resolve_base_type(
 /// Normalize parameter types according to C decay rules.
 ///
 /// Arrays decay to pointers, functions decay to function pointers.
-fn normalize_function_parameter_type(cx: &mut SemaContext<'_>, param_ty: TypeId) -> TypeId {
+pub(crate) fn normalize_function_parameter_type(
+    cx: &mut SemaContext<'_>,
+    param_ty: TypeId,
+) -> TypeId {
     let ty = cx.types.get(param_ty);
     match &ty.kind {
         TypeKind::Array { elem, .. } => cx.types.intern(Type {
@@ -799,6 +1040,21 @@ fn emit_ice_eval_error(cx: &mut SemaContext<'_>, err: IceEvalError, non_constant
     }
 }
 
+/// Evaluate an integer constant expression and emit diagnostics on failure.
+pub(crate) fn evaluate_required_integer_constant_expr(
+    cx: &mut SemaContext<'_>,
+    expr: &crate::frontend::parser::ast::Expr,
+    non_constant_message: &str,
+) -> Option<i64> {
+    match evaluate_integer_constant_expr(cx, expr) {
+        Ok(v) => Some(v),
+        Err(err) => {
+            emit_ice_eval_error(cx, err, non_constant_message);
+            None
+        }
+    }
+}
+
 fn evaluate_integer_constant_expr(
     cx: &mut SemaContext<'_>,
     expr: &crate::frontend::parser::ast::Expr,
@@ -948,7 +1204,15 @@ fn evaluate_integer_constant_expr(
     }
 }
 
-fn cast_ice_integer_value(cx: &SemaContext<'_>, value: i64, ty: TypeId) -> i64 {
+fn const_int_value(value: Option<ConstValue>) -> Option<i64> {
+    match value {
+        Some(ConstValue::Int(v)) => Some(v),
+        Some(ConstValue::UInt(v)) => i64::try_from(v).ok(),
+        _ => None,
+    }
+}
+
+pub(crate) fn cast_ice_integer_value(cx: &SemaContext<'_>, value: i64, ty: TypeId) -> i64 {
     match &cx.types.get(ty).kind {
         TypeKind::Bool => i64::from(value != 0),
         TypeKind::Char | TypeKind::SignedChar => (value as i8) as i64,
