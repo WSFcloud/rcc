@@ -2,7 +2,7 @@ use crate::frontend::lexer::lexer_from_source;
 use crate::frontend::parser::parse;
 use crate::frontend::sema;
 use crate::frontend::sema::diagnostic::SemaDiagnosticCode;
-use crate::frontend::sema::symbols::{DefinitionStatus, Linkage, SymbolId};
+use crate::frontend::sema::symbols::{DefinitionStatus, Linkage, SymbolId, SymbolKind};
 use crate::frontend::sema::types::TypeKind;
 use chumsky::input::{Input, Stream};
 
@@ -79,6 +79,21 @@ fn finalizes_tentative_definition_at_tu_end() {
 }
 
 #[test]
+fn extern_incomplete_array_declaration_is_not_tentative() {
+    let src = "extern int ext_arr[];";
+    let result = analyze_source(src).expect("sema should succeed");
+    let symbol = result.symbols.get(SymbolId(0));
+    assert_eq!(symbol.status(), DefinitionStatus::Declared);
+}
+
+#[test]
+fn reports_incomplete_element_type_for_tentative_array_definition() {
+    let src = "struct S; struct S arr[1];";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::IncompleteType);
+}
+
+#[test]
 fn static_inline_function_uses_internal_linkage() {
     let src = "static inline int helper(void) { return 42; }";
     let result = analyze_source(src).expect("sema should succeed");
@@ -128,6 +143,35 @@ fn supports_enum_constants_and_sizeof_in_array_length() {
 
     let result = analyze_source(src);
     assert!(result.is_ok(), "unexpected diagnostics: {result:?}");
+}
+
+#[test]
+fn supports_short_circuit_integer_constant_expressions() {
+    let src = r#"
+        enum { A = 0 && (1 / 0), B = 1 || (1 / 0) };
+        int arr[A + B + 1];
+    "#;
+
+    let result = analyze_source(src);
+    assert!(result.is_ok(), "unexpected diagnostics: {result:?}");
+}
+
+#[test]
+fn classifies_function_pointer_and_function_declarators_correctly() {
+    let src = "int *f(void); int (*fp)(void);";
+    let result = analyze_source(src).expect("sema should succeed");
+
+    let f = result.symbols.get(SymbolId(0));
+    let fp = result.symbols.get(SymbolId(1));
+    assert_eq!(f.kind(), SymbolKind::Function);
+    assert_eq!(fp.kind(), SymbolKind::Object);
+}
+
+#[test]
+fn rejects_incompatible_typedef_redeclaration_for_function_type() {
+    let src = "typedef int F(); typedef int F(int);";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::RedeclarationConflict);
 }
 
 #[test]

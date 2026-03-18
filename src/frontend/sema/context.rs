@@ -152,6 +152,11 @@ impl<'a> SemaContext<'a> {
         self.symbol_table.get_tag(name).copied()
     }
 
+    /// Looks up a tag only in the current scope (no outer scope lookup).
+    pub fn lookup_tag_in_current_scope(&self, name: &str) -> Option<TagId> {
+        self.symbol_table.get_tag_in_current_scope(name).copied()
+    }
+
     /// Associates an enum constant symbol with its integer value.
     pub fn set_enum_const_value(&mut self, id: SymbolId, value: i64) {
         self.enum_const_values.insert(id, value);

@@ -59,6 +59,12 @@ impl<O, T, L> SymbolTable<O, T, L> {
         self.tags.get(name)
     }
 
+    /// Lookup a tag only in the current scope (no shadowing lookup).
+    #[must_use]
+    pub fn get_tag_in_current_scope(&self, name: &str) -> Option<&T> {
+        self.tags.get_in_current_scope(name)
+    }
+
     /// Start a fresh function-level label namespace.
     pub fn begin_function_labels(&mut self) {
         self.labels = Some(HashMap::new());

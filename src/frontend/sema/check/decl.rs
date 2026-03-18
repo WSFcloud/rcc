@@ -3,15 +3,16 @@ use crate::frontend::parser::ast::{
     ArraySize, DeclSpec, Declaration, Declarator, DirectDeclarator, DirectDeclaratorKind,
     EnumSpecifier, ExternalDecl, FunctionDef, FunctionParams, ParameterDecl, Pointer, RecordKind,
     RecordMemberDecl, RecordSpecifier, StorageClass, TranslationUnit, TypeName, TypeQualifier,
+    TypeSpecifier,
 };
 use crate::frontend::sema::context::SemaContext;
 use crate::frontend::sema::diagnostic::{SemaDiagnostic, SemaDiagnosticCode};
 use crate::frontend::sema::symbols::{
-    DefinitionStatus, Linkage, LinkageError, Symbol, SymbolId, SymbolKind, infer_linkage,
+    infer_linkage, DefinitionStatus, Linkage, LinkageError, Symbol, SymbolId, SymbolKind,
 };
 use crate::frontend::sema::typed_ast::TypedDeclaration;
 use crate::frontend::sema::types::{
-    ArrayLen, EnumConstant, FieldDef, Qualifiers, TagId, Type, TypeId, TypeKind,
+    ArrayLen, EnumConstant, EnumDef, FieldDef, Qualifiers, RecordDef, TagId, Type, TypeId, TypeKind,
 };
 
 /// Pass 1 entry for declaration processing at translation-unit scope.
@@ -91,10 +92,65 @@ pub fn finalize_tentative_definitions(cx: &mut SemaContext<'_>) {
 }
 
 /// Ensure one function symbol exists in the current scope and return its symbol id.
-///
-/// TODO: implement function declaration building, linkage merge, and diagnostics.
-pub fn ensure_function_symbol(_cx: &mut SemaContext<'_>, _func: &FunctionDef) -> Option<SymbolId> {
-    todo!("sema decl: ensure function symbol");
+pub fn ensure_function_symbol(cx: &mut SemaContext<'_>, func: &FunctionDef) -> Option<SymbolId> {
+    let Some(name) = function_name(func) else {
+        return None;
+    };
+
+    let ty = build_decl_type(
+        cx,
+        &func.specifiers,
+        &func.declarator,
+        func.declarator.direct.span,
+    );
+
+    let storage = match normalize_storage(&func.specifiers, func.span) {
+        Ok(s) => s,
+        Err(diag) => {
+            cx.emit(diag);
+            return None;
+        }
+    };
+
+    let linkage = match infer_linkage(cx.scope_level(), storage, None) {
+        Ok(l) => l,
+        Err(err) => {
+            cx.emit(linkage_error_to_diag(err, func.span));
+            return None;
+        }
+    };
+
+    // Check for existing symbol and merge.
+    if let Some(existing_id) = cx.lookup_ordinary(name) {
+        let decl_info = crate::frontend::sema::symbols::DeclInfo {
+            name,
+            kind: SymbolKind::Function,
+            ty,
+            linkage,
+            status: DefinitionStatus::Defined,
+            span: func.declarator.direct.span,
+        };
+        if let Err(diag) = crate::frontend::sema::symbols::merge_declarations(
+            cx.symbols.get_mut(existing_id),
+            &decl_info,
+            &mut cx.types,
+        ) {
+            cx.emit(diag);
+        }
+        Some(existing_id)
+    } else {
+        let sym = Symbol::new(
+            name.to_string(),
+            SymbolKind::Function,
+            ty,
+            linkage,
+            DefinitionStatus::Defined,
+            func.declarator.direct.span,
+        );
+        let sym_id = cx.insert_symbol(sym);
+        let _ = cx.insert_ordinary(name.to_string(), sym_id);
+        Some(sym_id)
+    }
 }
 
 /// Lower one local declaration inside a block scope.
@@ -117,13 +173,13 @@ pub fn function_name(func: &FunctionDef) -> Option<&str> {
 }
 
 /// Build semantic parameter type from parser parameter declaration.
-///
-/// TODO: implement base-type resolution and parameter declarator application.
-pub(crate) fn build_parameter_type(
-    _cx: &mut SemaContext<'_>,
-    _parameter: &ParameterDecl,
-) -> TypeId {
-    todo!("sema decl: build parameter type");
+pub(crate) fn build_parameter_type(cx: &mut SemaContext<'_>, parameter: &ParameterDecl) -> TypeId {
+    let base_ty = resolve_base_type(cx, &parameter.specifiers, parameter.span, true);
+    if let Some(declarator) = &parameter.declarator {
+        apply_declarator_with_base(cx, base_ty, declarator)
+    } else {
+        base_ty
+    }
 }
 
 /// Extract the identifier from a direct declarator node.
@@ -138,26 +194,118 @@ fn direct_declarator_ident(declarator: &DirectDeclarator) -> Option<&str> {
 }
 
 /// Register one file-scope declaration in pass 1.
-///
-/// TODO: implement symbol creation/merge, linkage rules, and tentative definition status.
-fn declare_file_scope_declaration(_cx: &mut SemaContext<'_>, _decl: &Declaration) {
-    todo!("sema decl: declare file-scope declaration");
-}
+fn declare_file_scope_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) {
+    let storage = match normalize_storage(&decl.specifiers, declaration_span(decl)) {
+        Ok(s) => s,
+        Err(diag) => {
+            cx.emit(diag);
+            return;
+        }
+    };
 
-/// Classify a declaration as object/function/typedef symbol kind.
-fn symbol_kind(specifiers: &DeclSpec, declarator: &Declarator, is_definition: bool) -> SymbolKind {
-    if specifiers.storage.contains(&StorageClass::Typedef) {
-        return SymbolKind::Typedef;
+    let is_typedef = decl.specifiers.storage.contains(&StorageClass::Typedef);
+
+    // Handle declarations without declarators (e.g., `struct S {};` or `enum E { A };`).
+    if decl.declarators.is_empty() {
+        // Trigger type resolution to register tags.
+        let _ = resolve_base_type(cx, &decl.specifiers, declaration_span(decl), false);
+        return;
     }
-    if is_definition
-        || matches!(
-            declarator.direct.kind,
-            DirectDeclaratorKind::Function { .. }
-        )
-    {
-        return SymbolKind::Function;
+
+    // Resolve base type once to avoid re-entering struct/enum definitions.
+    let base_ty = resolve_base_type(cx, &decl.specifiers, declaration_span(decl), true);
+
+    for init_decl in &decl.declarators {
+        let Some(name) = declarator_ident(&init_decl.declarator) else {
+            continue;
+        };
+
+        let ty = apply_declarator_with_base(cx, base_ty, &init_decl.declarator);
+
+        if is_typedef {
+            // Typedef redeclaration: C11 6.7p3 allows identical typedef redeclaration.
+            if let Some(existing_id) = cx.lookup_ordinary(name) {
+                let existing = cx.symbol(existing_id);
+                if existing.kind() == SymbolKind::Typedef && existing.ty() == ty {
+                    // Identical typedef redeclaration — silently accept.
+                    continue;
+                }
+                cx.emit(SemaDiagnostic::new(
+                    SemaDiagnosticCode::RedeclarationConflict,
+                    format!("redefinition of '{name}'"),
+                    init_decl.declarator.direct.span,
+                ));
+                continue;
+            }
+            // First declaration — insert symbol then register in namespace.
+            let sym = Symbol::new(
+                name.to_string(),
+                SymbolKind::Typedef,
+                ty,
+                Linkage::None,
+                DefinitionStatus::Defined,
+                init_decl.declarator.direct.span,
+            );
+            let sym_id = cx.insert_symbol(sym);
+            let _ = cx.insert_ordinary(name.to_string(), sym_id);
+            continue;
+        }
+
+        let kind = if matches!(cx.types.get(ty).kind, TypeKind::Function(_)) {
+            SymbolKind::Function
+        } else {
+            SymbolKind::Object
+        };
+
+        let linkage = match infer_linkage(cx.scope_level(), storage, None) {
+            Ok(l) => l,
+            Err(err) => {
+                cx.emit(linkage_error_to_diag(err, init_decl.declarator.direct.span));
+                continue;
+            }
+        };
+
+        let status = if init_decl.init.is_some() {
+            DefinitionStatus::Defined
+        } else if kind == SymbolKind::Object
+            && linkage != Linkage::None
+            && storage != Some(StorageClass::Extern)
+        {
+            DefinitionStatus::Tentative
+        } else {
+            DefinitionStatus::Declared
+        };
+
+        // Check for existing symbol and merge if compatible.
+        if let Some(existing_id) = cx.lookup_ordinary(name) {
+            let decl_info = crate::frontend::sema::symbols::DeclInfo {
+                name,
+                kind,
+                ty,
+                linkage,
+                status,
+                span: init_decl.declarator.direct.span,
+            };
+            if let Err(diag) = crate::frontend::sema::symbols::merge_declarations(
+                cx.symbols.get_mut(existing_id),
+                &decl_info,
+                &mut cx.types,
+            ) {
+                cx.emit(diag);
+            }
+        } else {
+            let sym = Symbol::new(
+                name.to_string(),
+                kind,
+                ty,
+                linkage,
+                status,
+                init_decl.declarator.direct.span,
+            );
+            let sym_id = cx.insert_symbol(sym);
+            let _ = cx.insert_ordinary(name.to_string(), sym_id);
+        }
     }
-    SymbolKind::Object
 }
 
 /// Validate and normalize storage-class specifiers.
@@ -176,61 +324,124 @@ fn normalize_storage(
 }
 
 /// Build full declaration type from specifiers and declarator.
-///
-/// TODO: replace placeholder flow once declarator/type builder is fully implemented.
 fn build_decl_type(
     cx: &mut SemaContext<'_>,
     specifiers: &DeclSpec,
     declarator: &Declarator,
     span: SourceSpan,
 ) -> TypeId {
-    let base_ty = resolve_base_type(cx, specifiers, span);
+    let base_ty = resolve_base_type(cx, specifiers, span, true);
     apply_declarator_with_base(cx, base_ty, declarator)
 }
 
 /// Apply declarator modifiers over a computed base type.
 ///
-/// TODO: implement full inside-out declarator composition.
+/// Apply by declarator precedence:
+/// - First apply pointer layers on this declarator node.
+/// - Then thread direct-declarator suffixes (`[]`, `()`) through `Grouped`.
 fn apply_declarator_with_base(
-    _cx: &mut SemaContext<'_>,
-    _base_ty: TypeId,
-    _declarator: &Declarator,
+    cx: &mut SemaContext<'_>,
+    base_ty: TypeId,
+    declarator: &Declarator,
 ) -> TypeId {
-    todo!("sema decl: apply declarator with base");
+    let base_with_pointers = apply_pointer_layers(cx, base_ty, &declarator.pointers);
+    apply_direct_declarator(cx, base_with_pointers, &declarator.direct)
 }
 
-/// Apply pointer layers (`*`) over a type.
-///
-/// TODO: implement pointer qualifier and ordering handling.
-fn apply_pointer_layers(_cx: &mut SemaContext<'_>, _ty: TypeId, _pointers: &[Pointer]) -> TypeId {
-    todo!("sema decl: apply pointer layers");
+/// Apply pointer layers (`*`) over a type, from innermost to outermost.
+fn apply_pointer_layers(cx: &mut SemaContext<'_>, mut ty: TypeId, pointers: &[Pointer]) -> TypeId {
+    for ptr in pointers {
+        let quals = qualifiers_from_slice(&ptr.qualifiers);
+        ty = cx.types.intern(Type {
+            kind: TypeKind::Pointer { pointee: ty },
+            quals,
+        });
+    }
+    ty
 }
 
 /// Apply one direct declarator chain (array/function/grouped/identifier).
-///
-/// TODO: implement direct declarator lowering recursion.
 fn apply_direct_declarator(
-    _cx: &mut SemaContext<'_>,
-    _base_ty: TypeId,
-    _direct: &DirectDeclarator,
+    cx: &mut SemaContext<'_>,
+    base_ty: TypeId,
+    direct: &DirectDeclarator,
 ) -> TypeId {
-    todo!("sema decl: apply direct declarator");
+    match &direct.kind {
+        DirectDeclaratorKind::Ident(_) | DirectDeclaratorKind::Abstract => base_ty,
+        DirectDeclaratorKind::Grouped(inner) => apply_declarator_with_base(cx, base_ty, inner),
+        DirectDeclaratorKind::Array { inner, size, .. } => {
+            let len = array_len_from_size_expr(cx, size, direct.span);
+            let array_ty = cx.types.intern(Type {
+                kind: TypeKind::Array { elem: base_ty, len },
+                quals: Qualifiers::default(),
+            });
+            apply_direct_declarator(cx, array_ty, inner)
+        }
+        DirectDeclaratorKind::Function { inner, params } => {
+            let function_ty = build_function_type(cx, base_ty, params);
+            apply_direct_declarator(cx, function_ty, inner)
+        }
+    }
 }
 
 /// Build function type from return type and parsed parameter list.
-///
-/// TODO: implement prototype/non-prototype handling and parameter normalization.
 fn build_function_type(
-    _cx: &mut SemaContext<'_>,
-    _ret_ty: TypeId,
-    _params: &FunctionParams,
+    cx: &mut SemaContext<'_>,
+    ret_ty: TypeId,
+    params: &FunctionParams,
 ) -> TypeId {
-    todo!("sema decl: build function type");
+    use crate::frontend::sema::types::{FunctionStyle, FunctionType};
+
+    match params {
+        FunctionParams::NonPrototype => cx.types.intern(Type {
+            kind: TypeKind::Function(FunctionType {
+                ret: ret_ty,
+                params: Vec::new(),
+                variadic: false,
+                style: FunctionStyle::NonPrototype,
+            }),
+            quals: Qualifiers::default(),
+        }),
+        FunctionParams::Prototype { params, variadic } => {
+            // Special case: single void parameter means zero parameters.
+            let param_types = if params.len() == 1 && params[0].declarator.is_none() {
+                let base_ty = resolve_base_type(cx, &params[0].specifiers, params[0].span, true);
+                if matches!(cx.types.get(base_ty).kind, TypeKind::Void) {
+                    Vec::new()
+                } else {
+                    vec![normalize_function_parameter_type(cx, base_ty)]
+                }
+            } else {
+                params
+                    .iter()
+                    .map(|p| {
+                        let ty = build_parameter_type(cx, p);
+                        normalize_function_parameter_type(cx, ty)
+                    })
+                    .collect()
+            };
+
+            cx.types.intern(Type {
+                kind: TypeKind::Function(FunctionType {
+                    ret: ret_ty,
+                    params: param_types,
+                    variadic: *variadic,
+                    style: FunctionStyle::Prototype,
+                }),
+                quals: Qualifiers::default(),
+            })
+        }
+    }
 }
 
 /// Resolve declaration specifiers into a semantic base type.
-fn resolve_base_type(cx: &mut SemaContext<'_>, specifiers: &DeclSpec, span: SourceSpan) -> TypeId {
-    match try_build_base_type(cx, specifiers, span) {
+fn resolve_base_type(
+    cx: &mut SemaContext<'_>,
+    specifiers: &DeclSpec,
+    span: SourceSpan,
+    allow_outer_tag_reference: bool,
+) -> TypeId {
+    match try_build_base_type(cx, specifiers, span, allow_outer_tag_reference) {
         Ok(ty) => ty,
         Err(diag) => {
             cx.emit(diag);
@@ -241,139 +452,830 @@ fn resolve_base_type(cx: &mut SemaContext<'_>, specifiers: &DeclSpec, span: Sour
 
 /// Normalize parameter types according to C decay rules.
 ///
-/// TODO: implement array/function parameter decay and qualifier adjustments.
-fn normalize_function_parameter_type(_cx: &mut SemaContext<'_>, _param_ty: TypeId) -> TypeId {
-    todo!("sema decl: normalize function parameter type");
+/// Arrays decay to pointers, functions decay to function pointers.
+fn normalize_function_parameter_type(cx: &mut SemaContext<'_>, param_ty: TypeId) -> TypeId {
+    let ty = cx.types.get(param_ty);
+    match &ty.kind {
+        TypeKind::Array { elem, .. } => cx.types.intern(Type {
+            kind: TypeKind::Pointer { pointee: *elem },
+            quals: ty.quals,
+        }),
+        TypeKind::Function(_) => cx.types.intern(Type {
+            kind: TypeKind::Pointer { pointee: param_ty },
+            quals: Qualifiers::default(),
+        }),
+        _ => param_ty,
+    }
 }
 
 /// Convert array-size syntax node into semantic array length.
-///
-/// TODO: implement constant-expression evaluation and VM-type diagnostics.
 fn array_len_from_size_expr(
-    _cx: &mut SemaContext<'_>,
-    _size: &ArraySize,
-    _span: SourceSpan,
+    cx: &mut SemaContext<'_>,
+    size: &ArraySize,
+    span: SourceSpan,
 ) -> ArrayLen {
-    todo!("sema decl: resolve array length");
+    match size {
+        ArraySize::Unspecified => ArrayLen::Incomplete,
+        ArraySize::Variable => {
+            cx.emit(SemaDiagnostic::new(
+                SemaDiagnosticCode::UnsupportedVmType,
+                "variable-length arrays are not supported in V1",
+                span,
+            ));
+            ArrayLen::Incomplete
+        }
+        ArraySize::Expr(expr) => match evaluate_integer_constant_expr(cx, expr) {
+            Some(n) if n > 0 => ArrayLen::Known(n as u64),
+            Some(_) => {
+                cx.emit(SemaDiagnostic::new(
+                    SemaDiagnosticCode::NonConstantInRequiredContext,
+                    "array size must be a positive integer",
+                    span,
+                ));
+                ArrayLen::Incomplete
+            }
+            None => {
+                cx.emit(SemaDiagnostic::new(
+                    SemaDiagnosticCode::NonConstantInRequiredContext,
+                    "array size is not a constant expression",
+                    span,
+                ));
+                ArrayLen::Incomplete
+            }
+        },
+    }
 }
 
 /// Build builtin/typedef/record/enum base type from declaration specifiers.
 ///
-/// TODO: implement C type-specifier combination validation and lowering.
+/// Uses a counter-based approach: count occurrences of each type keyword,
+/// then match against the set of legal C99 combinations (C99 6.7.2).
 fn try_build_base_type(
-    _cx: &mut SemaContext<'_>,
-    _specifiers: &DeclSpec,
-    _span: SourceSpan,
+    cx: &mut SemaContext<'_>,
+    specifiers: &DeclSpec,
+    span: SourceSpan,
+    allow_outer_tag_reference: bool,
 ) -> Result<TypeId, SemaDiagnostic> {
-    todo!("sema decl: build base type from specifiers");
+    use crate::frontend::parser::ast::TypeSpecifierKind as TSK;
+
+    // Separate structured specifiers (struct/union/enum/typedef) from keywords.
+    let mut structured: Option<&TypeSpecifier> = None;
+    let mut void_count = 0u8;
+    let mut char_count = 0u8;
+    let mut short_count = 0u8;
+    let mut int_count = 0u8;
+    let mut long_count = 0u8;
+    let mut float_count = 0u8;
+    let mut double_count = 0u8;
+    let mut signed_count = 0u8;
+    let mut unsigned_count = 0u8;
+    let mut bool_count = 0u8;
+
+    for spec in &specifiers.ty {
+        match &spec.kind {
+            TSK::StructOrUnion(_) | TSK::Enum(_) | TSK::TypedefName(_) => {
+                if structured.is_some() {
+                    return Err(SemaDiagnostic::new(
+                        SemaDiagnosticCode::TypeMismatch,
+                        "multiple struct/union/enum/typedef specifiers",
+                        spec.span,
+                    ));
+                }
+                structured = Some(spec);
+            }
+            TSK::Void => void_count += 1,
+            TSK::Char => char_count += 1,
+            TSK::Short => short_count += 1,
+            TSK::Int => int_count += 1,
+            TSK::Long => long_count += 1,
+            TSK::Float => float_count += 1,
+            TSK::Double => double_count += 1,
+            TSK::Signed => signed_count += 1,
+            TSK::Unsigned => unsigned_count += 1,
+            TSK::Bool => bool_count += 1,
+        }
+    }
+
+    let keyword_total = void_count
+        + char_count
+        + short_count
+        + int_count
+        + long_count
+        + float_count
+        + double_count
+        + signed_count
+        + unsigned_count
+        + bool_count;
+
+    // Structured specifier must appear alone (no keyword mix).
+    if let Some(s) = structured {
+        if keyword_total > 0 {
+            return Err(SemaDiagnostic::new(
+                SemaDiagnosticCode::TypeMismatch,
+                "type specifier keywords cannot combine with struct/union/enum/typedef",
+                span,
+            ));
+        }
+        let base_ty = match &s.kind {
+            TSK::StructOrUnion(rec) => {
+                resolve_record_specifier_type(cx, rec, s.span, allow_outer_tag_reference)?
+            }
+            TSK::Enum(en) => resolve_enum_specifier_type(cx, en, s.span)?,
+            TSK::TypedefName(name) => resolve_typedef_name_type(cx, name, s.span)?,
+            _ => unreachable!(),
+        };
+        // Apply top-level qualifiers.
+        let quals = qualifiers_from_slice(&specifiers.qualifiers);
+        return Ok(apply_type_qualifiers(cx, base_ty, quals));
+    }
+
+    // Empty specifier list: C99 forbids implicit int.
+    if keyword_total == 0 {
+        return Err(SemaDiagnostic::new(
+            SemaDiagnosticCode::TypeMismatch,
+            "missing type specifier (implicit int is not allowed in C99)",
+            span,
+        ));
+    }
+
+    // Reject duplicates of non-combinable keywords.
+    if void_count > 1
+        || char_count > 1
+        || short_count > 1
+        || int_count > 1
+        || float_count > 1
+        || double_count > 1
+        || signed_count > 1
+        || unsigned_count > 1
+        || bool_count > 1
+    {
+        return Err(SemaDiagnostic::new(
+            SemaDiagnosticCode::TypeMismatch,
+            "duplicate type specifier",
+            span,
+        ));
+    }
+    // long can appear at most twice (long long).
+    if long_count > 2 {
+        return Err(SemaDiagnostic::new(
+            SemaDiagnosticCode::TypeMismatch,
+            "too many 'long' specifiers",
+            span,
+        ));
+    }
+
+    // signed/unsigned are mutually exclusive.
+    if signed_count > 0 && unsigned_count > 0 {
+        return Err(SemaDiagnostic::new(
+            SemaDiagnosticCode::TypeMismatch,
+            "'signed' and 'unsigned' cannot be combined",
+            span,
+        ));
+    }
+    let is_unsigned = unsigned_count > 0;
+
+    // Match legal combinations (C99 6.7.2).
+    let kind = match (
+        void_count,
+        bool_count,
+        char_count,
+        short_count,
+        int_count,
+        long_count,
+        float_count,
+        double_count,
+    ) {
+        // void
+        (1, 0, 0, 0, 0, 0, 0, 0) if !is_unsigned && signed_count == 0 => TypeKind::Void,
+        // _Bool
+        (0, 1, 0, 0, 0, 0, 0, 0) if !is_unsigned && signed_count == 0 => TypeKind::Bool,
+        // char, signed char, unsigned char
+        (0, 0, 1, 0, 0, 0, 0, 0) if signed_count == 0 && !is_unsigned => TypeKind::Char,
+        (0, 0, 1, 0, 0, 0, 0, 0) if signed_count > 0 => TypeKind::SignedChar,
+        (0, 0, 1, 0, 0, 0, 0, 0) if is_unsigned => TypeKind::UnsignedChar,
+        // short, short int, signed short, signed short int, unsigned short, unsigned short int
+        (0, 0, 0, 1, i, 0, 0, 0) if i <= 1 => TypeKind::Short {
+            signed: !is_unsigned,
+        },
+        // int, signed, signed int, unsigned, unsigned int
+        (0, 0, 0, 0, i, 0, 0, 0) if i <= 1 && (i > 0 || signed_count > 0 || is_unsigned) => {
+            TypeKind::Int {
+                signed: !is_unsigned,
+            }
+        }
+        // long, long int, signed long, signed long int, unsigned long, unsigned long int
+        (0, 0, 0, 0, i, 1, 0, 0) if i <= 1 => TypeKind::Long {
+            signed: !is_unsigned,
+        },
+        // long long, long long int, signed long long, etc.
+        (0, 0, 0, 0, i, 2, 0, 0) if i <= 1 => TypeKind::LongLong {
+            signed: !is_unsigned,
+        },
+        // float
+        (0, 0, 0, 0, 0, 0, 1, 0) if signed_count == 0 && !is_unsigned => TypeKind::Float,
+        // double
+        (0, 0, 0, 0, 0, 0, 0, 1) if signed_count == 0 && !is_unsigned && long_count == 0 => {
+            TypeKind::Double
+        }
+        // long double — V1 不支持
+        (0, 0, 0, 0, 0, 1, 0, 1) if signed_count == 0 && !is_unsigned => {
+            return Err(SemaDiagnostic::new(
+                SemaDiagnosticCode::TypeMismatch,
+                "'long double' is not supported in V1",
+                span,
+            ));
+        }
+        _ => {
+            return Err(SemaDiagnostic::new(
+                SemaDiagnosticCode::TypeMismatch,
+                "invalid combination of type specifiers",
+                span,
+            ));
+        }
+    };
+
+    let quals = qualifiers_from_slice(&specifiers.qualifiers);
+    Ok(cx.types.intern(Type { kind, quals }))
 }
 
 /// Evaluate an integer constant expression for contexts like enum/array length.
 ///
-/// TODO: implement constant-expression folding.
+/// Supports: integer literals, enum constant references, unary +/-/~/!,
+/// and binary arithmetic/bitwise/relational/logical operators.
 fn evaluate_integer_constant_expr(
-    _cx: &mut SemaContext<'_>,
-    _expr: &crate::frontend::parser::ast::Expr,
+    cx: &mut SemaContext<'_>,
+    expr: &crate::frontend::parser::ast::Expr,
 ) -> Option<i64> {
-    todo!("sema decl: evaluate integer constant expr");
+    use crate::frontend::parser::ast::{BinaryOp, ExprKind, Literal, UnaryOp};
+
+    match &expr.kind {
+        ExprKind::Literal(Literal::Int { value, .. }) => Some(*value as i64),
+        ExprKind::Literal(Literal::Char(c)) => Some(*c as i64),
+        ExprKind::Var(name) => {
+            // Look up enum constants by name.
+            let sym_id = cx.resolve_ordinary(name, expr.span)?;
+            let sym = cx.symbol(sym_id);
+            if sym.kind() != SymbolKind::EnumConst {
+                return None;
+            }
+            cx.lookup_enum_const_value(sym_id)
+        }
+        ExprKind::Unary { op, expr: inner } => {
+            let val = evaluate_integer_constant_expr(cx, inner)?;
+            Some(match op {
+                UnaryOp::Plus => val,
+                UnaryOp::Minus => val.wrapping_neg(),
+                UnaryOp::BitNot => !val,
+                UnaryOp::LogicalNot => {
+                    if val == 0 {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                _ => return None,
+            })
+        }
+        ExprKind::Binary { left, op, right } => {
+            // Preserve C short-circuit behavior for logical operators.
+            if matches!(op, BinaryOp::LogicalAnd) {
+                let lhs = evaluate_integer_constant_expr(cx, left)?;
+                if lhs == 0 {
+                    return Some(0);
+                }
+                let rhs = evaluate_integer_constant_expr(cx, right)?;
+                return Some(if rhs != 0 { 1 } else { 0 });
+            }
+            if matches!(op, BinaryOp::LogicalOr) {
+                let lhs = evaluate_integer_constant_expr(cx, left)?;
+                if lhs != 0 {
+                    return Some(1);
+                }
+                let rhs = evaluate_integer_constant_expr(cx, right)?;
+                return Some(if rhs != 0 { 1 } else { 0 });
+            }
+
+            let lhs = evaluate_integer_constant_expr(cx, left)?;
+            let rhs = evaluate_integer_constant_expr(cx, right)?;
+            Some(match op {
+                BinaryOp::Add => lhs.wrapping_add(rhs),
+                BinaryOp::Sub => lhs.wrapping_sub(rhs),
+                BinaryOp::Mul => lhs.wrapping_mul(rhs),
+                BinaryOp::Div => {
+                    if rhs == 0 {
+                        return None;
+                    }
+                    lhs.wrapping_div(rhs)
+                }
+                BinaryOp::Mod => {
+                    if rhs == 0 {
+                        return None;
+                    }
+                    lhs.wrapping_rem(rhs)
+                }
+                BinaryOp::Shl => lhs.wrapping_shl(rhs as u32),
+                BinaryOp::Shr => lhs.wrapping_shr(rhs as u32),
+                BinaryOp::BitAnd => lhs & rhs,
+                BinaryOp::BitOr => lhs | rhs,
+                BinaryOp::BitXor => lhs ^ rhs,
+                BinaryOp::Lt => {
+                    if lhs < rhs {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                BinaryOp::Le => {
+                    if lhs <= rhs {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                BinaryOp::Gt => {
+                    if lhs > rhs {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                BinaryOp::Ge => {
+                    if lhs >= rhs {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                BinaryOp::Eq => {
+                    if lhs == rhs {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                BinaryOp::Ne => {
+                    if lhs != rhs {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                BinaryOp::LogicalAnd | BinaryOp::LogicalOr => unreachable!(),
+            })
+        }
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            let c = evaluate_integer_constant_expr(cx, cond)?;
+            if c != 0 {
+                evaluate_integer_constant_expr(cx, then_expr)
+            } else {
+                evaluate_integer_constant_expr(cx, else_expr)
+            }
+        }
+        ExprKind::Cast { ty, expr: inner } => {
+            let value = evaluate_integer_constant_expr(cx, inner)?;
+            let cast_ty = build_type_from_type_name(cx, ty, expr.span);
+            if is_integer_ice_type(cx, cast_ty) {
+                Some(value)
+            } else {
+                None
+            }
+        }
+        ExprKind::SizeofType(ty_name) => {
+            let ty = build_type_from_type_name(cx, ty_name, expr.span);
+            type_size_of(cx, ty).map(|n| n as i64)
+        }
+        ExprKind::SizeofExpr(inner) => {
+            // sizeof on an expression: we'd need expression type inference.
+            // For now, try to evaluate if it's a simple sizeof(var) pattern.
+            let _ = inner;
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Resolve a typedef name into its target semantic type.
-///
-/// TODO: implement typedef lookup and diagnostics.
 fn resolve_typedef_name_type(
-    _cx: &mut SemaContext<'_>,
-    _name: &str,
-    _span: SourceSpan,
+    cx: &mut SemaContext<'_>,
+    name: &str,
+    span: SourceSpan,
 ) -> Result<TypeId, SemaDiagnostic> {
-    todo!("sema decl: resolve typedef name");
+    let Some(sym_id) = cx.lookup_ordinary(name) else {
+        return Err(SemaDiagnostic::new(
+            SemaDiagnosticCode::UndefinedSymbol,
+            format!("unknown type name '{name}'"),
+            span,
+        ));
+    };
+    let symbol = cx.symbol(sym_id);
+    if symbol.kind() != SymbolKind::Typedef {
+        return Err(SemaDiagnostic::new(
+            SemaDiagnosticCode::TypeMismatch,
+            format!("'{name}' is not a typedef name"),
+            span,
+        ));
+    }
+    Ok(symbol.ty())
 }
 
 /// Resolve a `struct`/`union` specifier into semantic record type.
 ///
-/// TODO: implement tag lookup/registration and record completion rules.
+/// Three cases:
+/// 1. Forward declaration: `struct S;` — create incomplete record, register tag.
+/// 2. Definition: `struct S { ... }` — create complete record with fields, register tag.
+/// 3. Reference: `struct S` (no body, tag already exists) — look up existing tag.
 fn resolve_record_specifier_type(
-    _cx: &mut SemaContext<'_>,
-    _record_spec: &RecordSpecifier,
-    _span: SourceSpan,
+    cx: &mut SemaContext<'_>,
+    record_spec: &RecordSpecifier,
+    span: SourceSpan,
+    allow_outer_tag_reference: bool,
 ) -> Result<TypeId, SemaDiagnostic> {
-    todo!("sema decl: resolve record specifier");
+    let has_body = record_spec.members.is_some();
+
+    // Check current scope first to handle shadowing correctly.
+    if let Some(tag_name) = &record_spec.tag {
+        if let Some(existing_tag) = cx.lookup_tag_in_current_scope(tag_name) {
+            // Found in current scope - try to merge or report conflict.
+            match existing_tag {
+                TagId::Record(record_id) => {
+                    let existing_rec = cx.records.get(record_id);
+                    // Check struct vs union consistency.
+                    if existing_rec.kind != record_spec.kind {
+                        return Err(SemaDiagnostic::new(
+                            SemaDiagnosticCode::RedeclarationConflict,
+                            format!(
+                                "'{tag_name}' defined as a {} but was previously declared as a {}",
+                                if record_spec.kind == RecordKind::Struct {
+                                    "struct"
+                                } else {
+                                    "union"
+                                },
+                                if existing_rec.kind == RecordKind::Struct {
+                                    "struct"
+                                } else {
+                                    "union"
+                                }
+                            ),
+                            span,
+                        ));
+                    }
+                    if has_body {
+                        // Complete the existing forward declaration.
+                        let fields =
+                            lower_record_fields(cx, record_spec.members.as_deref().unwrap());
+                        let rec = cx.records.get_mut(record_id);
+                        if rec.is_complete {
+                            return Err(SemaDiagnostic::new(
+                                SemaDiagnosticCode::RedeclarationConflict,
+                                format!(
+                                    "redefinition of '{} {tag_name}'",
+                                    if record_spec.kind == RecordKind::Struct {
+                                        "struct"
+                                    } else {
+                                        "union"
+                                    }
+                                ),
+                                span,
+                            ));
+                        }
+                        rec.fields = fields;
+                        rec.is_complete = true;
+                    }
+                    return Ok(cx.types.intern(Type {
+                        kind: TypeKind::Record(record_id),
+                        quals: Qualifiers::default(),
+                    }));
+                }
+                TagId::Enum(_) => {
+                    return Err(SemaDiagnostic::new(
+                        SemaDiagnosticCode::RedeclarationConflict,
+                        format!("'{tag_name}' previously declared as enum"),
+                        span,
+                    ));
+                }
+            }
+        } else if !has_body && allow_outer_tag_reference {
+            // No body (reference or forward declaration) — look up in outer scopes.
+            if let Some(existing_tag) = cx.lookup_tag(tag_name) {
+                match existing_tag {
+                    TagId::Record(record_id) => {
+                        return Ok(cx.types.intern(Type {
+                            kind: TypeKind::Record(record_id),
+                            quals: Qualifiers::default(),
+                        }));
+                    }
+                    TagId::Enum(_) => {
+                        return Err(SemaDiagnostic::new(
+                            SemaDiagnosticCode::RedeclarationConflict,
+                            format!("'{tag_name}' previously declared as enum"),
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Create new record (either definition or forward declaration in current scope).
+    let fields = if has_body {
+        lower_record_fields(cx, record_spec.members.as_deref().unwrap())
+    } else {
+        Vec::new()
+    };
+
+    let record_id = cx.records.insert(RecordDef {
+        tag: record_spec.tag.clone(),
+        kind: record_spec.kind,
+        fields,
+        is_complete: has_body,
+    });
+
+    if let Some(tag_name) = &record_spec.tag {
+        register_tag(cx, tag_name, TagId::Record(record_id), span)?;
+    }
+
+    Ok(cx.types.intern(Type {
+        kind: TypeKind::Record(record_id),
+        quals: Qualifiers::default(),
+    }))
 }
 
 /// Resolve an `enum` specifier into semantic enum type.
 ///
-/// TODO: implement tag lookup/registration and variant lowering.
+/// Two cases:
+/// 1. Definition: `enum E { A, B }` — create enum with constants, register tag.
+/// 2. Reference: `enum E` (no body, tag exists) — look up existing tag.
+/// Forward reference without body is an error (C99 forbids incomplete enum types).
 fn resolve_enum_specifier_type(
-    _cx: &mut SemaContext<'_>,
-    _enum_spec: &EnumSpecifier,
-    _span: SourceSpan,
+    cx: &mut SemaContext<'_>,
+    enum_spec: &EnumSpecifier,
+    span: SourceSpan,
 ) -> Result<TypeId, SemaDiagnostic> {
-    todo!("sema decl: resolve enum specifier");
+    let has_body = enum_spec.variants.is_some();
+
+    // Check current scope first to handle shadowing correctly.
+    if let Some(tag_name) = &enum_spec.tag {
+        if let Some(existing_tag) = cx.lookup_tag_in_current_scope(tag_name) {
+            // Found in current scope - try to merge or report conflict.
+            match existing_tag {
+                TagId::Enum(enum_id) => {
+                    if has_body {
+                        let existing = cx.enums.get(enum_id);
+                        if !existing.constants.is_empty() {
+                            return Err(SemaDiagnostic::new(
+                                SemaDiagnosticCode::RedeclarationConflict,
+                                format!("redefinition of 'enum {tag_name}'"),
+                                span,
+                            ));
+                        }
+                        let underlying_ty = int_type(cx);
+                        let constants = lower_enum_variants(
+                            cx,
+                            enum_spec.variants.as_deref().unwrap(),
+                            underlying_ty,
+                        );
+                        cx.enums.get_mut(enum_id).constants = constants;
+                    }
+                    return Ok(cx.types.intern(Type {
+                        kind: TypeKind::Enum(enum_id),
+                        quals: Qualifiers::default(),
+                    }));
+                }
+                TagId::Record(_) => {
+                    return Err(SemaDiagnostic::new(
+                        SemaDiagnosticCode::RedeclarationConflict,
+                        format!("'{tag_name}' previously declared as struct/union"),
+                        span,
+                    ));
+                }
+            }
+        } else if !has_body {
+            // No body (reference) - look up in outer scopes.
+            if let Some(existing_tag) = cx.lookup_tag(tag_name) {
+                match existing_tag {
+                    TagId::Enum(enum_id) => {
+                        return Ok(cx.types.intern(Type {
+                            kind: TypeKind::Enum(enum_id),
+                            quals: Qualifiers::default(),
+                        }));
+                    }
+                    TagId::Record(_) => {
+                        return Err(SemaDiagnostic::new(
+                            SemaDiagnosticCode::RedeclarationConflict,
+                            format!("'{tag_name}' previously declared as struct/union"),
+                            span,
+                        ));
+                    }
+                }
+            }
+            // Forward reference without definition is an error.
+            return Err(SemaDiagnostic::new(
+                SemaDiagnosticCode::IncompleteType,
+                format!("use of undefined enum '{tag_name}'"),
+                span,
+            ));
+        }
+    }
+
+    let underlying_ty = int_type(cx);
+    let constants = if has_body {
+        lower_enum_variants(cx, enum_spec.variants.as_deref().unwrap(), underlying_ty)
+    } else {
+        Vec::new()
+    };
+
+    let enum_id = cx.enums.insert(EnumDef {
+        tag: enum_spec.tag.clone(),
+        underlying_ty,
+        constants,
+    });
+
+    if let Some(tag_name) = &enum_spec.tag {
+        register_tag(cx, tag_name, TagId::Enum(enum_id), span)?;
+    }
+
+    Ok(cx.types.intern(Type {
+        kind: TypeKind::Enum(enum_id),
+        quals: Qualifiers::default(),
+    }))
 }
 
 /// Lower record member declarations into field definitions.
-///
-/// TODO: implement field type lowering and bit-field handling.
-fn lower_record_fields(_cx: &mut SemaContext<'_>, _members: &[RecordMemberDecl]) -> Vec<FieldDef> {
-    todo!("sema decl: lower record fields");
+fn lower_record_fields(cx: &mut SemaContext<'_>, members: &[RecordMemberDecl]) -> Vec<FieldDef> {
+    let mut fields = Vec::new();
+    for member in members {
+        let base_ty = resolve_base_type(cx, &member.specifiers, member.span, true);
+        if member.declarators.is_empty() {
+            // Anonymous member (e.g. unnamed struct/union).
+            fields.push(FieldDef {
+                name: None,
+                ty: base_ty,
+                bit_width: None,
+            });
+        } else {
+            for declarator in &member.declarators {
+                let name = declarator_ident(declarator).map(|s| s.to_string());
+                let ty = apply_declarator_with_base(cx, base_ty, declarator);
+                fields.push(FieldDef {
+                    name,
+                    ty,
+                    bit_width: None,
+                });
+            }
+        }
+    }
+    fields
 }
 
 /// Lower enum variants into semantic constants and symbol table entries.
 ///
-/// TODO: implement enumerator value assignment and duplicate checking.
+/// Each enumerator is registered as an `EnumConst` symbol in the ordinary namespace.
+/// Values are assigned sequentially (previous + 1) unless an explicit value is given.
 fn lower_enum_variants(
-    _cx: &mut SemaContext<'_>,
-    _variants: &[crate::frontend::parser::ast::EnumVariant],
-    _underlying_ty: TypeId,
+    cx: &mut SemaContext<'_>,
+    variants: &[crate::frontend::parser::ast::EnumVariant],
+    underlying_ty: TypeId,
 ) -> Vec<EnumConstant> {
-    todo!("sema decl: lower enum variants");
+    let mut constants = Vec::new();
+    let mut next_value: i64 = 0;
+
+    for variant in variants {
+        let value = if let Some(expr) = &variant.value {
+            match evaluate_integer_constant_expr(cx, expr) {
+                Some(v) => v,
+                None => {
+                    cx.emit(SemaDiagnostic::new(
+                        SemaDiagnosticCode::NonConstantInRequiredContext,
+                        "enumerator value is not an integer constant expression",
+                        expr.span,
+                    ));
+                    next_value
+                }
+            }
+        } else {
+            next_value
+        };
+
+        // Check for duplicate enumerator names.
+        if cx.lookup_ordinary(&variant.name).is_some() {
+            cx.emit(SemaDiagnostic::new(
+                SemaDiagnosticCode::RedeclarationConflict,
+                format!("redefinition of enumerator '{}'", variant.name),
+                variant.span,
+            ));
+            next_value = value + 1;
+            continue;
+        }
+
+        constants.push(EnumConstant {
+            name: variant.name.clone(),
+            value,
+        });
+
+        // Register as symbol in ordinary namespace.
+        let sym = Symbol::new(
+            variant.name.clone(),
+            SymbolKind::EnumConst,
+            underlying_ty,
+            Linkage::None,
+            DefinitionStatus::Defined,
+            variant.span,
+        );
+        let sym_id = cx.insert_symbol(sym);
+        cx.set_enum_const_value(sym_id, value);
+        let _ = cx.insert_ordinary(variant.name.clone(), sym_id);
+
+        next_value = value + 1;
+    }
+
+    constants
 }
 
 /// Register one tag (`struct`/`union`/`enum`) in current scope.
-///
-/// TODO: implement tag insertion conflict handling.
 fn register_tag(
-    _cx: &mut SemaContext<'_>,
-    _tag: &str,
-    _tag_id: TagId,
-    _span: SourceSpan,
+    cx: &mut SemaContext<'_>,
+    tag: &str,
+    tag_id: TagId,
+    span: SourceSpan,
 ) -> Result<(), SemaDiagnostic> {
-    todo!("sema decl: register tag");
+    if let Err((name, existing)) = cx.insert_tag(tag.to_string(), tag_id) {
+        // Same tag kind re-entering the same scope is allowed for forward decl + definition.
+        // Different tag kinds in the same scope conflict.
+        let conflicts = match (existing, tag_id) {
+            (TagId::Record(a), TagId::Record(b)) => a != b,
+            (TagId::Enum(a), TagId::Enum(b)) => a != b,
+            _ => true,
+        };
+        if conflicts {
+            return Err(SemaDiagnostic::new(
+                SemaDiagnosticCode::RedeclarationConflict,
+                format!("tag '{name}' conflicts with a previous declaration"),
+                span,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Return canonical semantic `int` type.
-///
-/// TODO: route through central builtin type cache when available.
-fn int_type(_cx: &mut SemaContext<'_>) -> TypeId {
-    todo!("sema decl: int type helper");
+fn int_type(cx: &mut SemaContext<'_>) -> TypeId {
+    cx.types.intern(Type {
+        kind: TypeKind::Int { signed: true },
+        quals: Qualifiers::default(),
+    })
 }
 
 /// Build semantic type from parser `TypeName` node.
-///
-/// TODO: implement typenames with abstract declarator support.
 fn build_type_from_type_name(
-    _cx: &mut SemaContext<'_>,
-    _ty_name: &TypeName,
-    _span: SourceSpan,
+    cx: &mut SemaContext<'_>,
+    ty_name: &TypeName,
+    span: SourceSpan,
 ) -> TypeId {
-    todo!("sema decl: build type from type-name");
-}
-
-/// Infer expression type for `sizeof(expr)` in constant-eval contexts.
-///
-/// TODO: implement expression type inference subset for `sizeof`.
-fn infer_sizeof_expr_type(
-    _cx: &mut SemaContext<'_>,
-    _expr: &crate::frontend::parser::ast::Expr,
-) -> Option<TypeId> {
-    todo!("sema decl: infer sizeof expression type");
+    let base_ty = resolve_base_type(cx, &ty_name.specifiers, span, true);
+    if let Some(declarator) = &ty_name.declarator {
+        apply_declarator_with_base(cx, base_ty, declarator)
+    } else {
+        base_ty
+    }
 }
 
 /// Compute static type size in bytes for semantic type nodes.
 ///
-/// TODO: implement ABI-aware layout and object-size rules.
-fn type_size_of(_cx: &SemaContext<'_>, _ty: TypeId) -> Option<u64> {
-    todo!("sema decl: type size evaluation");
+/// Simplified ABI: uses common LP64/ILP32-compatible sizes.
+fn type_size_of(cx: &SemaContext<'_>, ty: TypeId) -> Option<u64> {
+    let t = cx.types.get(ty);
+    match &t.kind {
+        TypeKind::Bool | TypeKind::Char | TypeKind::SignedChar | TypeKind::UnsignedChar => Some(1),
+        TypeKind::Short { .. } => Some(2),
+        TypeKind::Int { .. } | TypeKind::Enum(_) | TypeKind::Float => Some(4),
+        TypeKind::Long { .. } | TypeKind::Pointer { .. } => Some(8),
+        TypeKind::LongLong { .. } | TypeKind::Double => Some(8),
+        TypeKind::Array { elem, len } => match len {
+            ArrayLen::Known(n) => type_size_of(cx, *elem).map(|sz| sz * n),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Returns whether a type is valid as the result type of an integer constant expression.
+fn is_integer_ice_type(cx: &SemaContext<'_>, ty: TypeId) -> bool {
+    matches!(
+        cx.types.get(ty).kind,
+        TypeKind::Bool
+            | TypeKind::Char
+            | TypeKind::SignedChar
+            | TypeKind::UnsignedChar
+            | TypeKind::Short { .. }
+            | TypeKind::Int { .. }
+            | TypeKind::Long { .. }
+            | TypeKind::LongLong { .. }
+            | TypeKind::Enum(_)
+    )
 }
 
 /// Apply top-level qualifiers to an existing semantic type.
@@ -396,10 +1298,19 @@ fn merge_qualifiers(lhs: Qualifiers, rhs: Qualifiers) -> Qualifiers {
 }
 
 /// Check if a type is complete under current semantic context.
-///
-/// TODO: implement full completeness rules for arrays/records/function types.
-fn is_complete_type(_ty: TypeId, _cx: &SemaContext<'_>) -> bool {
-    todo!("sema decl: complete-type check");
+fn is_complete_type(ty: TypeId, cx: &SemaContext<'_>) -> bool {
+    let t = cx.types.get(ty);
+    match &t.kind {
+        TypeKind::Void => false,
+        TypeKind::Array { elem, len } => {
+            !matches!(len, ArrayLen::Incomplete | ArrayLen::FlexibleMember)
+                && is_complete_type(*elem, cx)
+        }
+        TypeKind::Record(record_id) => cx.records.get(*record_id).is_complete,
+        TypeKind::Function(_) => false,
+        TypeKind::Error => true, // Error type is considered complete for recovery.
+        _ => true,
+    }
 }
 
 /// Convert AST qualifiers into semantic qualifier flags.

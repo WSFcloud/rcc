@@ -357,16 +357,24 @@ pub fn types_compatible(a: TypeId, b: TypeId, arena: &TypeArena) -> bool {
         }
         (TypeKind::Function(a), TypeKind::Function(b)) => {
             // Function qualifiers are ignored during type compatibility.
-            if a.style != b.style || a.variadic != b.variadic || a.params.len() != b.params.len() {
-                return false;
-            }
+            // For declaration merging, prototype and non-prototype are compatible.
             if !types_compatible(a.ret, b.ret, arena) {
                 return false;
             }
-            a.params
-                .iter()
-                .zip(&b.params)
-                .all(|(lhs, rhs)| types_compatible(*lhs, *rhs, arena))
+            match (&a.style, &b.style) {
+                (FunctionStyle::Prototype, FunctionStyle::Prototype) => {
+                    a.variadic == b.variadic
+                        && a.params.len() == b.params.len()
+                        && a.params
+                            .iter()
+                            .zip(&b.params)
+                            .all(|(lhs, rhs)| types_compatible(*lhs, *rhs, arena))
+                }
+                (FunctionStyle::NonPrototype, FunctionStyle::NonPrototype) => true,
+                // Prototype and non-prototype are compatible for declaration merging.
+                (FunctionStyle::Prototype, FunctionStyle::NonPrototype)
+                | (FunctionStyle::NonPrototype, FunctionStyle::Prototype) => true,
+            }
         }
         (TypeKind::Record(a), TypeKind::Record(b)) => a == b && lhs.quals == rhs.quals,
         (TypeKind::Enum(a), TypeKind::Enum(b)) => a == b && lhs.quals == rhs.quals,
