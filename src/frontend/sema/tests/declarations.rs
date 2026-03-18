@@ -86,6 +86,17 @@ fn supports_enum_constants_and_sizeof_in_array_length() {
 }
 
 #[test]
+fn supports_sizeof_complete_struct_in_array_length() {
+    let src = r#"
+        struct S { int a; char b; };
+        int arr[sizeof(struct S)];
+    "#;
+
+    let result = analyze_source(src);
+    assert!(result.is_ok(), "unexpected diagnostics: {result:?}");
+}
+
+#[test]
 fn supports_short_circuit_integer_constant_expressions() {
     let src = r#"
         enum { A = 0 && (1 / 0), B = 1 || (1 / 0) };
@@ -94,6 +105,20 @@ fn supports_short_circuit_integer_constant_expressions() {
 
     let result = analyze_source(src);
     assert!(result.is_ok(), "unexpected diagnostics: {result:?}");
+}
+
+#[test]
+fn reports_division_by_zero_in_constant_expression() {
+    let src = "enum { A = 1 / 0 };";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::ConstantDivisionByZero);
+}
+
+#[test]
+fn reports_signed_overflow_in_constant_expression() {
+    let src = "enum { A = 1 << 63 };";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::ConstantSignedOverflow);
 }
 
 #[test]

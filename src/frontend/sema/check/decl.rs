@@ -8,7 +8,7 @@ use crate::frontend::parser::ast::{
 use crate::frontend::sema::context::SemaContext;
 use crate::frontend::sema::diagnostic::{SemaDiagnostic, SemaDiagnosticCode};
 use crate::frontend::sema::symbols::{
-    infer_linkage, DefinitionStatus, Linkage, LinkageError, Symbol, SymbolId, SymbolKind,
+    DefinitionStatus, Linkage, LinkageError, Symbol, SymbolId, SymbolKind, infer_linkage,
 };
 use crate::frontend::sema::typed_ast::TypedDeclaration;
 use crate::frontend::sema::types::{
@@ -523,8 +523,8 @@ fn array_len_from_size_expr(
             ArrayLen::Incomplete
         }
         ArraySize::Expr(expr) => match evaluate_integer_constant_expr(cx, expr) {
-            Some(n) if n > 0 => ArrayLen::Known(n as u64),
-            Some(_) => {
+            Ok(n) if n > 0 => ArrayLen::Known(n as u64),
+            Ok(_) => {
                 cx.emit(SemaDiagnostic::new(
                     SemaDiagnosticCode::NonConstantInRequiredContext,
                     "array size must be a positive integer",
@@ -532,12 +532,8 @@ fn array_len_from_size_expr(
                 ));
                 ArrayLen::Incomplete
             }
-            None => {
-                cx.emit(SemaDiagnostic::new(
-                    SemaDiagnosticCode::NonConstantInRequiredContext,
-                    "array size is not a constant expression",
-                    span,
-                ));
+            Err(err) => {
+                emit_ice_eval_error(cx, err, "array size is not a constant expression");
                 ArrayLen::Incomplete
             }
         },
@@ -740,38 +736,106 @@ fn try_build_base_type(
 ///
 /// Supports: integer literals, enum constant references, unary +/-/~/!,
 /// and binary arithmetic/bitwise/relational/logical operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IceEvalErrorKind {
+    NonConstant,
+    DivisionByZero,
+    SignedOverflow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IceEvalError {
+    kind: IceEvalErrorKind,
+    span: SourceSpan,
+}
+
+impl IceEvalError {
+    fn non_constant(span: SourceSpan) -> Self {
+        Self {
+            kind: IceEvalErrorKind::NonConstant,
+            span,
+        }
+    }
+
+    fn division_by_zero(span: SourceSpan) -> Self {
+        Self {
+            kind: IceEvalErrorKind::DivisionByZero,
+            span,
+        }
+    }
+
+    fn signed_overflow(span: SourceSpan) -> Self {
+        Self {
+            kind: IceEvalErrorKind::SignedOverflow,
+            span,
+        }
+    }
+}
+
+fn emit_ice_eval_error(cx: &mut SemaContext<'_>, err: IceEvalError, non_constant_message: &str) {
+    match err.kind {
+        IceEvalErrorKind::NonConstant => {
+            cx.emit(SemaDiagnostic::new(
+                SemaDiagnosticCode::NonConstantInRequiredContext,
+                non_constant_message,
+                err.span,
+            ));
+        }
+        IceEvalErrorKind::DivisionByZero => {
+            cx.emit(SemaDiagnostic::new(
+                SemaDiagnosticCode::ConstantDivisionByZero,
+                "division by zero in constant expression",
+                err.span,
+            ));
+        }
+        IceEvalErrorKind::SignedOverflow => {
+            cx.emit(SemaDiagnostic::new(
+                SemaDiagnosticCode::ConstantSignedOverflow,
+                "signed integer overflow in constant expression",
+                err.span,
+            ));
+        }
+    }
+}
+
 fn evaluate_integer_constant_expr(
     cx: &mut SemaContext<'_>,
     expr: &crate::frontend::parser::ast::Expr,
-) -> Option<i64> {
-    use crate::frontend::parser::ast::{BinaryOp, ExprKind, Literal, UnaryOp};
+) -> Result<i64, IceEvalError> {
+    use crate::frontend::parser::ast::{BinaryOp, ExprKind, IntLiteralSuffix, Literal, UnaryOp};
 
     match &expr.kind {
-        ExprKind::Literal(Literal::Int { value, .. }) => Some(*value as i64),
-        ExprKind::Literal(Literal::Char(c)) => Some(*c as i64),
+        ExprKind::Literal(Literal::Int { value, base }) => match base {
+            IntLiteralSuffix::Int | IntLiteralSuffix::Long | IntLiteralSuffix::LongLong => {
+                i64::try_from(*value).map_err(|_| IceEvalError::signed_overflow(expr.span))
+            }
+            IntLiteralSuffix::UInt | IntLiteralSuffix::ULong | IntLiteralSuffix::ULongLong => {
+                Ok(*value as i64)
+            }
+        },
+        ExprKind::Literal(Literal::Char(c)) => Ok(*c as i64),
         ExprKind::Var(name) => {
             // Look up enum constants by name.
-            let sym_id = cx.resolve_ordinary(name, expr.span)?;
+            let sym_id = cx
+                .resolve_ordinary(name, expr.span)
+                .ok_or_else(|| IceEvalError::non_constant(expr.span))?;
             let sym = cx.symbol(sym_id);
             if sym.kind() != SymbolKind::EnumConst {
-                return None;
+                return Err(IceEvalError::non_constant(expr.span));
             }
             cx.lookup_enum_const_value(sym_id)
+                .ok_or_else(|| IceEvalError::non_constant(expr.span))
         }
         ExprKind::Unary { op, expr: inner } => {
             let val = evaluate_integer_constant_expr(cx, inner)?;
-            Some(match op {
+            Ok(match op {
                 UnaryOp::Plus => val,
-                UnaryOp::Minus => val.wrapping_neg(),
+                UnaryOp::Minus => val
+                    .checked_neg()
+                    .ok_or_else(|| IceEvalError::signed_overflow(expr.span))?,
                 UnaryOp::BitNot => !val,
-                UnaryOp::LogicalNot => {
-                    if val == 0 {
-                        1
-                    } else {
-                        0
-                    }
-                }
-                _ => return None,
+                UnaryOp::LogicalNot => i64::from(val == 0),
+                _ => return Err(IceEvalError::non_constant(expr.span)),
             })
         }
         ExprKind::Binary { left, op, right } => {
@@ -779,85 +843,71 @@ fn evaluate_integer_constant_expr(
             if matches!(op, BinaryOp::LogicalAnd) {
                 let lhs = evaluate_integer_constant_expr(cx, left)?;
                 if lhs == 0 {
-                    return Some(0);
+                    return Ok(0);
                 }
                 let rhs = evaluate_integer_constant_expr(cx, right)?;
-                return Some(if rhs != 0 { 1 } else { 0 });
+                return Ok(i64::from(rhs != 0));
             }
             if matches!(op, BinaryOp::LogicalOr) {
                 let lhs = evaluate_integer_constant_expr(cx, left)?;
                 if lhs != 0 {
-                    return Some(1);
+                    return Ok(1);
                 }
                 let rhs = evaluate_integer_constant_expr(cx, right)?;
-                return Some(if rhs != 0 { 1 } else { 0 });
+                return Ok(i64::from(rhs != 0));
             }
 
             let lhs = evaluate_integer_constant_expr(cx, left)?;
             let rhs = evaluate_integer_constant_expr(cx, right)?;
-            Some(match op {
-                BinaryOp::Add => lhs.wrapping_add(rhs),
-                BinaryOp::Sub => lhs.wrapping_sub(rhs),
-                BinaryOp::Mul => lhs.wrapping_mul(rhs),
+            Ok(match op {
+                BinaryOp::Add => lhs
+                    .checked_add(rhs)
+                    .ok_or_else(|| IceEvalError::signed_overflow(expr.span))?,
+                BinaryOp::Sub => lhs
+                    .checked_sub(rhs)
+                    .ok_or_else(|| IceEvalError::signed_overflow(expr.span))?,
+                BinaryOp::Mul => lhs
+                    .checked_mul(rhs)
+                    .ok_or_else(|| IceEvalError::signed_overflow(expr.span))?,
                 BinaryOp::Div => {
                     if rhs == 0 {
-                        return None;
+                        return Err(IceEvalError::division_by_zero(right.span));
                     }
-                    lhs.wrapping_div(rhs)
+                    lhs.checked_div(rhs)
+                        .ok_or_else(|| IceEvalError::signed_overflow(expr.span))?
                 }
                 BinaryOp::Mod => {
                     if rhs == 0 {
-                        return None;
+                        return Err(IceEvalError::division_by_zero(right.span));
                     }
-                    lhs.wrapping_rem(rhs)
+                    lhs.checked_rem(rhs)
+                        .ok_or_else(|| IceEvalError::signed_overflow(expr.span))?
                 }
-                BinaryOp::Shl => lhs.wrapping_shl(rhs as u32),
-                BinaryOp::Shr => lhs.wrapping_shr(rhs as u32),
+                BinaryOp::Shl => {
+                    if !(0..64).contains(&rhs) {
+                        return Err(IceEvalError::signed_overflow(expr.span));
+                    }
+                    let shifted = (lhs as i128) << (rhs as u32);
+                    if shifted < i64::MIN as i128 || shifted > i64::MAX as i128 {
+                        return Err(IceEvalError::signed_overflow(expr.span));
+                    }
+                    shifted as i64
+                }
+                BinaryOp::Shr => {
+                    if !(0..64).contains(&rhs) {
+                        return Err(IceEvalError::signed_overflow(expr.span));
+                    }
+                    lhs >> (rhs as u32)
+                }
                 BinaryOp::BitAnd => lhs & rhs,
                 BinaryOp::BitOr => lhs | rhs,
                 BinaryOp::BitXor => lhs ^ rhs,
-                BinaryOp::Lt => {
-                    if lhs < rhs {
-                        1
-                    } else {
-                        0
-                    }
-                }
-                BinaryOp::Le => {
-                    if lhs <= rhs {
-                        1
-                    } else {
-                        0
-                    }
-                }
-                BinaryOp::Gt => {
-                    if lhs > rhs {
-                        1
-                    } else {
-                        0
-                    }
-                }
-                BinaryOp::Ge => {
-                    if lhs >= rhs {
-                        1
-                    } else {
-                        0
-                    }
-                }
-                BinaryOp::Eq => {
-                    if lhs == rhs {
-                        1
-                    } else {
-                        0
-                    }
-                }
-                BinaryOp::Ne => {
-                    if lhs != rhs {
-                        1
-                    } else {
-                        0
-                    }
-                }
+                BinaryOp::Lt => i64::from(lhs < rhs),
+                BinaryOp::Le => i64::from(lhs <= rhs),
+                BinaryOp::Gt => i64::from(lhs > rhs),
+                BinaryOp::Ge => i64::from(lhs >= rhs),
+                BinaryOp::Eq => i64::from(lhs == rhs),
+                BinaryOp::Ne => i64::from(lhs != rhs),
                 BinaryOp::LogicalAnd | BinaryOp::LogicalOr => unreachable!(),
             })
         }
@@ -877,22 +927,39 @@ fn evaluate_integer_constant_expr(
             let value = evaluate_integer_constant_expr(cx, inner)?;
             let cast_ty = build_type_from_type_name(cx, ty, expr.span);
             if is_integer_ice_type(cx, cast_ty) {
-                Some(value)
+                Ok(cast_ice_integer_value(cx, value, cast_ty))
             } else {
-                None
+                Err(IceEvalError::non_constant(expr.span))
             }
         }
         ExprKind::SizeofType(ty_name) => {
             let ty = build_type_from_type_name(cx, ty_name, expr.span);
-            type_size_of(cx, ty).map(|n| n as i64)
+            let size = type_size_of(cx, ty).ok_or_else(|| IceEvalError::non_constant(expr.span))?;
+            i64::try_from(size).map_err(|_| IceEvalError::signed_overflow(expr.span))
         }
         ExprKind::SizeofExpr(inner) => {
-            // sizeof on an expression: we'd need expression type inference.
-            // For now, try to evaluate if it's a simple sizeof(var) pattern.
+            // sizeof(expr) requires expression type inference.
             let _ = inner;
-            None
+            Err(IceEvalError::non_constant(expr.span))
         }
-        _ => None,
+        _ => Err(IceEvalError::non_constant(expr.span)),
+    }
+}
+
+fn cast_ice_integer_value(cx: &SemaContext<'_>, value: i64, ty: TypeId) -> i64 {
+    match &cx.types.get(ty).kind {
+        TypeKind::Bool => i64::from(value != 0),
+        TypeKind::Char | TypeKind::SignedChar => (value as i8) as i64,
+        TypeKind::UnsignedChar => (value as u8) as i64,
+        TypeKind::Short { signed: true } => (value as i16) as i64,
+        TypeKind::Short { signed: false } => (value as u16) as i64,
+        TypeKind::Int { signed: true } | TypeKind::Enum(_) => (value as i32) as i64,
+        TypeKind::Int { signed: false } => (value as u32) as i64,
+        TypeKind::Long { signed: true } | TypeKind::LongLong { signed: true } => value,
+        TypeKind::Long { signed: false } | TypeKind::LongLong { signed: false } => {
+            (value as u64) as i64
+        }
+        _ => value,
     }
 }
 
@@ -1180,13 +1247,13 @@ fn lower_enum_variants(
     for variant in variants {
         let value = if let Some(expr) = &variant.value {
             match evaluate_integer_constant_expr(cx, expr) {
-                Some(v) => v,
-                None => {
-                    cx.emit(SemaDiagnostic::new(
-                        SemaDiagnosticCode::NonConstantInRequiredContext,
+                Ok(v) => v,
+                Err(err) => {
+                    emit_ice_eval_error(
+                        cx,
+                        err,
                         "enumerator value is not an integer constant expression",
-                        expr.span,
-                    ));
+                    );
                     next_value
                 }
             }
@@ -1201,7 +1268,7 @@ fn lower_enum_variants(
                 format!("redefinition of enumerator '{}'", variant.name),
                 variant.span,
             ));
-            next_value = value + 1;
+            next_value = advance_enum_value(cx, value, variant.span);
             continue;
         }
 
@@ -1223,10 +1290,21 @@ fn lower_enum_variants(
         cx.set_enum_const_value(sym_id, value);
         let _ = cx.insert_ordinary(variant.name.clone(), sym_id);
 
-        next_value = value + 1;
+        next_value = advance_enum_value(cx, value, variant.span);
     }
 
     constants
+}
+
+fn advance_enum_value(cx: &mut SemaContext<'_>, current: i64, span: SourceSpan) -> i64 {
+    current.checked_add(1).unwrap_or_else(|| {
+        cx.emit(SemaDiagnostic::new(
+            SemaDiagnosticCode::ConstantSignedOverflow,
+            "signed integer overflow in enum value computation",
+            span,
+        ));
+        current
+    })
 }
 
 /// Register one tag (`struct`/`union`/`enum`) in current scope.
@@ -1289,9 +1367,31 @@ fn type_size_of(cx: &SemaContext<'_>, ty: TypeId) -> Option<u64> {
         TypeKind::Long { .. } | TypeKind::Pointer { .. } => Some(8),
         TypeKind::LongLong { .. } | TypeKind::Double => Some(8),
         TypeKind::Array { elem, len } => match len {
-            ArrayLen::Known(n) => type_size_of(cx, *elem).map(|sz| sz * n),
+            ArrayLen::Known(n) => type_size_of(cx, *elem)?.checked_mul(*n),
             _ => None,
         },
+        TypeKind::Record(record_id) => {
+            let record = cx.records.get(*record_id);
+            if !record.is_complete {
+                return None;
+            }
+            match record.kind {
+                RecordKind::Struct => {
+                    let mut total = 0u64;
+                    for field in &record.fields {
+                        total = total.checked_add(type_size_of(cx, field.ty)?)?;
+                    }
+                    Some(total)
+                }
+                RecordKind::Union => {
+                    let mut max_size = 0u64;
+                    for field in &record.fields {
+                        max_size = max_size.max(type_size_of(cx, field.ty)?);
+                    }
+                    Some(max_size)
+                }
+            }
+        }
         _ => None,
     }
 }

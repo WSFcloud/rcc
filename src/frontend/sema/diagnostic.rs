@@ -38,6 +38,10 @@ pub enum SemaDiagnosticCode {
     UnsupportedKnrDefinition,
     /// Non-constant expression in a context requiring a constant.
     NonConstantInRequiredContext,
+    /// Division or modulo by zero in a constant expression.
+    ConstantDivisionByZero,
+    /// Signed integer overflow while evaluating a constant expression.
+    ConstantSignedOverflow,
 }
 
 /// One semantic diagnostic with optional secondary labels and notes.
