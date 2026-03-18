@@ -129,6 +129,36 @@ fn parses_function_pointer_parameter() {
 }
 
 #[test]
+fn parses_pointer_to_array_parameter() {
+    let unit = parse_source("int f(int (*)(), double (*)[3]);");
+    let ExternalDecl::Declaration(decl) = &unit.items[0] else {
+        panic!("expected declaration");
+    };
+    let DirectDeclaratorKind::Function { params, .. } = &decl.declarators[0].declarator.direct.kind
+    else {
+        panic!("expected function");
+    };
+    let FunctionParams::Prototype { params, .. } = params else {
+        panic!("expected prototype");
+    };
+    assert_eq!(params.len(), 2);
+
+    let second = params[1]
+        .declarator
+        .as_ref()
+        .expect("second parameter declarator expected");
+    let DirectDeclaratorKind::Array { inner, size, .. } = &second.direct.kind else {
+        panic!("expected pointer-to-array parameter");
+    };
+    let DirectDeclaratorKind::Grouped(grouped) = &inner.kind else {
+        panic!("expected grouped declarator");
+    };
+    assert_eq!(grouped.pointers.len(), 1);
+    assert_eq!(grouped.direct.as_ref(), &DirectDeclarator::Abstract);
+    assert_eq!(size.as_ref(), &ArraySize::Expr(Expr::int(3)));
+}
+
+#[test]
 fn preserves_unnamed_pointer_parameter() {
     let unit = parse_source("int sum(int, char *);");
     let ExternalDecl::Declaration(decl) = &unit.items[0] else {

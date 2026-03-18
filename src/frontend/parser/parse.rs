@@ -1519,11 +1519,15 @@ where
 {
     let basic_declarator = basic_parameter_declarator_parser();
 
-    let grouped_function_pointer = basic_declarator
+    let grouped_with_suffix = basic_declarator
         .clone()
         .delimited_by(just(TokenKind::LParen), just(TokenKind::RParen))
-        .then(simple_function_params_parser())
-        .map_with(|(inner_declarator, params), extra| {
+        .then(
+            direct_declarator_suffix_with_function_params_parser(simple_function_params_parser())
+                .repeated()
+                .collect::<Vec<_>>(),
+        )
+        .map_with(|(inner_declarator, suffixes), extra| {
             let inner_declarator = inner_declarator.unwrap_or(Declarator {
                 pointers: Vec::new(),
                 direct: Box::new(direct_decl(DirectDeclaratorKind::Abstract, extra.span())),
@@ -1531,20 +1535,17 @@ where
 
             Some(Declarator {
                 pointers: Vec::new(),
-                direct: Box::new(direct_decl(
-                    DirectDeclaratorKind::Function {
-                        inner: Box::new(direct_decl(
-                            DirectDeclaratorKind::Grouped(Box::new(inner_declarator)),
-                            extra.span(),
-                        )),
-                        params,
-                    },
-                    extra.span(),
+                direct: Box::new(fold_direct_declarator_suffixes(
+                    direct_decl(
+                        DirectDeclaratorKind::Grouped(Box::new(inner_declarator)),
+                        extra.span(),
+                    ),
+                    suffixes,
                 )),
             })
         });
 
-    choice((grouped_function_pointer, basic_declarator)).boxed()
+    choice((grouped_with_suffix, basic_declarator)).boxed()
 }
 
 /// Parse function parameter list forms:
