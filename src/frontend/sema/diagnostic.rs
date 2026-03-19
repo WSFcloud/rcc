@@ -1,4 +1,6 @@
 use crate::common::span::SourceSpan;
+use ariadne::{Color, Config, IndexType, Label, Report, ReportKind, sources};
+use std::ops::Range;
 
 /// Stable semantic diagnostic codes.
 ///
@@ -93,4 +95,45 @@ impl SemaDiagnostic {
         self.notes.push(note.into());
         self
     }
+}
+
+/// Render semantic diagnostics via ariadne with a consistent report style.
+pub fn emit_sema_diagnostics(
+    filename: &str,
+    source: &str,
+    diagnostics: &[SemaDiagnostic],
+) -> std::io::Result<()> {
+    let file_id = filename.to_string();
+    let src = source.to_string();
+
+    for diagnostic in diagnostics {
+        let primary_range: Range<usize> = diagnostic.primary.into();
+        let mut report = Report::build(ReportKind::Error, (file_id.clone(), primary_range.clone()))
+            .with_config(Config::new().with_index_type(IndexType::Byte))
+            .with_message(format!("[{:?}] {}", diagnostic.code, diagnostic.message))
+            .with_label(
+                Label::new((file_id.clone(), primary_range))
+                    .with_message(diagnostic.message.clone())
+                    .with_color(Color::Red),
+            );
+
+        for (span, message) in &diagnostic.secondary {
+            let range: Range<usize> = (*span).into();
+            report = report.with_label(
+                Label::new((file_id.clone(), range))
+                    .with_message(message.clone())
+                    .with_color(Color::Yellow),
+            );
+        }
+
+        for note in &diagnostic.notes {
+            report = report.with_note(note.clone());
+        }
+
+        report
+            .finish()
+            .print(sources([(file_id.clone(), src.clone())]))?;
+    }
+
+    Ok(())
 }

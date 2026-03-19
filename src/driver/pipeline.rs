@@ -4,7 +4,7 @@ use crate::frontend::lexer::lexer_from_source;
 use crate::frontend::parser::diagnostic::emit_parse_diagnostics;
 use crate::frontend::parser::parse;
 use crate::frontend::sema;
-use crate::frontend::sema::diagnostic::SemaDiagnostic;
+use crate::frontend::sema::diagnostic::emit_sema_diagnostics;
 use chumsky::input::{Input, Stream};
 use std::error::Error;
 use std::fmt;
@@ -72,7 +72,7 @@ pub fn run(config: CompilerConfig) -> Result<(), PipelineError> {
     let sema_result = match sema::analyze(filename, &source, &ast) {
         Ok(result) => result,
         Err(diagnostics) => {
-            emit_sema_diagnostics(filename, &source, &diagnostics);
+            emit_sema_diagnostics(filename, &source, &diagnostics)?;
             return Err(PipelineError::SemaDiagnostic(format!(
                 "failed semantic analysis for '{}'",
                 input_path.display()
@@ -82,40 +82,4 @@ pub fn run(config: CompilerConfig) -> Result<(), PipelineError> {
     println!("Typed AST: {:#?}", sema_result.typed_tu);
 
     Ok(())
-}
-
-fn emit_sema_diagnostics(filename: &str, source: &str, diagnostics: &[SemaDiagnostic]) {
-    for diag in diagnostics {
-        eprintln!(
-            "{filename}:{}..{}: error[{:#?}]: {}",
-            diag.primary.start, diag.primary.end, diag.code, diag.message
-        );
-        if let Some(snippet) = diagnostic_snippet(source, diag.primary.start, diag.primary.end) {
-            eprintln!("  primary: {snippet}");
-        }
-        for (span, message) in &diag.secondary {
-            eprintln!("  secondary {}..{}: {}", span.start, span.end, message);
-            if let Some(snippet) = diagnostic_snippet(source, span.start, span.end) {
-                eprintln!("    {snippet}");
-            }
-        }
-        for note in &diag.notes {
-            eprintln!("  note: {note}");
-        }
-    }
-}
-
-fn diagnostic_snippet(source: &str, start: usize, end: usize) -> Option<String> {
-    let raw = source.get(start..end)?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let one_line = trimmed.replace('\n', "\\n");
-    const MAX_LEN: usize = 120;
-    if one_line.chars().count() <= MAX_LEN {
-        Some(one_line)
-    } else {
-        Some(format!("{}...", one_line.chars().take(MAX_LEN).collect::<String>()))
-    }
 }
