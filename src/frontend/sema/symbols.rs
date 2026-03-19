@@ -260,6 +260,13 @@ pub fn infer_linkage(
                 SymbolKind::Typedef | SymbolKind::EnumConst => Ok(Linkage::None),
             },
             Some(StorageClass::Extern) => Ok(existing.map_or(Linkage::External, Symbol::linkage)),
+            Some(StorageClass::Static) => match kind {
+                // Block-scope `static` objects have static storage duration but no linkage.
+                SymbolKind::Object => Ok(Linkage::None),
+                SymbolKind::Function | SymbolKind::Typedef | SymbolKind::EnumConst => {
+                    Err(LinkageError::InvalidStorageClass(StorageClass::Static))
+                }
+            },
             Some(other) => Err(LinkageError::InvalidStorageClass(other)),
         },
     }

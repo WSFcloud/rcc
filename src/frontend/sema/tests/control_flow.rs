@@ -46,14 +46,28 @@ fn reports_jump_over_initializer() {
 fn reports_break_outside_loop_or_switch() {
     let src = "int main(void) { break; }";
     let diagnostics = analyze_source(src).expect_err("sema should fail");
-    assert_has_code(&diagnostics, SemaDiagnosticCode::TypeMismatch);
+    assert_has_code(&diagnostics, SemaDiagnosticCode::InvalidControlFlow);
 }
 
 #[test]
 fn reports_continue_outside_loop() {
     let src = "int main(void) { continue; }";
     let diagnostics = analyze_source(src).expect_err("sema should fail");
-    assert_has_code(&diagnostics, SemaDiagnosticCode::TypeMismatch);
+    assert_has_code(&diagnostics, SemaDiagnosticCode::InvalidControlFlow);
+}
+
+#[test]
+fn reports_case_outside_switch() {
+    let src = "int main(void) { case 1: return 0; }";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::InvalidControlFlow);
+}
+
+#[test]
+fn reports_default_outside_switch() {
+    let src = "int main(void) { default: return 0; }";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::InvalidControlFlow);
 }
 
 #[test]

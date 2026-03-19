@@ -83,10 +83,6 @@ fn eval_const_expr_inner(
             })?;
             Ok(ConstValue::UInt(size))
         }
-        TypedExprKind::Comma { left, right } => {
-            let _ = eval_const_expr_inner(left, env)?;
-            eval_const_expr_inner(right, env)
-        }
         _ => Err(non_constant_diag(
             expr.span,
             "expression is not a constant expression",

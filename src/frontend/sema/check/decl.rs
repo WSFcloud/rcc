@@ -11,11 +11,10 @@ use crate::frontend::sema::init;
 use crate::frontend::sema::symbols::{
     DefinitionStatus, Linkage, LinkageError, Symbol, SymbolId, SymbolKind, infer_linkage,
 };
-use crate::frontend::sema::typed_ast::ConstValue;
-use crate::frontend::sema::typed_ast::TypedDeclaration;
+use crate::frontend::sema::typed_ast::{TypedDeclInit, TypedDeclaration};
 use crate::frontend::sema::types::{
     ArrayLen, EnumConstant, EnumDef, FieldDef, Qualifiers, RecordDef, TagId, Type, TypeId,
-    TypeKind, assignment_compatible_with_const, type_size_of,
+    TypeKind, type_size_of,
 };
 
 /// Pass 1 entry for declaration processing at translation-unit scope.
@@ -45,6 +44,7 @@ pub fn lower_external_declaration(
     decl: &Declaration,
 ) -> TypedDeclaration {
     let mut symbols = Vec::new();
+    let mut initializers = Vec::new();
 
     for init_decl in &decl.declarators {
         let Some(name) = declarator_ident(&init_decl.declarator) else {
@@ -52,11 +52,24 @@ pub fn lower_external_declaration(
         };
         if let Some(symbol_id) = cx.lookup_ordinary(name) {
             symbols.push(symbol_id);
+            if let Some(init_ast) = &init_decl.init {
+                let decl_span = init_decl.declarator.direct.span.join(init_ast.span);
+                if has_prior_initializer_diagnostic(cx, decl_span) {
+                    continue;
+                }
+                let target_ty = cx.symbol(symbol_id).ty();
+                let lowered = init::lower_initializer(cx, target_ty, init_ast);
+                initializers.push(TypedDeclInit {
+                    symbol: symbol_id,
+                    init: lowered.init,
+                });
+            }
         }
     }
 
     TypedDeclaration {
         symbols,
+        initializers,
         span: declaration_span(decl),
     }
 }
@@ -165,13 +178,18 @@ pub fn ensure_function_symbol(cx: &mut SemaContext<'_>, func: &FunctionDef) -> O
 /// Lower one local declaration inside a block scope.
 pub fn lower_local_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) -> TypedDeclaration {
     let mut symbols = Vec::new();
+    let mut initializers = Vec::new();
     let span = declaration_span(decl);
 
     let storage = match normalize_storage(&decl.specifiers, span) {
         Ok(s) => s,
         Err(diag) => {
             cx.emit(diag);
-            return TypedDeclaration { symbols, span };
+            return TypedDeclaration {
+                symbols,
+                initializers,
+                span,
+            };
         }
     };
     let is_typedef = decl.specifiers.storage.contains(&StorageClass::Typedef);
@@ -186,7 +204,11 @@ pub fn lower_local_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) -> 
             ));
         }
         let _ = resolve_base_type(cx, &decl.specifiers, span, false);
-        return TypedDeclaration { symbols, span };
+        return TypedDeclaration {
+            symbols,
+            initializers,
+            span,
+        };
     }
 
     let base_ty = resolve_base_type(cx, &decl.specifiers, span, false);
@@ -195,7 +217,7 @@ pub fn lower_local_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) -> 
         let Some(name) = declarator_ident(&init_decl.declarator) else {
             continue;
         };
-        let ty = apply_declarator_with_base(cx, base_ty, &init_decl.declarator);
+        let mut ty = apply_declarator_with_base(cx, base_ty, &init_decl.declarator);
 
         if is_typedef {
             if init_decl.init.is_some() {
@@ -241,22 +263,12 @@ pub fn lower_local_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) -> 
             continue;
         }
 
-        let kind = if matches!(cx.types.get(ty).kind, TypeKind::Function(_)) {
+        let mut kind = if matches!(cx.types.get(ty).kind, TypeKind::Function(_)) {
             SymbolKind::Function
         } else {
             SymbolKind::Object
         };
-
-        if kind == SymbolKind::Object
-            && storage != Some(StorageClass::Extern)
-            && !is_complete_type(ty, cx)
-        {
-            cx.emit(SemaDiagnostic::new(
-                SemaDiagnosticCode::IncompleteType,
-                format!("declaration of '{name}' has incomplete type"),
-                init_decl.declarator.direct.span,
-            ));
-        }
+        let mut typed_initializer = None;
 
         if let Some(init) = &init_decl.init {
             if kind == SymbolKind::Function {
@@ -275,33 +287,37 @@ pub fn lower_local_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) -> 
                 ));
             }
 
-            match &init.kind {
-                crate::frontend::parser::ast::InitializerKind::Expr(_) => {
-                    let typed_init = init::lower_initializer(cx, ty, init);
-                    if let crate::frontend::sema::typed_ast::TypedInitializer::Expr(value) =
-                        typed_init
-                        && !assignment_compatible_with_const(
-                            value.ty,
-                            const_int_value(value.const_value),
-                            ty,
-                            &cx.types,
-                        )
-                    {
-                        cx.emit(SemaDiagnostic::new(
-                            SemaDiagnosticCode::TypeMismatch,
-                            format!("initializer for '{name}' has incompatible type"),
-                            value.span,
-                        ));
-                    }
-                }
-                crate::frontend::parser::ast::InitializerKind::Aggregate(_) => {
+            if kind != SymbolKind::Function && storage != Some(StorageClass::Extern) {
+                let lowered = init::lower_initializer(cx, ty, init);
+                if storage == Some(StorageClass::Static)
+                    && !init::is_constant_initializer(cx, &lowered.init)
+                {
                     cx.emit(SemaDiagnostic::new(
-                        SemaDiagnosticCode::InvalidInitializer,
-                        "aggregate initializers are not supported yet",
+                        SemaDiagnosticCode::NonConstantInRequiredContext,
+                        format!("initializer for '{name}' is not a constant expression"),
                         init.span,
                     ));
                 }
+                ty = lowered.resulting_ty;
+                typed_initializer = Some(lowered.init);
             }
+        }
+
+        kind = if matches!(cx.types.get(ty).kind, TypeKind::Function(_)) {
+            SymbolKind::Function
+        } else {
+            SymbolKind::Object
+        };
+
+        if kind == SymbolKind::Object
+            && storage != Some(StorageClass::Extern)
+            && !is_complete_type(ty, cx)
+        {
+            cx.emit(SemaDiagnostic::new(
+                SemaDiagnosticCode::IncompleteType,
+                format!("declaration of '{name}' has incomplete type"),
+                init_decl.declarator.direct.span,
+            ));
         }
 
         let existing_in_current = cx.lookup_ordinary_in_current_scope(name);
@@ -377,6 +393,12 @@ pub fn lower_local_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) -> 
                 continue;
             }
             symbols.push(existing_id);
+            if let Some(init) = typed_initializer.take() {
+                initializers.push(TypedDeclInit {
+                    symbol: existing_id,
+                    init,
+                });
+            }
             continue;
         }
 
@@ -398,9 +420,19 @@ pub fn lower_local_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) -> 
             continue;
         }
         symbols.push(sym_id);
+        if let Some(init) = typed_initializer.take() {
+            initializers.push(TypedDeclInit {
+                symbol: sym_id,
+                init,
+            });
+        }
     }
 
-    TypedDeclaration { symbols, span }
+    TypedDeclaration {
+        symbols,
+        initializers,
+        span,
+    }
 }
 
 /// Extract the identifier from a declarator.
@@ -471,7 +503,7 @@ fn declare_file_scope_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) 
             continue;
         };
 
-        let ty = apply_declarator_with_base(cx, base_ty, &init_decl.declarator);
+        let mut ty = apply_declarator_with_base(cx, base_ty, &init_decl.declarator);
 
         if is_typedef {
             // Typedef redeclaration: C11 6.7p3 allows identical typedef redeclaration.
@@ -502,7 +534,34 @@ fn declare_file_scope_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) 
             continue;
         }
 
-        let kind = if matches!(cx.types.get(ty).kind, TypeKind::Function(_)) {
+        let mut kind = if matches!(cx.types.get(ty).kind, TypeKind::Function(_)) {
+            SymbolKind::Function
+        } else {
+            SymbolKind::Object
+        };
+
+        if let Some(init) = &init_decl.init {
+            if kind == SymbolKind::Function {
+                cx.emit(SemaDiagnostic::new(
+                    SemaDiagnosticCode::InvalidInitializer,
+                    "function declaration cannot have an initializer",
+                    init.span,
+                ));
+                continue;
+            }
+
+            let lowered = init::lower_initializer(cx, ty, init);
+            if !init::is_constant_initializer(cx, &lowered.init) {
+                cx.emit(SemaDiagnostic::new(
+                    SemaDiagnosticCode::NonConstantInRequiredContext,
+                    format!("initializer for '{name}' is not a constant expression"),
+                    init.span,
+                ));
+            }
+            ty = lowered.resulting_ty;
+        }
+
+        kind = if matches!(cx.types.get(ty).kind, TypeKind::Function(_)) {
             SymbolKind::Function
         } else {
             SymbolKind::Object
@@ -1204,14 +1263,6 @@ fn evaluate_integer_constant_expr(
     }
 }
 
-fn const_int_value(value: Option<ConstValue>) -> Option<i64> {
-    match value {
-        Some(ConstValue::Int(v)) => Some(v),
-        Some(ConstValue::UInt(v)) => i64::try_from(v).ok(),
-        _ => None,
-    }
-}
-
 pub(crate) fn cast_ice_integer_value(cx: &SemaContext<'_>, value: i64, ty: TypeId) -> i64 {
     match &cx.types.get(ty).kind {
         TypeKind::Bool => i64::from(value != 0),
@@ -1513,18 +1564,23 @@ fn lower_enum_variants(
     for variant in variants {
         let value = if let Some(expr) = &variant.value {
             match evaluate_integer_constant_expr(cx, expr) {
-                Ok(v) => v,
+                Ok(v) => Some(v),
                 Err(err) => {
                     emit_ice_eval_error(
                         cx,
                         err,
                         "enumerator value is not an integer constant expression",
                     );
-                    next_value
+                    None
                 }
             }
         } else {
-            next_value
+            Some(next_value)
+        };
+
+        let Some(value) = value else {
+            // Keep sequence state unchanged for invalid explicit enumerator values.
+            continue;
         };
 
         // Check for duplicate enumerator names.
@@ -1702,6 +1758,12 @@ fn declaration_span(decl: &Declaration) -> SourceSpan {
         (Some(span), None) | (None, Some(span)) => span,
         (None, None) => SourceSpan::new(0, 0),
     }
+}
+
+fn has_prior_initializer_diagnostic(cx: &SemaContext<'_>, span: SourceSpan) -> bool {
+    cx.diagnostics()
+        .iter()
+        .any(|diag| diag.primary.start >= span.start && diag.primary.end <= span.end)
 }
 
 /// Convert linkage merge errors into user-facing diagnostics.

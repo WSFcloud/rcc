@@ -31,6 +31,8 @@ pub enum SemaDiagnosticCode {
     InvalidInitializer,
     /// Jump (goto) bypasses variable initialization.
     JumpOverInitializer,
+    /// Invalid placement of control-flow statements/labels (break/continue/case/default).
+    InvalidControlFlow,
 
     /// Variable-modified types are not supported.
     UnsupportedVmType,

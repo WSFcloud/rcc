@@ -668,11 +668,14 @@ pub fn composite_type(a: TypeId, b: TypeId, arena: &mut TypeArena) -> Option<Typ
                     if a_fn.params.len() != b_fn.params.len() {
                         return None;
                     }
+                    if a_fn.variadic != b_fn.variadic {
+                        return None;
+                    }
                     let mut params = Vec::with_capacity(a_fn.params.len());
                     for (lhs, rhs) in a_fn.params.iter().zip(&b_fn.params) {
                         params.push(composite_type(*lhs, *rhs, arena)?);
                     }
-                    (params, a_fn.variadic || b_fn.variadic)
+                    (params, a_fn.variadic)
                 }
                 (FunctionStyle::Prototype, FunctionStyle::NonPrototype) => {
                     (a_fn.params.clone(), a_fn.variadic)
@@ -885,6 +888,35 @@ mod tests {
             arena.get(common).kind,
             TypeKind::Long { signed: false }
         ));
+    }
+
+    #[test]
+    fn composite_type_rejects_variadic_mismatch_between_prototypes() {
+        let mut arena = TypeArena::new();
+        let int_ty = arena.intern(Type {
+            kind: TypeKind::Int { signed: true },
+            quals: Qualifiers::default(),
+        });
+        let proto_non_variadic = arena.intern(Type {
+            kind: TypeKind::Function(FunctionType {
+                ret: int_ty,
+                params: vec![int_ty],
+                variadic: false,
+                style: FunctionStyle::Prototype,
+            }),
+            quals: Qualifiers::default(),
+        });
+        let proto_variadic = arena.intern(Type {
+            kind: TypeKind::Function(FunctionType {
+                ret: int_ty,
+                params: vec![int_ty],
+                variadic: true,
+                style: FunctionStyle::Prototype,
+            }),
+            quals: Qualifiers::default(),
+        });
+
+        assert!(composite_type(proto_non_variadic, proto_variadic, &mut arena).is_none());
     }
 
     #[test]

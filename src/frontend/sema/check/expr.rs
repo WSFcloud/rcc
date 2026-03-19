@@ -4,10 +4,11 @@ use crate::frontend::parser::ast::{
     TypeName, UnaryOp as AstUnaryOp,
 };
 use crate::frontend::sema::check::decl;
+use crate::frontend::sema::const_eval::{self, ConstEvalEnv, ConstExprContext};
 use crate::frontend::sema::context::SemaContext;
 use crate::frontend::sema::diagnostic::{SemaDiagnostic, SemaDiagnosticCode};
 use crate::frontend::sema::init;
-use crate::frontend::sema::symbols::SymbolKind;
+use crate::frontend::sema::symbols::{SymbolId, SymbolKind};
 use crate::frontend::sema::typed_ast::{
     AssignOp, BinaryOp, ConstValue, TypedExpr, TypedExprKind, UnaryOp, ValueCategory,
 };
@@ -59,6 +60,14 @@ fn lower_and_convert(
 ) -> TypedExpr {
     let lowered = lower_expr(cx, expr);
     apply_standard_conversions(cx, lowered, options)
+}
+
+/// Lowers an expression and applies the ordinary standard conversions.
+pub(crate) fn lower_expr_with_standard_conversions(
+    cx: &mut SemaContext<'_>,
+    expr: &Expr,
+) -> TypedExpr {
+    lower_and_convert(cx, expr, ConversionOptions::STANDARD)
 }
 
 /// Lower parser expressions into typed expressions.
@@ -225,6 +234,7 @@ fn lower_unary_expr(
                 },
                 quals: Qualifiers::default(),
             });
+            let const_value = address_of_operand_const(cx, &operand);
             TypedExpr {
                 kind: TypedExprKind::Unary {
                     op: UnaryOp::AddrOf,
@@ -232,7 +242,7 @@ fn lower_unary_expr(
                 },
                 ty: ptr_ty,
                 value_category: ValueCategory::RValue,
-                const_value: None,
+                const_value,
                 span,
             }
         }
@@ -412,7 +422,20 @@ fn lower_binary_expr(
                 left = cast_if_needed(left, common);
                 right = cast_if_needed(right, common);
             } else if is_pointer_type(cx, left.ty) && is_pointer_type(cx, right.ty) {
-                // Accept pointer comparisons in V1.
+                let compatible = if matches!(op, AstBinaryOp::Eq | AstBinaryOp::Ne) {
+                    types_compatible(left.ty, right.ty, &cx.types)
+                        || is_void_pointer_type(cx, left.ty)
+                        || is_void_pointer_type(cx, right.ty)
+                } else {
+                    types_compatible(left.ty, right.ty, &cx.types)
+                };
+                if !compatible {
+                    return emit_type_mismatch(
+                        cx,
+                        span,
+                        "pointer comparison requires compatible pointer types",
+                    );
+                }
             } else if is_pointer_type(cx, left.ty) && is_null_pointer_constant(&right) {
                 right = cast_if_needed(right, left.ty);
             } else if is_pointer_type(cx, right.ty) && is_null_pointer_constant(&left) {
@@ -545,7 +568,10 @@ fn lower_assign_expr(
                     "shift compound assignment requires integer operands",
                 );
             }
-            integer_promotion(lhs_rvalue.ty, &mut cx.types)
+            let lhs_promoted = integer_promotion(lhs_rvalue.ty, &mut cx.types);
+            let rhs_promoted = integer_promotion(rhs.ty, &mut cx.types);
+            rhs = cast_if_needed(rhs, rhs_promoted);
+            lhs_promoted
         }
         AstAssignOp::BitAndAssign | AstAssignOp::BitXorAssign | AstAssignOp::BitOrAssign => {
             if !is_integer(&cx.types.get(lhs_rvalue.ty).kind)
@@ -609,9 +635,7 @@ fn lower_conditional_expr(
     } else if types_compatible(then_expr.ty, else_expr.ty, &cx.types) {
         then_expr.ty
     } else if is_pointer_type(cx, then_expr.ty) && is_pointer_type(cx, else_expr.ty) {
-        if types_compatible(then_expr.ty, else_expr.ty, &cx.types) {
-            then_expr.ty
-        } else if is_void_pointer_type(cx, then_expr.ty) {
+        if is_void_pointer_type(cx, then_expr.ty) {
             then_expr.ty
         } else if is_void_pointer_type(cx, else_expr.ty) {
             else_expr.ty
@@ -840,6 +864,8 @@ fn lower_index_expr(
         );
     };
 
+    let const_value = index_expr_const_address(cx, &base, &index);
+
     TypedExpr {
         kind: TypedExprKind::Index {
             base: Box::new(base),
@@ -847,9 +873,30 @@ fn lower_index_expr(
         },
         ty: pointee,
         value_category: value_category_for_designator_type(cx, pointee),
-        const_value: None,
+        const_value,
         span,
     }
+}
+
+fn index_expr_const_address(
+    cx: &SemaContext<'_>,
+    base: &TypedExpr,
+    index: &TypedExpr,
+) -> Option<ConstValue> {
+    let (ptr_expr, int_expr, pointee) = if let Some(pointee) = pointee_of_pointer(cx, base.ty) {
+        (base, index, pointee)
+    } else if let Some(pointee) = pointee_of_pointer(cx, index.ty) {
+        (index, base, pointee)
+    } else {
+        return None;
+    };
+
+    let (symbol, base_offset) = pointer_const_address(cx, ptr_expr)?;
+    let index_value = integer_constant_value(cx, int_expr)?;
+    let elem_size = i64::try_from(type_size_of(pointee, &cx.types, &cx.records)?).ok()?;
+    let index_offset = index_value.checked_mul(elem_size)?;
+    let offset = base_offset.checked_add(index_offset)?;
+    Some(ConstValue::Addr { symbol, offset })
 }
 
 /// Lowers explicit cast expressions and validates allowed cast categories.
@@ -880,6 +927,246 @@ fn lower_cast_expr(
         value_category: ValueCategory::RValue,
         const_value: None,
         span,
+    }
+}
+
+fn address_of_operand_const(cx: &SemaContext<'_>, operand: &TypedExpr) -> Option<ConstValue> {
+    let (symbol, offset) = address_of_operand_symbol_offset(cx, operand)?;
+    Some(ConstValue::Addr { symbol, offset })
+}
+
+fn address_of_operand_symbol_offset(
+    cx: &SemaContext<'_>,
+    operand: &TypedExpr,
+) -> Option<(SymbolId, i64)> {
+    if let Some(ConstValue::Addr { symbol, offset }) = operand.const_value {
+        return Some((symbol, offset));
+    }
+
+    match &operand.kind {
+        TypedExprKind::SymbolRef(symbol) => Some((*symbol, 0)),
+        TypedExprKind::ImplicitCast { expr, .. } | TypedExprKind::Cast { expr, .. } => {
+            address_of_operand_symbol_offset(cx, expr)
+        }
+        TypedExprKind::Unary {
+            op: UnaryOp::Deref,
+            operand: inner,
+        } => pointer_const_address(cx, inner),
+        TypedExprKind::Index { base, index } => {
+            let (ptr_expr, int_expr, pointee) =
+                if let Some(pointee) = pointee_of_pointer(cx, base.ty) {
+                    (base.as_ref(), index.as_ref(), pointee)
+                } else if let Some(pointee) = pointee_of_pointer(cx, index.ty) {
+                    (index.as_ref(), base.as_ref(), pointee)
+                } else {
+                    return None;
+                };
+            let (symbol, base_offset) = pointer_const_address(cx, ptr_expr)?;
+            let index_value = integer_constant_value(cx, int_expr)?;
+            let elem_size = i64::try_from(type_size_of(pointee, &cx.types, &cx.records)?).ok()?;
+            let index_offset = index_value.checked_mul(elem_size)?;
+            let offset = base_offset.checked_add(index_offset)?;
+            Some((symbol, offset))
+        }
+        TypedExprKind::MemberAccess { base, field, deref } => {
+            let (symbol, base_offset, record_id) = if *deref {
+                let TypeKind::Pointer { pointee } = cx.types.get(base.ty).kind else {
+                    return None;
+                };
+                let TypeKind::Record(record_id) = cx.types.get(pointee).kind else {
+                    return None;
+                };
+                let (symbol, offset) = pointer_const_address(cx, base)?;
+                (symbol, offset, record_id)
+            } else {
+                let TypeKind::Record(record_id) = cx.types.get(base.ty).kind else {
+                    return None;
+                };
+                let (symbol, offset) = address_of_operand_symbol_offset(cx, base)?;
+                (symbol, offset, record_id)
+            };
+            let field_offset = record_field_offset(cx, record_id, *field)?;
+            let offset = base_offset.checked_add(field_offset)?;
+            Some((symbol, offset))
+        }
+        _ => None,
+    }
+}
+
+fn pointer_const_address(cx: &SemaContext<'_>, expr: &TypedExpr) -> Option<(SymbolId, i64)> {
+    if let Some(ConstValue::Addr { symbol, offset }) = expr.const_value {
+        return Some((symbol, offset));
+    }
+
+    match &expr.kind {
+        TypedExprKind::Unary {
+            op: UnaryOp::AddrOf,
+            operand,
+        } => address_of_operand_symbol_offset(cx, operand),
+        TypedExprKind::ImplicitCast { expr: inner, .. }
+        | TypedExprKind::Cast { expr: inner, .. } => {
+            if !is_pointer_type(cx, expr.ty) {
+                return None;
+            }
+            pointer_const_address(cx, inner)
+        }
+        TypedExprKind::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } => pointer_integer_offset_const_address(cx, left, right, false)
+            .or_else(|| pointer_integer_offset_const_address(cx, right, left, false)),
+        TypedExprKind::Binary {
+            op: BinaryOp::Sub,
+            left,
+            right,
+        } => pointer_integer_offset_const_address(cx, left, right, true),
+        TypedExprKind::MemberAccess { .. }
+            if matches!(
+                expr.value_category,
+                ValueCategory::LValue
+                    | ValueCategory::ArrayDesignator
+                    | ValueCategory::FunctionDesignator
+            ) =>
+        {
+            address_of_operand_symbol_offset(cx, expr)
+        }
+        TypedExprKind::SymbolRef(symbol)
+            if matches!(
+                expr.value_category,
+                ValueCategory::ArrayDesignator | ValueCategory::FunctionDesignator
+            ) =>
+        {
+            Some((*symbol, 0))
+        }
+        _ => None,
+    }
+}
+
+fn pointer_integer_offset_const_address(
+    cx: &SemaContext<'_>,
+    ptr_expr: &TypedExpr,
+    int_expr: &TypedExpr,
+    negate_index: bool,
+) -> Option<(SymbolId, i64)> {
+    let pointee = pointee_of_pointer(cx, ptr_expr.ty)?;
+    let (symbol, base_offset) = pointer_const_address(cx, ptr_expr)?;
+    let mut index = integer_constant_value(cx, int_expr)?;
+    if negate_index {
+        index = index.checked_neg()?;
+    }
+    let elem_size = i64::try_from(type_size_of(pointee, &cx.types, &cx.records)?).ok()?;
+    let delta = index.checked_mul(elem_size)?;
+    Some((symbol, base_offset.checked_add(delta)?))
+}
+
+fn integer_constant_value(cx: &SemaContext<'_>, expr: &TypedExpr) -> Option<i64> {
+    if let Some(v) = const_int_value(expr.const_value) {
+        return Some(v);
+    }
+
+    let env = ConstEvalEnv {
+        types: &cx.types,
+        records: &cx.records,
+    };
+    match const_eval::eval_const_expr(expr, ConstExprContext::IntegerConstant, &env).ok()? {
+        ConstValue::Int(v) => Some(v),
+        ConstValue::UInt(v) => i64::try_from(v).ok(),
+        _ => None,
+    }
+}
+
+/// Returns `true` when an expression is representable as a C address constant.
+pub(crate) fn is_address_constant_expr(cx: &SemaContext<'_>, expr: &TypedExpr) -> bool {
+    if !is_pointer_type(cx, expr.ty) {
+        return false;
+    }
+
+    if matches!(
+        expr.const_value,
+        Some(ConstValue::Addr { .. }) | Some(ConstValue::NullPtr)
+    ) {
+        return true;
+    }
+
+    if pointer_const_address(cx, expr).is_some() {
+        return true;
+    }
+
+    // String literal decay produces an implicit cast from an opaque const-char array.
+    match &expr.kind {
+        TypedExprKind::ImplicitCast { expr: inner, .. }
+        | TypedExprKind::Cast { expr: inner, .. } => {
+            if !is_pointer_type(cx, expr.ty) {
+                return false;
+            }
+            if integer_constant_value(cx, inner).is_some() {
+                return true;
+            }
+            if matches!(inner.kind, TypedExprKind::Opaque)
+                && matches!(inner.value_category, ValueCategory::ArrayDesignator)
+            {
+                if let TypeKind::Array { elem, .. } = cx.types.get(inner.ty).kind {
+                    let elem_ty = cx.types.get(elem);
+                    if elem_ty.quals.is_const
+                        && matches!(
+                            elem_ty.kind,
+                            TypeKind::Char | TypeKind::SignedChar | TypeKind::UnsignedChar
+                        )
+                    {
+                        return true;
+                    }
+                }
+            }
+            // File-scope compound literal with array type decays to a pointer —
+            // that pointer is an address constant (C99 6.5.2.5p5).
+            if matches!(
+                inner.kind,
+                TypedExprKind::CompoundLiteral {
+                    is_file_scope: true,
+                    ..
+                }
+            ) {
+                return true;
+            }
+            is_address_constant_expr(cx, inner)
+        }
+        // C99 6.6p9: a conditional with a constant condition and address-constant
+        // branches is an address constant expression.
+        TypedExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            integer_constant_value(cx, cond).is_some()
+                && is_address_constant_expr(cx, then_expr)
+                && is_address_constant_expr(cx, else_expr)
+        }
+        _ => false,
+    }
+}
+
+fn record_field_offset(
+    cx: &SemaContext<'_>,
+    record_id: crate::frontend::sema::types::RecordId,
+    field_id: crate::frontend::sema::types::FieldId,
+) -> Option<i64> {
+    let record = cx.records.get(record_id);
+    let field_index = field_id.0 as usize;
+    if field_index >= record.fields.len() {
+        return None;
+    }
+
+    match record.kind {
+        crate::frontend::parser::ast::RecordKind::Struct => {
+            let mut offset = 0i64;
+            for field in record.fields.iter().take(field_index) {
+                let size = i64::try_from(type_size_of(field.ty, &cx.types, &cx.records)?).ok()?;
+                offset = offset.checked_add(size)?;
+            }
+            Some(offset)
+        }
+        crate::frontend::parser::ast::RecordKind::Union => Some(0),
     }
 }
 
@@ -941,9 +1228,6 @@ fn lower_comma_expr(
     }
 }
 
-/// Lowers compound literal expressions.
-///
-/// Aggregate/designator-heavy forms are intentionally deferred to Phase 5.
 fn lower_compound_literal_expr(
     cx: &mut SemaContext<'_>,
     ty_name: &TypeName,
@@ -951,26 +1235,16 @@ fn lower_compound_literal_expr(
     span: SourceSpan,
 ) -> TypedExpr {
     let ty = decl::build_type_from_type_name(cx, ty_name, span);
-
-    let typed_init = match &init.kind {
-        crate::frontend::parser::ast::InitializerKind::Expr(_) => {
-            init::lower_initializer(cx, ty, init)
-        }
-        crate::frontend::parser::ast::InitializerKind::Aggregate(_) => {
-            // Phase 5 will handle aggregate/designator compound literals.
-            cx.emit(SemaDiagnostic::new(
-                SemaDiagnosticCode::InvalidInitializer,
-                "aggregate compound literals are not supported yet",
-                span,
-            ));
-            crate::frontend::sema::typed_ast::TypedInitializer::ZeroInit { ty }
-        }
-    };
+    let lowered = init::lower_initializer(cx, ty, init);
+    let ty = lowered.resulting_ty;
+    let typed_init = lowered.init;
+    let is_file_scope = cx.scope_level() == crate::frontend::sema::symbols::ScopeLevel::File;
 
     TypedExpr {
         kind: TypedExprKind::CompoundLiteral {
             ty,
             init: Box::new(typed_init),
+            is_file_scope,
         },
         ty,
         value_category: value_category_for_designator_type(cx, ty),
@@ -1351,7 +1625,7 @@ mod tests {
     use super::*;
     use crate::common::span::SourceSpan;
     use crate::frontend::parser::ast::{
-        BinaryOp as AstBinaryOp, Expr, IntLiteralSuffix, RecordKind,
+        AssignOp as AstAssignOp, BinaryOp as AstBinaryOp, Expr, IntLiteralSuffix, RecordKind,
     };
     use crate::frontend::sema::symbols::{DefinitionStatus, Linkage, Symbol, SymbolId};
     use crate::frontend::sema::types::{FieldDef, FunctionType, RecordDef, RecordId};
@@ -1472,6 +1746,30 @@ mod tests {
         let typed = lower_expr(&mut cx, &expr);
         assert_eq!(typed.ty, int_ty);
         assert_eq!(typed.value_category, ValueCategory::LValue);
+    }
+
+    #[test]
+    fn shift_compound_assignment_promotes_rhs_independently() {
+        let mut cx = new_cx();
+        let lhs_ty = long_long_type(&mut cx, true);
+        let rhs_ty = unsigned_char_ty(&mut cx);
+        bind_symbol(&mut cx, "lhs", lhs_ty);
+        bind_symbol(&mut cx, "rhs", rhs_ty);
+
+        let expr = Expr::assign(
+            Expr::var_with_span("lhs".to_string(), SourceSpan::dummy()),
+            AstAssignOp::ShlAssign,
+            Expr::var_with_span("rhs".to_string(), SourceSpan::dummy()),
+        );
+        let typed = lower_expr(&mut cx, &expr);
+
+        let TypedExprKind::Assign { rhs, .. } = typed.kind else {
+            panic!("expected assignment expression");
+        };
+        assert!(matches!(
+            cx.types.get(rhs.ty).kind,
+            TypeKind::Int { signed: true }
+        ));
     }
 
     #[test]

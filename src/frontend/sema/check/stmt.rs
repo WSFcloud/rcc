@@ -269,7 +269,7 @@ fn lower_stmt(cx: &mut SemaContext<'_>, stmt: &Stmt, labels: &mut LabelTracker) 
         StmtKind::Break => {
             if !labels.can_break() {
                 cx.emit(SemaDiagnostic::new(
-                    SemaDiagnosticCode::TypeMismatch,
+                    SemaDiagnosticCode::InvalidControlFlow,
                     "break statement not within loop or switch",
                     stmt.span,
                 ));
@@ -279,7 +279,7 @@ fn lower_stmt(cx: &mut SemaContext<'_>, stmt: &Stmt, labels: &mut LabelTracker) 
         StmtKind::Continue => {
             if !labels.in_loop() {
                 cx.emit(SemaDiagnostic::new(
-                    SemaDiagnosticCode::TypeMismatch,
+                    SemaDiagnosticCode::InvalidControlFlow,
                     "continue statement not within a loop",
                     stmt.span,
                 ));
@@ -304,7 +304,7 @@ fn lower_stmt(cx: &mut SemaContext<'_>, stmt: &Stmt, labels: &mut LabelTracker) 
         } => {
             if !labels.in_switch() {
                 cx.emit(SemaDiagnostic::new(
-                    SemaDiagnosticCode::TypeMismatch,
+                    SemaDiagnosticCode::InvalidControlFlow,
                     "case label is only valid inside switch",
                     stmt.span,
                 ));
@@ -331,7 +331,7 @@ fn lower_stmt(cx: &mut SemaContext<'_>, stmt: &Stmt, labels: &mut LabelTracker) 
         StmtKind::Default { stmt: inner } => {
             if !labels.in_switch() {
                 cx.emit(SemaDiagnostic::new(
-                    SemaDiagnosticCode::TypeMismatch,
+                    SemaDiagnosticCode::InvalidControlFlow,
                     "default label is only valid inside switch",
                     stmt.span,
                 ));

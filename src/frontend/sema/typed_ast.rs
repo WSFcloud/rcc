@@ -33,7 +33,16 @@ pub struct TypedFunctionDef {
 pub struct TypedDeclaration {
     /// Symbol IDs of declared entities.
     pub symbols: Vec<SymbolId>,
+    /// Lowered initializers attached to this declaration.
+    pub initializers: Vec<TypedDeclInit>,
     pub span: SourceSpan,
+}
+
+/// One lowered initializer attached to a declared symbol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedDeclInit {
+    pub symbol: SymbolId,
+    pub init: TypedInitializer,
 }
 
 /// A block item (declaration or statement).
@@ -388,9 +397,12 @@ pub enum TypedExprKind {
     },
 
     /// Compound literal: `(type){initializer}`.
+    /// `is_file_scope` is true when the literal appears at file scope,
+    /// giving it static storage duration (C99 6.5.2.5p5).
     CompoundLiteral {
         ty: TypeId,
         init: Box<TypedInitializer>,
+        is_file_scope: bool,
     },
 }
 
@@ -404,8 +416,15 @@ pub enum TypedExprKind {
 pub enum TypedInitializer {
     /// Single expression initializer.
     Expr(TypedExpr),
-    /// Aggregate initializer (array or struct).
+    /// Aggregate initializer (array or struct) — dense, positional.
     Aggregate(Vec<TypedInitItem>),
+    /// Sparse array initializer — only stores explicitly initialized indices.
+    /// Unmentioned slots are implicitly zero-initialized.
+    SparseArray {
+        elem_ty: TypeId,
+        total_len: usize,
+        entries: std::collections::BTreeMap<usize, TypedInitItem>,
+    },
     /// Zero-initialization (all bytes set to zero).
     ZeroInit { ty: TypeId },
 }

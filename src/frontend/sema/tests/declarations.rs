@@ -75,6 +75,13 @@ fn rejects_void_parameter_in_multi_parameter_prototype() {
 }
 
 #[test]
+fn rejects_function_redeclaration_with_variadic_mismatch() {
+    let src = "int f(int); int f(int, ...);";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::IncompatibleTypes);
+}
+
+#[test]
 fn supports_enum_constants_and_sizeof_in_array_length() {
     let src = r#"
         enum { A = 2, B = A + 3 };
@@ -112,6 +119,14 @@ fn reports_division_by_zero_in_constant_expression() {
     let src = "enum { A = 1 / 0 };";
     let diagnostics = analyze_source(src).expect_err("sema should fail");
     assert_has_code(&diagnostics, SemaDiagnosticCode::ConstantDivisionByZero);
+}
+
+#[test]
+fn invalid_enum_value_does_not_define_enumerator_symbol() {
+    let src = "enum { A = 1 / 0 }; int x = A;";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::ConstantDivisionByZero);
+    assert_has_code(&diagnostics, SemaDiagnosticCode::UndefinedSymbol);
 }
 
 #[test]

@@ -81,6 +81,11 @@ impl<'a> SemaContext<'a> {
         !self.diagnostics.is_empty()
     }
 
+    /// Returns all accumulated diagnostics without consuming them.
+    pub fn diagnostics(&self) -> &[SemaDiagnostic] {
+        &self.diagnostics
+    }
+
     /// Takes all accumulated diagnostics, leaving the vector empty.
     pub fn take_diagnostics(&mut self) -> Vec<SemaDiagnostic> {
         std::mem::take(&mut self.diagnostics)

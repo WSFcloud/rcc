@@ -24,3 +24,4 @@ fn assert_has_code(diags: &[sema::diagnostic::SemaDiagnostic], code: SemaDiagnos
 mod control_flow;
 mod declarations;
 mod functions;
+mod initializers;
