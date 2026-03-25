@@ -82,6 +82,17 @@ fn rejects_function_redeclaration_with_variadic_mismatch() {
 }
 
 #[test]
+fn allows_function_redeclaration_between_enum_and_underlying_int_param() {
+    let src = r#"
+        enum E { A = 1 };
+        int f(enum E x);
+        int f(int x);
+    "#;
+    let result = analyze_source(src);
+    assert!(result.is_ok(), "unexpected diagnostics: {result:?}");
+}
+
+#[test]
 fn supports_enum_constants_and_sizeof_in_array_length() {
     let src = r#"
         enum { A = 2, B = A + 3 };

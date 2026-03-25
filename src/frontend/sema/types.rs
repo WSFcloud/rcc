@@ -335,6 +335,9 @@ pub fn types_compatible(a: TypeId, b: TypeId, arena: &TypeArena) -> bool {
         | (TypeKind::LongLong { signed: a }, TypeKind::LongLong { signed: b }) => {
             a == b && lhs.quals == rhs.quals
         }
+        // In this implementation, enum underlying type is `int`.
+        (TypeKind::Enum(_), TypeKind::Int { signed: true })
+        | (TypeKind::Int { signed: true }, TypeKind::Enum(_)) => lhs.quals == rhs.quals,
         (TypeKind::Pointer { pointee: a }, TypeKind::Pointer { pointee: b }) => {
             if lhs.quals != rhs.quals {
                 return false;
@@ -668,6 +671,8 @@ pub fn composite_type(a: TypeId, b: TypeId, arena: &mut TypeArena) -> Option<Typ
 
     let quals = lhs.quals;
     let kind = match (lhs.kind, rhs.kind) {
+        (TypeKind::Enum(_), TypeKind::Int { signed: true })
+        | (TypeKind::Int { signed: true }, TypeKind::Enum(_)) => TypeKind::Int { signed: true },
         (TypeKind::Array { elem: ea, len: la }, TypeKind::Array { elem: eb, len: lb }) => {
             let elem = composite_type(ea, eb, arena)?;
             let len = match (la, lb) {
@@ -885,6 +890,8 @@ fn types_compatible_ignoring_quals(a: TypeId, b: TypeId, arena: &TypeArena) -> b
         | (TypeKind::Int { signed: a }, TypeKind::Int { signed: b })
         | (TypeKind::Long { signed: a }, TypeKind::Long { signed: b })
         | (TypeKind::LongLong { signed: a }, TypeKind::LongLong { signed: b }) => a == b,
+        (TypeKind::Enum(_), TypeKind::Int { signed: true })
+        | (TypeKind::Int { signed: true }, TypeKind::Enum(_)) => true,
         (TypeKind::Pointer { pointee: a }, TypeKind::Pointer { pointee: b }) => {
             types_compatible_ignoring_quals(*a, *b, arena)
         }
@@ -1259,5 +1266,26 @@ mod tests {
         assert!(!types_compatible(char_ty, schar_ty, &arena));
         assert!(!types_compatible(char_ty, uchar_ty, &arena));
         assert!(!types_compatible(schar_ty, uchar_ty, &arena));
+    }
+
+    #[test]
+    fn enum_type_is_compatible_with_signed_int() {
+        let mut arena = TypeArena::new();
+        let enum_ty = arena.intern(Type {
+            kind: TypeKind::Enum(EnumId(0)),
+            quals: Qualifiers::default(),
+        });
+        let int_ty = arena.intern(Type {
+            kind: TypeKind::Int { signed: true },
+            quals: Qualifiers::default(),
+        });
+        let uint_ty = arena.intern(Type {
+            kind: TypeKind::Int { signed: false },
+            quals: Qualifiers::default(),
+        });
+
+        assert!(types_compatible(enum_ty, int_ty, &arena));
+        assert!(types_compatible(int_ty, enum_ty, &arena));
+        assert!(!types_compatible(enum_ty, uint_ty, &arena));
     }
 }

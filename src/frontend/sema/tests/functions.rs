@@ -156,6 +156,34 @@ fn allows_void_pointer_object_pointer_roundtrip_assignment() {
 }
 
 #[test]
+fn rejects_cast_between_void_pointer_and_function_pointer() {
+    let src = r#"
+        int callee(void) { return 0; }
+        int main(void) {
+            void *vp = 0;
+            int (*fp)(void) = (int (*)(void))vp;
+            return fp();
+        }
+    "#;
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::InvalidCast);
+}
+
+#[test]
+fn rejects_member_access_on_incomplete_record_pointer() {
+    let src = "struct S; int f(struct S *p) { return p->x; }";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::IncompleteType);
+}
+
+#[test]
+fn rejects_dereferencing_void_pointer() {
+    let src = "int main(void) { void *p = 0; return *p; }";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::TypeMismatch);
+}
+
+#[test]
 fn rejects_dropping_pointee_const_qualification() {
     let src = r#"
         int main(void) {

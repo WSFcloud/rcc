@@ -14,8 +14,9 @@ use crate::frontend::sema::typed_ast::{
 };
 use crate::frontend::sema::types::{
     ArrayLen, FunctionStyle, Qualifiers, Type, TypeId, TypeKind, assignment_compatible_with_const,
-    integer_promotion, is_arithmetic, is_integer, is_scalar, pointer_comparison_compatible,
-    type_size_of, types_compatible, unqualified, usual_arithmetic_conversions,
+    integer_promotion, is_arithmetic, is_integer, is_scalar, is_void_pointer,
+    pointer_comparison_compatible, type_size_of, types_compatible, unqualified,
+    usual_arithmetic_conversions,
 };
 
 #[derive(Clone, Copy)]
@@ -254,6 +255,9 @@ fn lower_unary_expr(
             let TypeKind::Pointer { pointee } = cx.types.get(operand.ty).kind else {
                 return emit_type_mismatch(cx, span, "operator '*' requires pointer operand");
             };
+            if matches!(cx.types.get(pointee).kind, TypeKind::Void) {
+                return emit_type_mismatch(cx, span, "cannot dereference 'void *'");
+            }
             TypedExpr {
                 kind: TypedExprKind::Unary {
                     op: UnaryOp::Deref,
@@ -828,6 +832,14 @@ fn lower_member_expr(
     };
 
     let record = cx.records.get(record_id);
+    if !record.is_complete {
+        cx.emit(SemaDiagnostic::new(
+            SemaDiagnosticCode::IncompleteType,
+            "member access requires complete record type",
+            span,
+        ));
+        return TypedExpr::opaque(span, cx.error_type());
+    }
     let Some((field_idx, field)) = record
         .fields
         .iter()
@@ -1502,6 +1514,12 @@ fn is_valid_cast(cx: &SemaContext<'_>, from: TypeId, to: TypeId) -> bool {
 
     if matches!(from_kind, TypeKind::Pointer { .. }) && matches!(to_kind, TypeKind::Pointer { .. })
     {
+        // Strict C99 mode: function-pointer and `void*` interconversion is rejected.
+        if (is_void_pointer(from, &cx.types) && is_function_pointer_type(cx, to))
+            || (is_void_pointer(to, &cx.types) && is_function_pointer_type(cx, from))
+        {
+            return false;
+        }
         return true;
     }
 
@@ -1565,6 +1583,13 @@ fn pointee_of_pointer(cx: &SemaContext<'_>, ty: TypeId) -> Option<TypeId> {
         TypeKind::Pointer { pointee } => Some(pointee),
         _ => None,
     }
+}
+
+fn is_function_pointer_type(cx: &SemaContext<'_>, ty: TypeId) -> bool {
+    let Some(pointee) = pointee_of_pointer(cx, ty) else {
+        return false;
+    };
+    matches!(cx.types.get(pointee).kind, TypeKind::Function(_))
 }
 
 /// Returns true when `ty` is arithmetic.
