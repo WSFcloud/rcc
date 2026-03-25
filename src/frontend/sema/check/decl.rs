@@ -1483,8 +1483,13 @@ fn resolve_record_specifier_type(
                             ));
                         }
                         // Complete the existing forward declaration.
-                        let fields =
-                            lower_record_fields(cx, record_spec.members.as_deref().unwrap());
+                        let fields = lower_record_fields(
+                            cx,
+                            record_spec.members.as_deref().unwrap(),
+                            record_spec.kind,
+                            Some(record_id),
+                            span,
+                        );
                         let rec = cx.records.get_mut(record_id);
                         rec.fields = fields;
                         rec.is_complete = true;
@@ -1524,9 +1529,43 @@ fn resolve_record_specifier_type(
         }
     }
 
+    // For a tagged definition, pre-register an incomplete record so fields can
+    // reference the same tag during member type construction.
+    if has_body && let Some(tag_name) = &record_spec.tag {
+        let record_id = cx.records.insert(RecordDef {
+            tag: record_spec.tag.clone(),
+            kind: record_spec.kind,
+            fields: Vec::new(),
+            is_complete: false,
+        });
+        register_tag(cx, tag_name, TagId::Record(record_id), span)?;
+
+        let fields = lower_record_fields(
+            cx,
+            record_spec.members.as_deref().unwrap(),
+            record_spec.kind,
+            Some(record_id),
+            span,
+        );
+        let rec = cx.records.get_mut(record_id);
+        rec.fields = fields;
+        rec.is_complete = true;
+
+        return Ok(cx.types.intern(Type {
+            kind: TypeKind::Record(record_id),
+            quals: Qualifiers::default(),
+        }));
+    }
+
     // Create new record (either definition or forward declaration in current scope).
     let fields = if has_body {
-        lower_record_fields(cx, record_spec.members.as_deref().unwrap())
+        lower_record_fields(
+            cx,
+            record_spec.members.as_deref().unwrap(),
+            record_spec.kind,
+            None,
+            span,
+        )
     } else {
         Vec::new()
     };
@@ -1649,30 +1688,187 @@ fn resolve_enum_specifier_type(
 }
 
 /// Lower record member declarations into field definitions.
-fn lower_record_fields(cx: &mut SemaContext<'_>, members: &[RecordMemberDecl]) -> Vec<FieldDef> {
-    let mut fields = Vec::new();
+fn lower_record_fields(
+    cx: &mut SemaContext<'_>,
+    members: &[RecordMemberDecl],
+    record_kind: RecordKind,
+    self_record_id: Option<crate::frontend::sema::types::RecordId>,
+    record_span: SourceSpan,
+) -> Vec<FieldDef> {
+    let mut fields_with_span: Vec<(FieldDef, SourceSpan)> = Vec::new();
+    let mut seen_named_members: std::collections::HashMap<String, SourceSpan> =
+        std::collections::HashMap::new();
+
     for member in members {
         let base_ty = resolve_base_type(cx, &member.specifiers, member.span, true);
         if member.declarators.is_empty() {
             // Anonymous member (e.g. unnamed struct/union).
-            fields.push(FieldDef {
-                name: None,
-                ty: base_ty,
-                bit_width: None,
-            });
+            fields_with_span.push((
+                FieldDef {
+                    name: None,
+                    ty: base_ty,
+                    bit_width: None,
+                },
+                member.span,
+            ));
         } else {
             for declarator in &member.declarators {
                 let name = declarator_ident(declarator).map(|s| s.to_string());
-                let ty = apply_declarator_with_base(cx, base_ty, declarator);
-                fields.push(FieldDef {
-                    name,
-                    ty,
-                    bit_width: None,
-                });
+                let mut ty = apply_declarator_with_base(cx, base_ty, declarator);
+                let field_span = declarator.direct.span;
+
+                if let Some(member_name) = name.as_deref() {
+                    if let Some(previous_span) = seen_named_members.get(member_name).copied() {
+                        cx.emit(
+                            SemaDiagnostic::new(
+                                SemaDiagnosticCode::RedeclarationConflict,
+                                format!("duplicate member name '{member_name}'"),
+                                field_span,
+                            )
+                            .with_secondary(previous_span, "previous member declaration is here"),
+                        );
+                        ty = cx.error_type();
+                    } else {
+                        seen_named_members.insert(member_name.to_string(), field_span);
+                    }
+                }
+
+                fields_with_span.push((
+                    FieldDef {
+                        name,
+                        ty,
+                        bit_width: None,
+                    },
+                    field_span,
+                ));
             }
         }
     }
-    fields
+
+    if fields_with_span.is_empty() {
+        cx.emit(
+            SemaDiagnostic::new(
+                SemaDiagnosticCode::TypeMismatch,
+                format!(
+                    "empty {} definition is not supported in V1",
+                    record_kind_str(record_kind)
+                ),
+                record_span,
+            )
+            .with_note("add at least one member declaration"),
+        );
+        return Vec::new();
+    }
+
+    for idx in 0..fields_with_span.len() {
+        let is_last = idx + 1 == fields_with_span.len();
+        let named_before = fields_with_span[..idx]
+            .iter()
+            .filter(|(field, _)| field.name.is_some())
+            .count();
+
+        let (field, field_span) = &mut fields_with_span[idx];
+        if matches!(cx.types.get(field.ty).kind, TypeKind::Error) {
+            continue;
+        }
+
+        let has_incomplete_array_ty = matches!(
+            cx.types.get(field.ty).kind,
+            TypeKind::Array {
+                len: ArrayLen::Incomplete,
+                ..
+            }
+        );
+        if has_incomplete_array_ty {
+            if record_kind == RecordKind::Struct && is_last {
+                let mut valid_flexible_member = true;
+                if field.name.is_none() {
+                    cx.emit(
+                        SemaDiagnostic::new(
+                            SemaDiagnosticCode::TypeMismatch,
+                            "flexible array member must be named",
+                            *field_span,
+                        )
+                        .with_note("declare the flexible array member with an identifier"),
+                    );
+                    valid_flexible_member = false;
+                }
+                if named_before == 0 {
+                    cx.emit(
+                        SemaDiagnostic::new(
+                            SemaDiagnosticCode::TypeMismatch,
+                            "flexible array member requires at least one named member before it",
+                            *field_span,
+                        )
+                        .with_note("add a regular named member before the flexible array member"),
+                    );
+                    valid_flexible_member = false;
+                }
+
+                if valid_flexible_member {
+                    field.ty = mark_flexible_array_member_type(cx, field.ty);
+                    continue;
+                }
+                field.ty = cx.error_type();
+                continue;
+            }
+
+            cx.emit(
+                SemaDiagnostic::new(
+                    SemaDiagnosticCode::IncompleteType,
+                    format!(
+                        "{} member has incomplete array type",
+                        record_kind_str(record_kind)
+                    ),
+                    *field_span,
+                )
+                .with_note("only the last member of a struct can be a flexible array member"),
+            );
+            field.ty = cx.error_type();
+            continue;
+        }
+
+        if matches!(cx.types.get(field.ty).kind, TypeKind::Function(_)) {
+            cx.emit(
+                SemaDiagnostic::new(
+                    SemaDiagnosticCode::TypeMismatch,
+                    format!(
+                        "{} member cannot have function type",
+                        record_kind_str(record_kind)
+                    ),
+                    *field_span,
+                )
+                .with_note("use a pointer to function instead"),
+            );
+            field.ty = cx.error_type();
+            continue;
+        }
+
+        if !is_complete_type(field.ty, cx) {
+            // This catches by-value self-recursion because the placeholder record
+            // is still incomplete while its members are being lowered.
+            let mut diag = SemaDiagnostic::new(
+                SemaDiagnosticCode::IncompleteType,
+                format!(
+                    "{} member has incomplete type",
+                    record_kind_str(record_kind)
+                ),
+                *field_span,
+            );
+            if let Some(self_id) = self_record_id
+                && contains_direct_record(field.ty, self_id, cx)
+            {
+                diag = diag.with_note("self-referential members must use pointers");
+            }
+            cx.emit(diag);
+            field.ty = cx.error_type();
+        }
+    }
+
+    fields_with_span
+        .into_iter()
+        .map(|(field, _)| field)
+        .collect()
 }
 
 /// Lower enum variants into semantic constants and symbol table entries.
@@ -1773,6 +1969,37 @@ fn advance_enum_value(cx: &mut SemaContext<'_>, current: i64, span: SourceSpan) 
 
 fn enum_value_representable_as_int(value: i64) -> bool {
     (i32::MIN as i64..=i32::MAX as i64).contains(&value)
+}
+
+fn mark_flexible_array_member_type(cx: &mut SemaContext<'_>, ty: TypeId) -> TypeId {
+    let t = cx.types.get(ty);
+    let elem = match &t.kind {
+        TypeKind::Array {
+            elem,
+            len: ArrayLen::Incomplete,
+        } => *elem,
+        _ => return ty,
+    };
+
+    cx.types.intern(Type {
+        kind: TypeKind::Array {
+            elem,
+            len: ArrayLen::FlexibleMember,
+        },
+        quals: t.quals,
+    })
+}
+
+fn contains_direct_record(
+    ty: TypeId,
+    target_record: crate::frontend::sema::types::RecordId,
+    cx: &SemaContext<'_>,
+) -> bool {
+    match cx.types.get(ty).kind {
+        TypeKind::Record(record_id) => record_id == target_record,
+        TypeKind::Array { elem, .. } => contains_direct_record(elem, target_record, cx),
+        _ => false,
+    }
 }
 
 /// Register one tag (`struct`/`union`/`enum`) in current scope.

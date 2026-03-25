@@ -238,3 +238,59 @@ fn rejects_function_returning_function_type() {
     let diagnostics = analyze_source(src).expect_err("sema should fail");
     assert_has_code(&diagnostics, SemaDiagnosticCode::TypeMismatch);
 }
+
+#[test]
+fn rejects_duplicate_member_names_within_record() {
+    let src = "struct S { int x; int x; };";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::RedeclarationConflict);
+}
+
+#[test]
+fn accepts_valid_flexible_array_member() {
+    let src = "struct S { int n; int data[]; };";
+    let result = analyze_source(src);
+    assert!(result.is_ok(), "unexpected diagnostics: {result:?}");
+}
+
+#[test]
+fn rejects_flexible_array_member_without_named_prefix_member() {
+    let src = "struct S { int data[]; };";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::TypeMismatch);
+}
+
+#[test]
+fn rejects_non_last_flexible_array_member() {
+    let src = "struct S { int data[]; int tail; };";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::IncompleteType);
+}
+
+#[test]
+fn rejects_incomplete_union_member_type() {
+    let src = "struct S; union U { struct S value; };";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::IncompleteType);
+}
+
+#[test]
+fn rejects_recursive_record_member_by_value() {
+    let src = "struct S { struct S self; };";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::IncompleteType);
+}
+
+#[test]
+fn allows_recursive_record_member_via_pointer() {
+    let src = "struct S { struct S *next; }; struct S head;";
+    let result = analyze_source(src);
+    assert!(result.is_ok(), "unexpected diagnostics: {result:?}");
+}
+
+#[test]
+fn rejects_empty_record_definitions() {
+    let src = "struct EmptyS { }; union EmptyU { };";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::TypeMismatch);
+}
