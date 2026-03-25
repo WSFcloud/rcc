@@ -53,9 +53,10 @@ fn eval_const_expr_inner(
 ) -> Result<ConstValue, SemaDiagnostic> {
     match &expr.kind {
         TypedExprKind::Literal(value) => Ok(*value),
-        TypedExprKind::Opaque | TypedExprKind::SymbolRef(_) => expr
-            .const_value
-            .ok_or_else(|| non_constant_diag(expr.span, "expression is not a constant")),
+        TypedExprKind::Opaque | TypedExprKind::SymbolRef(_) | TypedExprKind::StringLiteral(_) => {
+            expr.const_value
+                .ok_or_else(|| non_constant_diag(expr.span, "expression is not a constant"))
+        }
         TypedExprKind::Unary { op, operand } => eval_unary_expr(*op, operand, expr.span, env),
         TypedExprKind::Binary { op, left, right } => {
             eval_binary_expr(*op, left, right, expr.span, env)

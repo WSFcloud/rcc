@@ -1167,8 +1167,10 @@ pub(crate) fn is_address_constant_expr(cx: &SemaContext<'_>, expr: &TypedExpr) -
             if integer_constant_value(cx, inner).is_some() {
                 return true;
             }
-            if matches!(inner.kind, TypedExprKind::Opaque)
-                && matches!(inner.value_category, ValueCategory::ArrayDesignator)
+            if (matches!(
+                inner.kind,
+                TypedExprKind::Opaque | TypedExprKind::StringLiteral(_)
+            ) && matches!(inner.value_category, ValueCategory::ArrayDesignator))
             {
                 if let TypeKind::Array { elem, .. } = cx.types.get(inner.ty).kind {
                     let elem_ty = cx.types.get(elem);
@@ -1394,7 +1396,7 @@ fn lower_literal_expr(cx: &mut SemaContext<'_>, lit: &Literal, span: SourceSpan)
                 quals: Qualifiers::default(),
             });
             TypedExpr {
-                kind: TypedExprKind::Opaque,
+                kind: TypedExprKind::StringLiteral(value.clone()),
                 ty: arr_ty,
                 value_category: ValueCategory::ArrayDesignator,
                 const_value: None,

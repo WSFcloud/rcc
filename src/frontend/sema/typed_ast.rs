@@ -331,6 +331,10 @@ pub enum TypedExprKind {
     /// Literal constant value.
     Literal(ConstValue),
 
+    /// String literal with its content preserved.
+    /// Type is `const char[N+1]` where N is the string length.
+    StringLiteral(String),
+
     /// Reference to a declared symbol (variable, function, etc.).
     SymbolRef(SymbolId),
 
