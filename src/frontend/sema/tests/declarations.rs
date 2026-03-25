@@ -181,3 +181,17 @@ fn rejects_void_with_int_combination() {
     let diagnostics = analyze_source(src).expect_err("sema should fail");
     assert_has_code(&diagnostics, SemaDiagnosticCode::TypeMismatch);
 }
+
+#[test]
+fn rejects_inline_on_object_declaration() {
+    let src = "inline int x;";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::TypeMismatch);
+}
+
+#[test]
+fn rejects_register_at_file_scope() {
+    let src = "register int x;";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::InvalidLinkageMerge);
+}

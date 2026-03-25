@@ -98,7 +98,9 @@ fn lower_stmt(cx: &mut SemaContext<'_>, stmt: &Stmt, labels: &mut LabelTracker) 
             else_branch,
         } => {
             let cond = expr::lower_expr(cx, cond);
-            if !is_scalar(cond.ty, &cx.types) {
+            if !is_scalar(cond.ty, &cx.types)
+                && !matches!(cx.types.get(cond.ty).kind, TypeKind::Error)
+            {
                 cx.emit(SemaDiagnostic::new(
                     SemaDiagnosticCode::TypeMismatch,
                     "if condition must have scalar type",
@@ -125,7 +127,9 @@ fn lower_stmt(cx: &mut SemaContext<'_>, stmt: &Stmt, labels: &mut LabelTracker) 
             } else {
                 cx.error_type()
             };
-            if !is_integer(&cx.types.get(typed_expr.ty).kind) {
+            if !is_integer(&cx.types.get(typed_expr.ty).kind)
+                && !matches!(cx.types.get(typed_expr.ty).kind, TypeKind::Error)
+            {
                 cx.emit(SemaDiagnostic::new(
                     SemaDiagnosticCode::TypeMismatch,
                     "switch expression must have integer type",
@@ -144,7 +148,9 @@ fn lower_stmt(cx: &mut SemaContext<'_>, stmt: &Stmt, labels: &mut LabelTracker) 
         }
         StmtKind::While { cond, body } => {
             let cond = expr::lower_expr(cx, cond);
-            if !is_scalar(cond.ty, &cx.types) {
+            if !is_scalar(cond.ty, &cx.types)
+                && !matches!(cx.types.get(cond.ty).kind, TypeKind::Error)
+            {
                 cx.emit(SemaDiagnostic::new(
                     SemaDiagnosticCode::TypeMismatch,
                     "while condition must have scalar type",
@@ -164,7 +170,9 @@ fn lower_stmt(cx: &mut SemaContext<'_>, stmt: &Stmt, labels: &mut LabelTracker) 
             labels.leave_loop();
 
             let cond = expr::lower_expr(cx, cond);
-            if !is_scalar(cond.ty, &cx.types) {
+            if !is_scalar(cond.ty, &cx.types)
+                && !matches!(cx.types.get(cond.ty).kind, TypeKind::Error)
+            {
                 cx.emit(SemaDiagnostic::new(
                     SemaDiagnosticCode::TypeMismatch,
                     "do-while condition must have scalar type",
@@ -198,7 +206,9 @@ fn lower_stmt(cx: &mut SemaContext<'_>, stmt: &Stmt, labels: &mut LabelTracker) 
 
             let cond = cond.as_ref().map(|c| {
                 let lowered = expr::lower_expr(cx, c);
-                if !is_scalar(lowered.ty, &cx.types) {
+                if !is_scalar(lowered.ty, &cx.types)
+                    && !matches!(cx.types.get(lowered.ty).kind, TypeKind::Error)
+                {
                     cx.emit(SemaDiagnostic::new(
                         SemaDiagnosticCode::TypeMismatch,
                         "for condition must have scalar type",
@@ -239,12 +249,14 @@ fn lower_stmt(cx: &mut SemaContext<'_>, stmt: &Stmt, labels: &mut LabelTracker) 
                     ));
                 }
                 Some(expr) => {
-                    if !assignment_compatible_with_const(
-                        expr.ty,
-                        const_int_value(expr.const_value),
-                        return_ty,
-                        &cx.types,
-                    ) {
+                    if !matches!(cx.types.get(expr.ty).kind, TypeKind::Error)
+                        && !assignment_compatible_with_const(
+                            expr.ty,
+                            const_int_value(expr.const_value),
+                            return_ty,
+                            &cx.types,
+                        )
+                    {
                         cx.emit(SemaDiagnostic::new(
                             SemaDiagnosticCode::TypeMismatch,
                             "returned expression has incompatible type",

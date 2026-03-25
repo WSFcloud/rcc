@@ -405,12 +405,10 @@ pub fn assignment_compatible(from: TypeId, to: TypeId, arena: &TypeArena) -> boo
 /// - `to`: The destination type
 /// - `arena`: The type arena
 ///
-/// # Note
-///
-/// This is a simplified implementation. Full C99 assignment compatibility
-/// also requires checking:
-/// - Qualifier compatibility for pointers (`int*` -> `const int*` is OK)
-/// - `void*` compatibility (any pointer can be assigned to/from `void*`)
+/// Pointer assignment handling includes:
+/// - Qualifier directionality (`T* -> const T*` allowed, reverse rejected)
+/// - `void*` and object-pointer interoperability
+/// - Nested-pointer qualifier safety checks (rejecting the classic `T** -> const T**` hole)
 pub fn assignment_compatible_with_const(
     from: TypeId,
     from_integer_const: Option<i64>,
@@ -437,13 +435,47 @@ pub fn assignment_compatible_with_const(
         return true;
     }
 
-    // Pointer assignment (simplified: only checks pointee compatibility).
+    // Pointer assignment: qualifier-aware checks including `void*` and nested pointers.
     match (from_kind, to_kind) {
         (TypeKind::Pointer { pointee: from_p }, TypeKind::Pointer { pointee: to_p }) => {
-            types_compatible(*from_p, *to_p, arena)
+            pointer_assignment_compatible(*from_p, *to_p, arena, 0)
         }
         _ => false,
     }
+}
+
+/// Checks whether two pointer types are comparable with `==`/`!=` or relational operators.
+///
+/// - When `allow_void_object` is `true`, `void*` is considered compatible with any object pointer.
+/// - Qualifier differences are ignored for compatibility checking in comparisons.
+pub fn pointer_comparison_compatible(
+    lhs: TypeId,
+    rhs: TypeId,
+    arena: &TypeArena,
+    allow_void_object: bool,
+) -> bool {
+    let (
+        TypeKind::Pointer {
+            pointee: lhs_pointee,
+        },
+        TypeKind::Pointer {
+            pointee: rhs_pointee,
+        },
+    ) = (&arena.get(lhs).kind, &arena.get(rhs).kind)
+    else {
+        return false;
+    };
+
+    if types_compatible_ignoring_quals(*lhs_pointee, *rhs_pointee, arena) {
+        return true;
+    }
+
+    if !allow_void_object {
+        return false;
+    }
+
+    (is_void_type(*lhs_pointee, arena) && is_object_type(*rhs_pointee, arena))
+        || (is_void_type(*rhs_pointee, arena) && is_object_type(*lhs_pointee, arena))
 }
 
 /// Checks if a type is an integer type.
@@ -766,6 +798,133 @@ fn unsigned_variant_of(kind: &TypeKind) -> TypeKind {
     }
 }
 
+fn pointer_assignment_compatible(
+    from_pointee: TypeId,
+    to_pointee: TypeId,
+    arena: &TypeArena,
+    depth: usize,
+) -> bool {
+    let from_ty = arena.get(from_pointee);
+    let to_ty = arena.get(to_pointee);
+
+    if matches!(from_ty.kind, TypeKind::Error) || matches!(to_ty.kind, TypeKind::Error) {
+        return true;
+    }
+
+    // C99 6.3.2.3p1: `void*` can convert to/from any object pointer.
+    if (is_void_type(from_pointee, arena) && is_object_type(to_pointee, arena))
+        || (is_void_type(to_pointee, arena) && is_object_type(from_pointee, arena))
+    {
+        return qualifiers_contain(to_ty.quals, from_ty.quals);
+    }
+
+    // Base compatibility ignores qualifiers, then we enforce qualifier directionality.
+    if !types_compatible_ignoring_quals(from_pointee, to_pointee, arena) {
+        return false;
+    }
+
+    // LHS (destination) pointee qualifiers must include RHS qualifiers.
+    if !qualifiers_contain(to_ty.quals, from_ty.quals) {
+        return false;
+    }
+
+    // Prevent the classic `T** -> const T**` hole by requiring deep qualifier equality.
+    if depth > 0 && from_ty.quals != to_ty.quals {
+        return false;
+    }
+
+    match (&from_ty.kind, &to_ty.kind) {
+        (
+            TypeKind::Pointer {
+                pointee: from_inner,
+            },
+            TypeKind::Pointer { pointee: to_inner },
+        ) => pointer_assignment_compatible(*from_inner, *to_inner, arena, depth + 1),
+        _ => true,
+    }
+}
+
+fn qualifiers_contain(superset: Qualifiers, subset: Qualifiers) -> bool {
+    (!subset.is_const || superset.is_const)
+        && (!subset.is_volatile || superset.is_volatile)
+        && (!subset.is_restrict || superset.is_restrict)
+}
+
+fn is_void_type(ty: TypeId, arena: &TypeArena) -> bool {
+    matches!(arena.get(ty).kind, TypeKind::Void)
+}
+
+fn is_object_type(ty: TypeId, arena: &TypeArena) -> bool {
+    !matches!(
+        arena.get(ty).kind,
+        TypeKind::Void | TypeKind::Function(_) | TypeKind::Error
+    )
+}
+
+fn types_compatible_ignoring_quals(a: TypeId, b: TypeId, arena: &TypeArena) -> bool {
+    if a == b {
+        return true;
+    }
+
+    let lhs = arena.get(a);
+    let rhs = arena.get(b);
+
+    if matches!(lhs.kind, TypeKind::Error) || matches!(rhs.kind, TypeKind::Error) {
+        return true;
+    }
+
+    match (&lhs.kind, &rhs.kind) {
+        (TypeKind::Void, TypeKind::Void)
+        | (TypeKind::Bool, TypeKind::Bool)
+        | (TypeKind::Char, TypeKind::Char)
+        | (TypeKind::SignedChar, TypeKind::SignedChar)
+        | (TypeKind::UnsignedChar, TypeKind::UnsignedChar)
+        | (TypeKind::Float, TypeKind::Float)
+        | (TypeKind::Double, TypeKind::Double) => true,
+        (TypeKind::Short { signed: a }, TypeKind::Short { signed: b })
+        | (TypeKind::Int { signed: a }, TypeKind::Int { signed: b })
+        | (TypeKind::Long { signed: a }, TypeKind::Long { signed: b })
+        | (TypeKind::LongLong { signed: a }, TypeKind::LongLong { signed: b }) => a == b,
+        (TypeKind::Pointer { pointee: a }, TypeKind::Pointer { pointee: b }) => {
+            types_compatible_ignoring_quals(*a, *b, arena)
+        }
+        (TypeKind::Array { elem: ea, len: la }, TypeKind::Array { elem: eb, len: lb }) => {
+            if !types_compatible_ignoring_quals(*ea, *eb, arena) {
+                return false;
+            }
+            match (la, lb) {
+                (ArrayLen::Known(a), ArrayLen::Known(b)) => a == b,
+                (ArrayLen::Incomplete, ArrayLen::Known(_))
+                | (ArrayLen::Known(_), ArrayLen::Incomplete)
+                | (ArrayLen::Incomplete, ArrayLen::Incomplete) => true,
+                (ArrayLen::FlexibleMember, ArrayLen::FlexibleMember) => true,
+                _ => false,
+            }
+        }
+        (TypeKind::Function(a), TypeKind::Function(b)) => {
+            if !types_compatible_ignoring_quals(a.ret, b.ret, arena) {
+                return false;
+            }
+            match (&a.style, &b.style) {
+                (FunctionStyle::Prototype, FunctionStyle::Prototype) => {
+                    a.variadic == b.variadic
+                        && a.params.len() == b.params.len()
+                        && a.params
+                            .iter()
+                            .zip(&b.params)
+                            .all(|(lhs, rhs)| types_compatible_ignoring_quals(*lhs, *rhs, arena))
+                }
+                (FunctionStyle::NonPrototype, FunctionStyle::NonPrototype) => true,
+                (FunctionStyle::Prototype, FunctionStyle::NonPrototype)
+                | (FunctionStyle::NonPrototype, FunctionStyle::Prototype) => true,
+            }
+        }
+        (TypeKind::Record(a), TypeKind::Record(b)) => a == b,
+        (TypeKind::Enum(a), TypeKind::Enum(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// An enum definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumDef {
@@ -933,5 +1092,172 @@ mod tests {
 
         let plain = unqualified(const_int, &mut arena);
         assert_eq!(arena.get(plain).quals, Qualifiers::default());
+    }
+
+    #[test]
+    fn pointer_assignment_respects_qualifier_direction() {
+        let mut arena = TypeArena::new();
+        let int_ty = arena.intern(Type {
+            kind: TypeKind::Int { signed: true },
+            quals: Qualifiers::default(),
+        });
+        let const_int_ty = arena.intern(Type {
+            kind: TypeKind::Int { signed: true },
+            quals: Qualifiers {
+                is_const: true,
+                is_volatile: false,
+                is_restrict: false,
+            },
+        });
+        let int_ptr = arena.intern(Type {
+            kind: TypeKind::Pointer { pointee: int_ty },
+            quals: Qualifiers::default(),
+        });
+        let const_int_ptr = arena.intern(Type {
+            kind: TypeKind::Pointer {
+                pointee: const_int_ty,
+            },
+            quals: Qualifiers::default(),
+        });
+
+        assert!(assignment_compatible_with_const(
+            int_ptr,
+            None,
+            const_int_ptr,
+            &arena
+        ));
+        assert!(!assignment_compatible_with_const(
+            const_int_ptr,
+            None,
+            int_ptr,
+            &arena
+        ));
+    }
+
+    #[test]
+    fn pointer_assignment_rejects_const_hole_through_double_pointer() {
+        let mut arena = TypeArena::new();
+        let int_ty = arena.intern(Type {
+            kind: TypeKind::Int { signed: true },
+            quals: Qualifiers::default(),
+        });
+        let const_int_ty = arena.intern(Type {
+            kind: TypeKind::Int { signed: true },
+            quals: Qualifiers {
+                is_const: true,
+                is_volatile: false,
+                is_restrict: false,
+            },
+        });
+        let int_ptr = arena.intern(Type {
+            kind: TypeKind::Pointer { pointee: int_ty },
+            quals: Qualifiers::default(),
+        });
+        let const_int_ptr = arena.intern(Type {
+            kind: TypeKind::Pointer {
+                pointee: const_int_ty,
+            },
+            quals: Qualifiers::default(),
+        });
+        let int_ptr_ptr = arena.intern(Type {
+            kind: TypeKind::Pointer { pointee: int_ptr },
+            quals: Qualifiers::default(),
+        });
+        let const_int_ptr_ptr = arena.intern(Type {
+            kind: TypeKind::Pointer {
+                pointee: const_int_ptr,
+            },
+            quals: Qualifiers::default(),
+        });
+
+        assert!(!assignment_compatible_with_const(
+            int_ptr_ptr,
+            None,
+            const_int_ptr_ptr,
+            &arena
+        ));
+    }
+
+    #[test]
+    fn pointer_assignment_allows_void_ptr_object_roundtrip() {
+        let mut arena = TypeArena::new();
+        let int_ty = arena.intern(Type {
+            kind: TypeKind::Int { signed: true },
+            quals: Qualifiers::default(),
+        });
+        let void_ty = arena.intern(Type {
+            kind: TypeKind::Void,
+            quals: Qualifiers::default(),
+        });
+        let int_ptr = arena.intern(Type {
+            kind: TypeKind::Pointer { pointee: int_ty },
+            quals: Qualifiers::default(),
+        });
+        let void_ptr = arena.intern(Type {
+            kind: TypeKind::Pointer { pointee: void_ty },
+            quals: Qualifiers::default(),
+        });
+
+        assert!(assignment_compatible_with_const(
+            int_ptr, None, void_ptr, &arena
+        ));
+        assert!(assignment_compatible_with_const(
+            void_ptr, None, int_ptr, &arena
+        ));
+    }
+
+    #[test]
+    fn pointer_comparison_ignores_qualifier_differences() {
+        let mut arena = TypeArena::new();
+        let int_ty = arena.intern(Type {
+            kind: TypeKind::Int { signed: true },
+            quals: Qualifiers::default(),
+        });
+        let const_int_ty = arena.intern(Type {
+            kind: TypeKind::Int { signed: true },
+            quals: Qualifiers {
+                is_const: true,
+                is_volatile: false,
+                is_restrict: false,
+            },
+        });
+        let int_ptr = arena.intern(Type {
+            kind: TypeKind::Pointer { pointee: int_ty },
+            quals: Qualifiers::default(),
+        });
+        let const_int_ptr = arena.intern(Type {
+            kind: TypeKind::Pointer {
+                pointee: const_int_ty,
+            },
+            quals: Qualifiers::default(),
+        });
+
+        assert!(pointer_comparison_compatible(
+            int_ptr,
+            const_int_ptr,
+            &arena,
+            false
+        ));
+    }
+
+    #[test]
+    fn char_signed_char_unsigned_char_are_pairwise_incompatible() {
+        let mut arena = TypeArena::new();
+        let char_ty = arena.intern(Type {
+            kind: TypeKind::Char,
+            quals: Qualifiers::default(),
+        });
+        let schar_ty = arena.intern(Type {
+            kind: TypeKind::SignedChar,
+            quals: Qualifiers::default(),
+        });
+        let uchar_ty = arena.intern(Type {
+            kind: TypeKind::UnsignedChar,
+            quals: Qualifiers::default(),
+        });
+
+        assert!(!types_compatible(char_ty, schar_ty, &arena));
+        assert!(!types_compatible(char_ty, uchar_ty, &arena));
+        assert!(!types_compatible(schar_ty, uchar_ty, &arena));
     }
 }

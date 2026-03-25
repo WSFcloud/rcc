@@ -40,6 +40,14 @@ pub enum SemaDiagnosticCode {
     UnsupportedVmType,
     /// K&R-style function definitions are not supported.
     UnsupportedKnrDefinition,
+    /// Bit-field declarations are not supported in V1.
+    UnsupportedBitField,
+    /// `_Complex` types are not supported in V1.
+    UnsupportedComplexType,
+    /// `_Atomic` types are not supported in V1.
+    UnsupportedAtomicType,
+    /// Multi-character character constants are not supported in V1.
+    UnsupportedMultiCharConstant,
     /// Non-constant expression in a context requiring a constant.
     NonConstantInRequiredContext,
     /// Division or modulo by zero in a constant expression.

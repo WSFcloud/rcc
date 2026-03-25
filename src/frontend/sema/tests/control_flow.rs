@@ -97,3 +97,23 @@ fn reports_duplicate_case_after_switch_type_conversion() {
     let diagnostics = analyze_source(src).expect_err("sema should fail");
     assert_has_code(&diagnostics, SemaDiagnosticCode::RedeclarationConflict);
 }
+
+#[test]
+fn suppresses_cascaded_type_mismatch_after_undefined_symbol() {
+    let src = "int main(void) { return missing_value + 1; }";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    let undefined_count = diagnostics
+        .iter()
+        .filter(|diag| diag.code == SemaDiagnosticCode::UndefinedSymbol)
+        .count();
+    let mismatch_count = diagnostics
+        .iter()
+        .filter(|diag| diag.code == SemaDiagnosticCode::TypeMismatch)
+        .count();
+
+    assert_eq!(
+        undefined_count, 1,
+        "unexpected diagnostics: {diagnostics:?}"
+    );
+    assert_eq!(mismatch_count, 0, "unexpected diagnostics: {diagnostics:?}");
+}

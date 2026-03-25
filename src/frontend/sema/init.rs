@@ -1,5 +1,3 @@
-use chumsky::prelude::todo;
-
 use crate::common::span::SourceSpan;
 use crate::frontend::parser::ast::{
     Designator, DesignatorKind, ExprKind, Initializer, InitializerItem, InitializerKind, Literal,
@@ -13,7 +11,7 @@ use crate::frontend::sema::typed_ast::{
     ConstValue, TypedExpr, TypedExprKind, TypedInitItem, TypedInitializer, ValueCategory,
 };
 use crate::frontend::sema::types::{
-    ArrayLen, FieldId, Type, TypeId, TypeKind, assignment_compatible_with_const,
+    ArrayLen, FieldId, Type, TypeId, TypeKind, assignment_compatible_with_const, types_compatible,
 };
 
 /// An element in the initialization path.
@@ -420,6 +418,7 @@ fn lower_array_from_items(
         ArrayLen::Incomplete => None,
         ArrayLen::FlexibleMember => None,
     };
+    let mut effective_elem_ty = elem_ty;
 
     let mut slots: std::collections::BTreeMap<usize, (TypedInitializer, SourceSpan)> =
         std::collections::BTreeMap::new();
@@ -427,7 +426,7 @@ fn lower_array_from_items(
     let mut cursor = InitCursor {
         object_ty: target_ty,
         path: Vec::new(),
-        current_subobject_ty: elem_ty,
+        current_subobject_ty: effective_elem_ty,
         next_implicit_index: 0,
     };
     let mut consumed = 0usize;
@@ -476,19 +475,35 @@ fn lower_array_from_items(
             continue;
         }
 
-        let (child_init, child_ty, used) = if is_aggregate_type(cx, elem_ty)
+        let (child_init, child_ty, used) = if is_aggregate_type(cx, effective_elem_ty)
             && !matches!(item.init.kind, InitializerKind::Aggregate(_))
         {
-            let lowered = lower_subobject_from_items(cx, elem_ty, &items[consumed..], true);
+            let lowered =
+                lower_subobject_from_items(cx, effective_elem_ty, &items[consumed..], true);
             (lowered.init, lowered.resulting_ty, lowered.consumed.max(1))
         } else {
-            let lowered = lower_initializer(cx, elem_ty, &item.init);
+            let lowered = lower_initializer(cx, effective_elem_ty, &item.init);
             (lowered.init, lowered.resulting_ty, 1)
         };
 
-        if child_ty != elem_ty {
-            // Nested incomplete-array inference in array elements is not modeled.
-            todo!("need implement");
+        if child_ty != effective_elem_ty {
+            if let Some(refined) =
+                refine_incomplete_array_element_type(cx, effective_elem_ty, child_ty)
+            {
+                effective_elem_ty = refined;
+                cursor.current_subobject_ty = refined;
+            } else if !types_compatible(child_ty, effective_elem_ty, &cx.types) {
+                cx.emit(
+                    SemaDiagnostic::new(
+                        SemaDiagnosticCode::InvalidInitializer,
+                        "initializer element type is incompatible with array element type",
+                        item.span,
+                    )
+                    .with_note(
+                        "nested array length inference only applies to incomplete array elements",
+                    ),
+                );
+            }
         }
 
         slots.insert(target_index, (child_init, item.span));
@@ -504,10 +519,10 @@ fn lower_array_from_items(
         None => max_index_seen,
     };
 
-    let resulting_ty = if fixed_len.is_none() {
+    let resulting_ty = if fixed_len.is_none() || effective_elem_ty != elem_ty {
         cx.types.intern(Type {
             kind: TypeKind::Array {
-                elem: elem_ty,
+                elem: effective_elem_ty,
                 len: ArrayLen::Known(final_len as u64),
             },
             quals: cx.types.get(target_ty).quals,
@@ -524,12 +539,12 @@ fn lower_array_from_items(
             .map(|(idx, (init, span))| (idx, TypedInitItem { init, span }))
             .collect();
         TypedInitializer::SparseArray {
-            elem_ty,
+            elem_ty: effective_elem_ty,
             total_len: final_len,
             entries,
         }
     } else {
-        build_aggregate_initializer_from_slots_map(slots, final_len, elem_ty)
+        build_aggregate_initializer_from_slots_map(slots, final_len, effective_elem_ty)
     };
 
     AggregateLowering {
@@ -996,4 +1011,31 @@ fn is_char_pointer_type(cx: &SemaContext<'_>, ty: TypeId) -> bool {
         cx.types.get(pointee).kind,
         TypeKind::Char | TypeKind::SignedChar | TypeKind::UnsignedChar
     )
+}
+
+fn refine_incomplete_array_element_type(
+    cx: &SemaContext<'_>,
+    current_elem_ty: TypeId,
+    candidate_ty: TypeId,
+) -> Option<TypeId> {
+    let TypeKind::Array {
+        elem: current_inner,
+        len: ArrayLen::Incomplete,
+    } = cx.types.get(current_elem_ty).kind
+    else {
+        return None;
+    };
+    let TypeKind::Array {
+        elem: candidate_inner,
+        len: ArrayLen::Known(_),
+    } = cx.types.get(candidate_ty).kind
+    else {
+        return None;
+    };
+
+    if types_compatible(current_inner, candidate_inner, &cx.types) {
+        Some(candidate_ty)
+    } else {
+        None
+    }
 }

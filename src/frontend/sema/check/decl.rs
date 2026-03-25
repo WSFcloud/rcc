@@ -1,9 +1,9 @@
 use crate::common::span::SourceSpan;
 use crate::frontend::parser::ast::{
     ArraySize, DeclSpec, Declaration, Declarator, DirectDeclarator, DirectDeclaratorKind,
-    EnumSpecifier, ExternalDecl, FunctionDef, FunctionParams, ParameterDecl, Pointer, RecordKind,
-    RecordMemberDecl, RecordSpecifier, StorageClass, TranslationUnit, TypeName, TypeQualifier,
-    TypeSpecifier,
+    EnumSpecifier, ExternalDecl, FunctionDef, FunctionParams, FunctionSpecifier, ParameterDecl,
+    Pointer, RecordKind, RecordMemberDecl, RecordSpecifier, StorageClass, TranslationUnit,
+    TypeName, TypeQualifier, TypeSpecifier,
 };
 use crate::frontend::sema::context::SemaContext;
 use crate::frontend::sema::diagnostic::{SemaDiagnostic, SemaDiagnosticCode};
@@ -193,6 +193,10 @@ pub fn lower_local_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) -> 
         }
     };
     let is_typedef = decl.specifiers.storage.contains(&StorageClass::Typedef);
+    let has_inline = decl
+        .specifiers
+        .function
+        .contains(&FunctionSpecifier::Inline);
 
     // Handle declarations without declarators (e.g., block-scope tag declarations).
     if decl.declarators.is_empty() {
@@ -203,6 +207,16 @@ pub fn lower_local_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) -> 
                 span,
             ));
         }
+        if has_inline {
+            cx.emit(
+                SemaDiagnostic::new(
+                    SemaDiagnosticCode::TypeMismatch,
+                    "'inline' can only be applied to function declarations",
+                    span,
+                )
+                .with_note("remove 'inline' or declare at least one function declarator"),
+            );
+        }
         let _ = resolve_base_type(cx, &decl.specifiers, span, false);
         return TypedDeclaration {
             symbols,
@@ -212,6 +226,17 @@ pub fn lower_local_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) -> 
     }
 
     let base_ty = resolve_base_type(cx, &decl.specifiers, span, false);
+
+    if is_typedef && has_inline {
+        cx.emit(
+            SemaDiagnostic::new(
+                SemaDiagnosticCode::TypeMismatch,
+                "'inline' cannot be combined with 'typedef'",
+                span,
+            )
+            .with_note("only function declarations/definitions may use 'inline'"),
+        );
+    }
 
     for init_decl in &decl.declarators {
         let Some(name) = declarator_ident(&init_decl.declarator) else {
@@ -308,6 +333,7 @@ pub fn lower_local_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) -> 
         } else {
             SymbolKind::Object
         };
+        enforce_inline_function_only(cx, has_inline, kind, init_decl.declarator.direct.span);
 
         if kind == SymbolKind::Object
             && storage != Some(StorageClass::Extern)
@@ -479,6 +505,10 @@ fn declare_file_scope_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) 
     };
 
     let is_typedef = decl.specifiers.storage.contains(&StorageClass::Typedef);
+    let has_inline = decl
+        .specifiers
+        .function
+        .contains(&FunctionSpecifier::Inline);
 
     // Handle declarations without declarators (e.g., `struct S {};` or `enum E { A };`).
     if decl.declarators.is_empty() {
@@ -490,6 +520,16 @@ fn declare_file_scope_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) 
             ));
             return;
         }
+        if has_inline {
+            cx.emit(
+                SemaDiagnostic::new(
+                    SemaDiagnosticCode::TypeMismatch,
+                    "'inline' can only be applied to function declarations",
+                    declaration_span(decl),
+                )
+                .with_note("remove 'inline' or declare at least one function declarator"),
+            );
+        }
         // Trigger type resolution to register tags.
         let _ = resolve_base_type(cx, &decl.specifiers, declaration_span(decl), false);
         return;
@@ -497,6 +537,17 @@ fn declare_file_scope_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) 
 
     // Resolve base type once to avoid re-entering struct/enum definitions.
     let base_ty = resolve_base_type(cx, &decl.specifiers, declaration_span(decl), true);
+
+    if is_typedef && has_inline {
+        cx.emit(
+            SemaDiagnostic::new(
+                SemaDiagnosticCode::TypeMismatch,
+                "'inline' cannot be combined with 'typedef'",
+                declaration_span(decl),
+            )
+            .with_note("only function declarations/definitions may use 'inline'"),
+        );
+    }
 
     for init_decl in &decl.declarators {
         let Some(name) = declarator_ident(&init_decl.declarator) else {
@@ -566,6 +617,7 @@ fn declare_file_scope_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) 
         } else {
             SymbolKind::Object
         };
+        enforce_inline_function_only(cx, has_inline, kind, init_decl.declarator.direct.span);
 
         let existing_id = cx.lookup_ordinary(name);
         let linkage = match infer_linkage(
@@ -1780,4 +1832,24 @@ fn linkage_error_to_diag(err: LinkageError, span: SourceSpan) -> SemaDiagnostic 
             span,
         ),
     }
+}
+
+fn enforce_inline_function_only(
+    cx: &mut SemaContext<'_>,
+    has_inline: bool,
+    kind: SymbolKind,
+    span: SourceSpan,
+) {
+    if !has_inline || kind == SymbolKind::Function {
+        return;
+    }
+
+    cx.emit(
+        SemaDiagnostic::new(
+            SemaDiagnosticCode::TypeMismatch,
+            "'inline' can only be applied to function declarations",
+            span,
+        )
+        .with_note("for objects, remove 'inline'; for functions, use a function declarator"),
+    );
 }

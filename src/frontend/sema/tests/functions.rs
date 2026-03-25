@@ -132,3 +132,52 @@ fn comma_expression_preserves_array_decay_in_subscript_context() {
     let result = analyze_source(src);
     assert!(result.is_ok(), "unexpected diagnostics: {result:?}");
 }
+
+#[test]
+fn allows_register_storage_in_block_scope() {
+    let src = "int main(void) { register int x = 1; return x; }";
+    let result = analyze_source(src);
+    assert!(result.is_ok(), "unexpected diagnostics: {result:?}");
+}
+
+#[test]
+fn allows_void_pointer_object_pointer_roundtrip_assignment() {
+    let src = r#"
+        int main(void) {
+            int value = 0;
+            int *p = &value;
+            void *vp = p;
+            p = vp;
+            return *p;
+        }
+    "#;
+    let result = analyze_source(src);
+    assert!(result.is_ok(), "unexpected diagnostics: {result:?}");
+}
+
+#[test]
+fn rejects_dropping_pointee_const_qualification() {
+    let src = r#"
+        int main(void) {
+            const int *cp = 0;
+            int *p = cp;
+            return 0;
+        }
+    "#;
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::TypeMismatch);
+}
+
+#[test]
+fn rejects_double_pointer_const_hole_assignment() {
+    let src = r#"
+        int main(void) {
+            int **pp = 0;
+            const int **cpp = 0;
+            cpp = pp;
+            return 0;
+        }
+    "#;
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::TypeMismatch);
+}

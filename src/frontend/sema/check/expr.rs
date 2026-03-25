@@ -14,8 +14,8 @@ use crate::frontend::sema::typed_ast::{
 };
 use crate::frontend::sema::types::{
     ArrayLen, FunctionStyle, Qualifiers, Type, TypeId, TypeKind, assignment_compatible_with_const,
-    integer_promotion, is_arithmetic, is_integer, is_scalar, type_size_of, types_compatible,
-    unqualified, usual_arithmetic_conversions,
+    integer_promotion, is_arithmetic, is_integer, is_scalar, pointer_comparison_compatible,
+    type_size_of, types_compatible, unqualified, usual_arithmetic_conversions,
 };
 
 #[derive(Clone, Copy)]
@@ -110,6 +110,9 @@ fn lower_unary_expr(
     span: SourceSpan,
 ) -> TypedExpr {
     let raw = lower_expr(cx, inner);
+    if is_error_type(cx, raw.ty) {
+        return TypedExpr::opaque(span, cx.error_type());
+    }
     match op {
         AstUnaryOp::Plus => {
             let operand = apply_standard_conversions(cx, raw, ConversionOptions::STANDARD);
@@ -276,6 +279,9 @@ fn lower_inc_dec_expr(
     span: SourceSpan,
 ) -> TypedExpr {
     let operand = lower_expr(cx, inner);
+    if is_error_type(cx, operand.ty) {
+        return TypedExpr::opaque(span, cx.error_type());
+    }
     if !is_modifiable_lvalue(cx, &operand) {
         return emit_type_mismatch(cx, span, "increment/decrement requires a modifiable lvalue");
     }
@@ -320,6 +326,9 @@ fn lower_binary_expr(
 ) -> TypedExpr {
     let mut left = lower_and_convert(cx, left_ast, ConversionOptions::STANDARD);
     let mut right = lower_and_convert(cx, right_ast, ConversionOptions::STANDARD);
+    if is_error_type(cx, left.ty) || is_error_type(cx, right.ty) {
+        return TypedExpr::opaque(span, cx.error_type());
+    }
 
     let (typed_op, result_ty) = match op {
         AstBinaryOp::Mul | AstBinaryOp::Div | AstBinaryOp::Mod => {
@@ -368,13 +377,7 @@ fn lower_binary_expr(
             } else if is_pointer_type(cx, left.ty) && is_integer(&cx.types.get(right.ty).kind) {
                 (BinaryOp::Sub, left.ty)
             } else if is_pointer_type(cx, left.ty) && is_pointer_type(cx, right.ty) {
-                let Some(lp) = pointee_of_pointer(cx, left.ty) else {
-                    return emit_type_mismatch(cx, span, "invalid pointer subtraction");
-                };
-                let Some(rp) = pointee_of_pointer(cx, right.ty) else {
-                    return emit_type_mismatch(cx, span, "invalid pointer subtraction");
-                };
-                if !types_compatible(lp, rp, &cx.types) {
+                if !pointer_comparison_compatible(left.ty, right.ty, &cx.types, false) {
                     return emit_type_mismatch(
                         cx,
                         span,
@@ -422,13 +425,12 @@ fn lower_binary_expr(
                 left = cast_if_needed(left, common);
                 right = cast_if_needed(right, common);
             } else if is_pointer_type(cx, left.ty) && is_pointer_type(cx, right.ty) {
-                let compatible = if matches!(op, AstBinaryOp::Eq | AstBinaryOp::Ne) {
-                    types_compatible(left.ty, right.ty, &cx.types)
-                        || is_void_pointer_type(cx, left.ty)
-                        || is_void_pointer_type(cx, right.ty)
-                } else {
-                    types_compatible(left.ty, right.ty, &cx.types)
-                };
+                let compatible = pointer_comparison_compatible(
+                    left.ty,
+                    right.ty,
+                    &cx.types,
+                    matches!(op, AstBinaryOp::Eq | AstBinaryOp::Ne),
+                );
                 if !compatible {
                     return emit_type_mismatch(
                         cx,
@@ -483,6 +485,9 @@ fn lower_assign_expr(
 ) -> TypedExpr {
     let lhs = lower_expr(cx, left_ast);
     let lhs_ty = lhs.ty;
+    if is_error_type(cx, lhs_ty) {
+        return TypedExpr::opaque(span, cx.error_type());
+    }
     if !is_modifiable_lvalue(cx, &lhs) {
         return emit_type_mismatch(
             cx,
@@ -492,6 +497,9 @@ fn lower_assign_expr(
     }
 
     let mut rhs = lower_and_convert(cx, right_ast, ConversionOptions::STANDARD);
+    if is_error_type(cx, rhs.ty) {
+        return TypedExpr::opaque(span, cx.error_type());
+    }
 
     if matches!(op, AstAssignOp::Assign) {
         let rhs_const_int = const_int_value(rhs.const_value);
@@ -619,12 +627,18 @@ fn lower_conditional_expr(
     span: SourceSpan,
 ) -> TypedExpr {
     let cond = lower_and_convert(cx, cond_ast, ConversionOptions::STANDARD);
+    if is_error_type(cx, cond.ty) {
+        return TypedExpr::opaque(span, cx.error_type());
+    }
     if !is_scalar(cond.ty, &cx.types) {
         return emit_type_mismatch(cx, span, "conditional expression requires scalar condition");
     }
 
     let mut then_expr = lower_and_convert(cx, then_ast, ConversionOptions::STANDARD);
     let mut else_expr = lower_and_convert(cx, else_ast, ConversionOptions::STANDARD);
+    if is_error_type(cx, then_expr.ty) || is_error_type(cx, else_expr.ty) {
+        return TypedExpr::opaque(span, cx.error_type());
+    }
 
     let result_ty = if is_arithmetic_type(cx, then_expr.ty) && is_arithmetic_type(cx, else_expr.ty)
     {
@@ -635,16 +649,18 @@ fn lower_conditional_expr(
     } else if types_compatible(then_expr.ty, else_expr.ty, &cx.types) {
         then_expr.ty
     } else if is_pointer_type(cx, then_expr.ty) && is_pointer_type(cx, else_expr.ty) {
-        if is_void_pointer_type(cx, then_expr.ty) {
-            then_expr.ty
-        } else if is_void_pointer_type(cx, else_expr.ty) {
-            else_expr.ty
-        } else {
+        if !pointer_comparison_compatible(then_expr.ty, else_expr.ty, &cx.types, true) {
             return emit_type_mismatch(
                 cx,
                 span,
                 "conditional pointer operands must have compatible pointee types",
             );
+        }
+
+        if assignment_compatible_with_const(then_expr.ty, None, else_expr.ty, &cx.types) {
+            else_expr.ty
+        } else {
+            then_expr.ty
         }
     } else if is_pointer_type(cx, then_expr.ty) && is_null_pointer_constant(&else_expr) {
         then_expr.ty
@@ -679,6 +695,9 @@ fn lower_call_expr(
 ) -> TypedExpr {
     let callee_raw = lower_expr(cx, callee_ast);
     let callee = apply_standard_conversions(cx, callee_raw, ConversionOptions::STANDARD);
+    if is_error_type(cx, callee.ty) {
+        return TypedExpr::opaque(span, cx.error_type());
+    }
 
     let function_ty = match &cx.types.get(callee.ty).kind {
         TypeKind::Function(func) => func.clone(),
@@ -733,6 +752,9 @@ fn lower_call_expr(
             if idx >= args.len() {
                 break;
             }
+            if is_error_type(cx, args[idx].ty) {
+                continue;
+            }
             let arg_const = const_int_value(args[idx].const_value);
             if !assignment_compatible_with_const(args[idx].ty, arg_const, param_ty, &cx.types) {
                 cx.emit(SemaDiagnostic::new(
@@ -778,6 +800,9 @@ fn lower_member_expr(
     span: SourceSpan,
 ) -> TypedExpr {
     let base = lower_expr(cx, base_ast);
+    if is_error_type(cx, base.ty) {
+        return TypedExpr::opaque(span, cx.error_type());
+    }
 
     let (record_id, base_expr, base_is_lvalue) = if deref {
         let base_converted = apply_standard_conversions(cx, base, ConversionOptions::STANDARD);
@@ -845,6 +870,9 @@ fn lower_index_expr(
 ) -> TypedExpr {
     let base = lower_and_convert(cx, base_ast, ConversionOptions::STANDARD);
     let index = lower_and_convert(cx, index_ast, ConversionOptions::STANDARD);
+    if is_error_type(cx, base.ty) || is_error_type(cx, index.ty) {
+        return TypedExpr::opaque(span, cx.error_type());
+    }
 
     let pointee = if let Some(pointee) = pointee_of_pointer(cx, base.ty) {
         if !is_integer(&cx.types.get(index.ty).kind) {
@@ -908,6 +936,9 @@ fn lower_cast_expr(
 ) -> TypedExpr {
     let to = decl::build_type_from_type_name(cx, ty_name, span);
     let expr = lower_and_convert(cx, inner, ConversionOptions::STANDARD);
+    if is_error_type(cx, to) || is_error_type(cx, expr.ty) {
+        return TypedExpr::opaque(span, cx.error_type());
+    }
 
     if !is_valid_cast(cx, expr.ty, to) {
         cx.emit(SemaDiagnostic::new(
@@ -1184,6 +1215,9 @@ fn lower_sizeof_type_expr(
 /// operand, matching C semantics.
 fn lower_sizeof_expr(cx: &mut SemaContext<'_>, inner: &Expr, span: SourceSpan) -> TypedExpr {
     let operand = lower_and_convert(cx, inner, ConversionOptions::SIZEOF_OPERAND);
+    if is_error_type(cx, operand.ty) {
+        return TypedExpr::opaque(span, cx.error_type());
+    }
     lower_sizeof_ty(cx, operand.ty, span)
 }
 
@@ -1538,12 +1572,8 @@ fn is_arithmetic_type(cx: &SemaContext<'_>, ty: TypeId) -> bool {
     is_arithmetic(&cx.types.get(ty).kind)
 }
 
-/// Returns true when `ty` is `void*` (ignoring top-level qualifiers).
-fn is_void_pointer_type(cx: &SemaContext<'_>, ty: TypeId) -> bool {
-    match cx.types.get(ty).kind {
-        TypeKind::Pointer { pointee } => matches!(cx.types.get(pointee).kind, TypeKind::Void),
-        _ => false,
-    }
+fn is_error_type(cx: &SemaContext<'_>, ty: TypeId) -> bool {
+    matches!(cx.types.get(ty).kind, TypeKind::Error)
 }
 
 /// Returns true when the typed expression is an integer zero constant.
