@@ -14,7 +14,7 @@ use crate::frontend::sema::typed_ast::{
 };
 use crate::frontend::sema::types::{
     ArrayLen, FunctionStyle, Qualifiers, Type, TypeId, TypeKind, assignment_compatible_with_const,
-    integer_promotion, is_arithmetic, is_integer, is_scalar, is_void_pointer,
+    composite_type, integer_promotion, is_arithmetic, is_integer, is_scalar, is_void_pointer,
     pointer_comparison_compatible, type_size_of, types_compatible, unqualified,
     usual_arithmetic_conversions,
 };
@@ -627,7 +627,7 @@ fn lower_assign_expr(
             lhs: Box::new(lhs),
             rhs: Box::new(rhs),
         },
-        ty: lhs_rvalue.ty,
+        ty: lhs_ty,
         value_category: ValueCategory::RValue,
         const_value: None,
         span,
@@ -657,32 +657,40 @@ fn lower_conditional_expr(
         return TypedExpr::opaque(span, cx.error_type());
     }
 
-    let result_ty = if is_arithmetic_type(cx, then_expr.ty) && is_arithmetic_type(cx, else_expr.ty)
-    {
+    let then_is_void = matches!(cx.types.get(then_expr.ty).kind, TypeKind::Void);
+    let else_is_void = matches!(cx.types.get(else_expr.ty).kind, TypeKind::Void);
+
+    let result_ty = if then_is_void || else_is_void {
+        if then_is_void && else_is_void {
+            then_expr.ty
+        } else {
+            return emit_type_mismatch(
+                cx,
+                span,
+                "conditional expression requires both branches to be void or non-void",
+            );
+        }
+    } else if is_arithmetic_type(cx, then_expr.ty) && is_arithmetic_type(cx, else_expr.ty) {
         let common = usual_arithmetic_conversions(then_expr.ty, else_expr.ty, &mut cx.types);
         then_expr = cast_if_needed(then_expr, common);
         else_expr = cast_if_needed(else_expr, common);
         common
-    } else if types_compatible(then_expr.ty, else_expr.ty, &cx.types) {
-        then_expr.ty
     } else if is_pointer_type(cx, then_expr.ty) && is_pointer_type(cx, else_expr.ty) {
-        if !pointer_comparison_compatible(then_expr.ty, else_expr.ty, &cx.types, true) {
+        let Some(merged_ptr_ty) = conditional_pointer_result_type(cx, then_expr.ty, else_expr.ty)
+        else {
             return emit_type_mismatch(
                 cx,
                 span,
                 "conditional pointer operands must have compatible pointee types",
             );
-        }
-
-        if assignment_compatible_with_const(then_expr.ty, None, else_expr.ty, &cx.types) {
-            else_expr.ty
-        } else {
-            then_expr.ty
-        }
+        };
+        merged_ptr_ty
     } else if is_pointer_type(cx, then_expr.ty) && is_null_pointer_constant(&else_expr) {
         then_expr.ty
     } else if is_pointer_type(cx, else_expr.ty) && is_null_pointer_constant(&then_expr) {
         else_expr.ty
+    } else if types_compatible(then_expr.ty, else_expr.ty, &cx.types) {
+        composite_type(then_expr.ty, else_expr.ty, &mut cx.types).unwrap_or(then_expr.ty)
     } else {
         return emit_type_mismatch(cx, span, "conditional branches have incompatible types");
     };
@@ -1614,6 +1622,55 @@ fn is_function_pointer_type(cx: &SemaContext<'_>, ty: TypeId) -> bool {
     matches!(cx.types.get(pointee).kind, TypeKind::Function(_))
 }
 
+fn conditional_pointer_result_type(
+    cx: &mut SemaContext<'_>,
+    lhs_ptr: TypeId,
+    rhs_ptr: TypeId,
+) -> Option<TypeId> {
+    if !pointer_comparison_compatible(lhs_ptr, rhs_ptr, &cx.types, true) {
+        return None;
+    }
+
+    let lhs_pointee = pointee_of_pointer(cx, lhs_ptr)?;
+    let rhs_pointee = pointee_of_pointer(cx, rhs_ptr)?;
+    let lhs_unqual = unqualified(lhs_pointee, &mut cx.types);
+    let rhs_unqual = unqualified(rhs_pointee, &mut cx.types);
+
+    let base_pointee = composite_type(lhs_unqual, rhs_unqual, &mut cx.types).or_else(|| {
+        if matches!(cx.types.get(lhs_unqual).kind, TypeKind::Void) {
+            Some(lhs_unqual)
+        } else if matches!(cx.types.get(rhs_unqual).kind, TypeKind::Void) {
+            Some(rhs_unqual)
+        } else {
+            None
+        }
+    })?;
+
+    let merged_pointee_quals = merge_qualifiers(
+        cx.types.get(lhs_pointee).quals,
+        cx.types.get(rhs_pointee).quals,
+    );
+    let mut pointee_ty = cx.types.get(base_pointee).clone();
+    pointee_ty.quals = merge_qualifiers(pointee_ty.quals, merged_pointee_quals);
+    let merged_pointee = cx.types.intern(pointee_ty);
+
+    let pointer_quals = merge_qualifiers(cx.types.get(lhs_ptr).quals, cx.types.get(rhs_ptr).quals);
+    Some(cx.types.intern(Type {
+        kind: TypeKind::Pointer {
+            pointee: merged_pointee,
+        },
+        quals: pointer_quals,
+    }))
+}
+
+fn merge_qualifiers(lhs: Qualifiers, rhs: Qualifiers) -> Qualifiers {
+    Qualifiers {
+        is_const: lhs.is_const || rhs.is_const,
+        is_volatile: lhs.is_volatile || rhs.is_volatile,
+        is_restrict: lhs.is_restrict || rhs.is_restrict,
+    }
+}
+
 /// Returns true when `ty` is arithmetic.
 fn is_arithmetic_type(cx: &SemaContext<'_>, ty: TypeId) -> bool {
     is_arithmetic(&cx.types.get(ty).kind)
@@ -2012,6 +2069,135 @@ mod tests {
                 .any(|d| d.code == SemaDiagnosticCode::TypeMismatch),
             "did not expect TypeMismatch diagnostics, got: {diags:?}"
         );
+    }
+
+    #[test]
+    fn compound_assignment_expression_type_is_lhs_type() {
+        let mut cx = new_cx();
+        let char_ty = cx.types.intern(Type {
+            kind: TypeKind::Char,
+            quals: Qualifiers::default(),
+        });
+        bind_symbol(&mut cx, "c", char_ty);
+
+        let expr = Expr::assign(
+            Expr::var_with_span("c".to_string(), SourceSpan::dummy()),
+            AstAssignOp::AddAssign,
+            Expr::int_with_span(1, SourceSpan::dummy()),
+        );
+        let typed = lower_expr(&mut cx, &expr);
+        assert_eq!(typed.ty, char_ty);
+    }
+
+    #[test]
+    fn conditional_void_branches_result_in_void_type() {
+        let mut cx = new_cx();
+        let int_ty = int_ty(&mut cx);
+        let void_ty = cx.types.intern(Type {
+            kind: TypeKind::Void,
+            quals: Qualifiers::default(),
+        });
+        bind_symbol(&mut cx, "cond", int_ty);
+
+        let void_fn_ty = cx.types.intern(Type {
+            kind: TypeKind::Function(FunctionType {
+                ret: void_ty,
+                params: Vec::new(),
+                variadic: false,
+                style: FunctionStyle::Prototype,
+            }),
+            quals: Qualifiers::default(),
+        });
+
+        let f_sym = Symbol::new(
+            "f".to_string(),
+            SymbolKind::Function,
+            void_fn_ty,
+            Linkage::External,
+            DefinitionStatus::Declared,
+            SourceSpan::dummy(),
+        );
+        let g_sym = Symbol::new(
+            "g".to_string(),
+            SymbolKind::Function,
+            void_fn_ty,
+            Linkage::External,
+            DefinitionStatus::Declared,
+            SourceSpan::dummy(),
+        );
+        let f_id = cx.insert_symbol(f_sym);
+        let g_id = cx.insert_symbol(g_sym);
+        let _ = cx.insert_ordinary("f".to_string(), f_id);
+        let _ = cx.insert_ordinary("g".to_string(), g_id);
+
+        let expr = Expr::conditional(
+            Expr::var_with_span("cond".to_string(), SourceSpan::dummy()),
+            Expr::call(
+                Expr::var_with_span("f".to_string(), SourceSpan::dummy()),
+                Vec::new(),
+            ),
+            Expr::call(
+                Expr::var_with_span("g".to_string(), SourceSpan::dummy()),
+                Vec::new(),
+            ),
+        );
+        let typed = lower_expr(&mut cx, &expr);
+        assert!(matches!(cx.types.get(typed.ty).kind, TypeKind::Void));
+    }
+
+    #[test]
+    fn conditional_pointer_result_merges_pointee_qualifiers() {
+        let mut cx = new_cx();
+        let int_ty = int_ty(&mut cx);
+        let const_int_ty = cx.types.intern(Type {
+            kind: TypeKind::Int { signed: true },
+            quals: Qualifiers {
+                is_const: true,
+                is_volatile: false,
+                is_restrict: false,
+            },
+        });
+        let int_ptr_ty = cx.types.intern(Type {
+            kind: TypeKind::Pointer { pointee: int_ty },
+            quals: Qualifiers::default(),
+        });
+        let const_int_ptr_ty = cx.types.intern(Type {
+            kind: TypeKind::Pointer {
+                pointee: const_int_ty,
+            },
+            quals: Qualifiers::default(),
+        });
+        bind_symbol(&mut cx, "p", int_ptr_ty);
+        bind_symbol(&mut cx, "cp", const_int_ptr_ty);
+
+        let expr = Expr::conditional(
+            Expr::int_with_span(1, SourceSpan::dummy()),
+            Expr::var_with_span("p".to_string(), SourceSpan::dummy()),
+            Expr::var_with_span("cp".to_string(), SourceSpan::dummy()),
+        );
+        let typed = lower_expr(&mut cx, &expr);
+
+        let TypeKind::Pointer { pointee } = cx.types.get(typed.ty).kind else {
+            panic!("expected pointer result type");
+        };
+        assert!(cx.types.get(pointee).quals.is_const);
+    }
+
+    #[test]
+    fn conditional_struct_operands_preserve_record_type() {
+        let mut cx = new_cx();
+        let int_ty = int_ty(&mut cx);
+        let rec_ty = record_ty_with_field(&mut cx, "x", int_ty);
+        bind_symbol(&mut cx, "a", rec_ty);
+        bind_symbol(&mut cx, "b", rec_ty);
+
+        let expr = Expr::conditional(
+            Expr::int_with_span(1, SourceSpan::dummy()),
+            Expr::var_with_span("a".to_string(), SourceSpan::dummy()),
+            Expr::var_with_span("b".to_string(), SourceSpan::dummy()),
+        );
+        let typed = lower_expr(&mut cx, &expr);
+        assert_eq!(typed.ty, rec_ty);
     }
 
     #[test]

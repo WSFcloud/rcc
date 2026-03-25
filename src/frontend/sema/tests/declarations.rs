@@ -33,6 +33,35 @@ fn finalizes_tentative_definition_at_tu_end() {
 }
 
 #[test]
+fn synthesizes_zero_initializer_for_tentative_definition() {
+    let src = "int global_value;";
+    let result = analyze_source(src).expect("sema should succeed");
+    let target = SymbolId(0);
+
+    let mut found_zero_init = false;
+    for item in &result.typed_tu.items {
+        let crate::frontend::sema::typed_ast::TypedExternalDecl::Declaration(decl) = item else {
+            continue;
+        };
+        for init in &decl.initializers {
+            if init.symbol == target
+                && matches!(
+                    init.init,
+                    crate::frontend::sema::typed_ast::TypedInitializer::ZeroInit { .. }
+                )
+            {
+                found_zero_init = true;
+            }
+        }
+    }
+
+    assert!(
+        found_zero_init,
+        "expected synthesized zero initializer for tentative definition"
+    );
+}
+
+#[test]
 fn extern_incomplete_array_declaration_is_not_tentative() {
     let src = "extern int ext_arr[];";
     let result = analyze_source(src).expect("sema should succeed");

@@ -63,7 +63,10 @@ pub mod sema {
             }
         }
 
-        check::decl::finalize_tentative_definitions(&mut cx);
+        let tentative_defs = check::decl::finalize_tentative_definitions(&mut cx);
+        for decl in tentative_defs {
+            typed_items.push(TypedExternalDecl::Declaration(decl));
+        }
 
         if cx.has_errors() {
             return Err(cx.take_diagnostics());

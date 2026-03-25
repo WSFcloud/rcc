@@ -592,7 +592,7 @@ pub fn usual_arithmetic_conversions(a: TypeId, b: TypeId, arena: &mut TypeArena)
                 (rhs_kind, rhs_rank, rhs_bits, lhs_kind, lhs_rank, lhs_bits)
             };
 
-        if unsigned_rank >= signed_rank {
+        if unsigned_rank > signed_rank {
             unsigned_kind
         } else if signed_bits > unsigned_bits {
             signed_kind
@@ -1287,5 +1287,24 @@ mod tests {
         assert!(types_compatible(enum_ty, int_ty, &arena));
         assert!(types_compatible(int_ty, enum_ty, &arena));
         assert!(!types_compatible(enum_ty, uint_ty, &arena));
+    }
+
+    #[test]
+    fn usual_arithmetic_conversions_choose_unsigned_int_for_int_and_unsigned_int() {
+        let mut arena = TypeArena::new();
+        let int_ty = arena.intern(Type {
+            kind: TypeKind::Int { signed: true },
+            quals: Qualifiers::default(),
+        });
+        let uint_ty = arena.intern(Type {
+            kind: TypeKind::Int { signed: false },
+            quals: Qualifiers::default(),
+        });
+
+        let common = usual_arithmetic_conversions(int_ty, uint_ty, &mut arena);
+        assert!(matches!(
+            arena.get(common).kind,
+            TypeKind::Int { signed: false }
+        ));
     }
 }

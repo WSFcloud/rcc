@@ -11,7 +11,7 @@ use crate::frontend::sema::init;
 use crate::frontend::sema::symbols::{
     DefinitionStatus, Linkage, LinkageError, Symbol, SymbolId, SymbolKind, infer_linkage,
 };
-use crate::frontend::sema::typed_ast::{TypedDeclInit, TypedDeclaration};
+use crate::frontend::sema::typed_ast::{TypedDeclInit, TypedDeclaration, TypedInitializer};
 use crate::frontend::sema::types::{
     ArrayLen, EnumConstant, EnumDef, FieldDef, Qualifiers, RecordDef, TagId, Type, TypeId,
     TypeKind, type_size_of,
@@ -75,7 +75,9 @@ pub fn lower_external_declaration(
 }
 
 /// Finalize tentative definitions at end of translation unit.
-pub fn finalize_tentative_definitions(cx: &mut SemaContext<'_>) {
+pub fn finalize_tentative_definitions(cx: &mut SemaContext<'_>) -> Vec<TypedDeclaration> {
+    let mut synthesized = Vec::new();
+
     for idx in 0..cx.symbols.len() {
         let symbol_id = SymbolId(idx as u32);
         let (is_tentative_object, ty, span, name) = {
@@ -104,7 +106,17 @@ pub fn finalize_tentative_definitions(cx: &mut SemaContext<'_>) {
 
         cx.symbol_mut(symbol_id)
             .set_status(DefinitionStatus::Defined);
+        synthesized.push(TypedDeclaration {
+            symbols: vec![symbol_id],
+            initializers: vec![TypedDeclInit {
+                symbol: symbol_id,
+                init: TypedInitializer::ZeroInit { ty },
+            }],
+            span,
+        });
     }
+
+    synthesized
 }
 
 /// Ensure one function symbol exists in the current scope and return its symbol id.

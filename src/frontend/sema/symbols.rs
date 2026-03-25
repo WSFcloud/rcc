@@ -348,6 +348,7 @@ pub fn merge_declarations(
 
     existing.set_ty(merged_ty);
     existing.set_status(merge_definition_status(existing.status(), new_decl.status));
+    existing.set_decl_span(new_decl.span);
 
     Ok(merged_ty)
 }
@@ -447,5 +448,36 @@ mod tests {
             Some(&existing),
         );
         assert_eq!(result, Err(LinkageError::ConflictingLinkage));
+    }
+
+    #[test]
+    fn merge_declarations_updates_decl_span_to_latest_declaration() {
+        let mut type_arena = TypeArena::new();
+        let int_ty = type_arena.intern(Type {
+            kind: TypeKind::Int { signed: true },
+            quals: Qualifiers::default(),
+        });
+
+        let mut existing = Symbol::new(
+            "x".to_string(),
+            SymbolKind::Object,
+            int_ty,
+            Linkage::External,
+            DefinitionStatus::Declared,
+            SourceSpan::new(1, 2),
+        );
+
+        let incoming = DeclInfo {
+            name: "x",
+            kind: SymbolKind::Object,
+            ty: int_ty,
+            linkage: Linkage::External,
+            status: DefinitionStatus::Defined,
+            span: SourceSpan::new(20, 25),
+        };
+
+        let _ = merge_declarations(&mut existing, &incoming, &mut type_arena)
+            .expect("compatible redeclaration should merge");
+        assert_eq!(existing.decl_span(), incoming.span);
     }
 }
