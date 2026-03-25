@@ -83,6 +83,12 @@ fn eval_const_expr_inner(
             })?;
             Ok(ConstValue::UInt(size))
         }
+        TypedExprKind::SizeofExpr { expr: inner } => {
+            let size = type_size_of(inner.ty, env.types, env.records).ok_or_else(|| {
+                non_constant_diag(expr.span, "operand of sizeof has incomplete type")
+            })?;
+            Ok(ConstValue::UInt(size))
+        }
         _ => Err(non_constant_diag(
             expr.span,
             "expression is not a constant expression",

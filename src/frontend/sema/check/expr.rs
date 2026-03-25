@@ -1251,7 +1251,25 @@ fn lower_sizeof_expr(cx: &mut SemaContext<'_>, inner: &Expr, span: SourceSpan) -
     if is_error_type(cx, operand.ty) {
         return TypedExpr::opaque(span, cx.error_type());
     }
-    lower_sizeof_ty(cx, operand.ty, span)
+
+    let Some(size) = type_size_of(operand.ty, &cx.types, &cx.records) else {
+        cx.emit(SemaDiagnostic::new(
+            SemaDiagnosticCode::IncompleteType,
+            "operand of sizeof has incomplete or unsupported type",
+            span,
+        ));
+        return TypedExpr::opaque(span, cx.error_type());
+    };
+
+    TypedExpr {
+        kind: TypedExprKind::SizeofExpr {
+            expr: Box::new(operand),
+        },
+        ty: size_t_type(cx),
+        value_category: ValueCategory::RValue,
+        const_value: Some(ConstValue::UInt(size)),
+        span,
+    }
 }
 
 /// Builds a typed `sizeof` expression from a resolved operand type.

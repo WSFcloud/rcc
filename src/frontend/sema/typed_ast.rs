@@ -390,6 +390,9 @@ pub enum TypedExprKind {
     /// `sizeof` operator applied to a type.
     SizeofType { ty: TypeId },
 
+    /// `sizeof` operator applied to an expression.
+    SizeofExpr { expr: Box<TypedExpr> },
+
     /// Comma expression: evaluates left, discards result, returns right.
     Comma {
         left: Box<TypedExpr>,
