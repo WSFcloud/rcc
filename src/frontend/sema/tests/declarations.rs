@@ -195,3 +195,46 @@ fn rejects_register_at_file_scope() {
     let diagnostics = analyze_source(src).expect_err("sema should fail");
     assert_has_code(&diagnostics, SemaDiagnosticCode::InvalidLinkageMerge);
 }
+
+#[test]
+fn reports_enum_value_not_representable_as_int() {
+    let src = "enum { A = 2147483648LL };";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::TypeMismatch);
+}
+
+#[test]
+fn out_of_range_enum_value_does_not_define_enumerator_symbol() {
+    let src = "enum { A = 2147483648LL }; int x = A;";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::TypeMismatch);
+    assert_has_code(&diagnostics, SemaDiagnosticCode::UndefinedSymbol);
+}
+
+#[test]
+fn rejects_array_of_incomplete_type_even_for_extern_declaration() {
+    let src = "struct S; extern struct S arr[1];";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::IncompleteType);
+}
+
+#[test]
+fn rejects_array_of_function_type() {
+    let src = "typedef int Fn(void); Fn table[2];";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::TypeMismatch);
+}
+
+#[test]
+fn rejects_function_returning_array_type() {
+    let src = "typedef int Arr2[2]; Arr2 make(void);";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::TypeMismatch);
+}
+
+#[test]
+fn rejects_function_returning_function_type() {
+    let src = "typedef int Fn(void); Fn make(void);";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::TypeMismatch);
+}

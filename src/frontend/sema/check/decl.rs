@@ -699,6 +699,76 @@ fn normalize_storage(
     Ok(real_storage.first().map(|s| **s))
 }
 
+fn validate_array_element_type(
+    cx: &mut SemaContext<'_>,
+    elem_ty: TypeId,
+    span: SourceSpan,
+) -> TypeId {
+    let kind = &cx.types.get(elem_ty).kind;
+    if matches!(kind, TypeKind::Error) {
+        return elem_ty;
+    }
+
+    if matches!(kind, TypeKind::Function(_)) {
+        cx.emit(
+            SemaDiagnostic::new(
+                SemaDiagnosticCode::TypeMismatch,
+                "array element type cannot be a function type",
+                span,
+            )
+            .with_note("declare an array of function pointers instead"),
+        );
+        return cx.error_type();
+    }
+
+    if !is_complete_type(elem_ty, cx) {
+        cx.emit(
+            SemaDiagnostic::new(
+                SemaDiagnosticCode::IncompleteType,
+                "array element type must be complete",
+                span,
+            )
+            .with_note("complete the element type or use a pointer element type"),
+        );
+        return cx.error_type();
+    }
+
+    elem_ty
+}
+
+fn validate_function_return_type(
+    cx: &mut SemaContext<'_>,
+    ret_ty: TypeId,
+    span: SourceSpan,
+) -> TypeId {
+    match cx.types.get(ret_ty).kind {
+        TypeKind::Error => ret_ty,
+        TypeKind::Array { .. } => {
+            cx.emit(
+                SemaDiagnostic::new(
+                    SemaDiagnosticCode::TypeMismatch,
+                    "function return type cannot be an array type",
+                    span,
+                )
+                .with_note("return a pointer to array instead"),
+            );
+            cx.error_type()
+        }
+        TypeKind::Function(_) => {
+            cx.emit(
+                SemaDiagnostic::new(
+                    SemaDiagnosticCode::TypeMismatch,
+                    "function return type cannot be a function type",
+                    span,
+                )
+                .with_note("return a function pointer instead"),
+            );
+            cx.error_type()
+        }
+        _ => ret_ty,
+    }
+}
+
 /// Build full declaration type from specifiers and declarator.
 fn build_decl_type(
     cx: &mut SemaContext<'_>,
@@ -747,14 +817,15 @@ fn apply_direct_declarator(
         DirectDeclaratorKind::Grouped(inner) => apply_declarator_with_base(cx, base_ty, inner),
         DirectDeclaratorKind::Array { inner, size, .. } => {
             let len = array_len_from_size_expr(cx, size, direct.span);
+            let elem_ty = validate_array_element_type(cx, base_ty, direct.span);
             let array_ty = cx.types.intern(Type {
-                kind: TypeKind::Array { elem: base_ty, len },
+                kind: TypeKind::Array { elem: elem_ty, len },
                 quals: Qualifiers::default(),
             });
             apply_direct_declarator(cx, array_ty, inner)
         }
         DirectDeclaratorKind::Function { inner, params } => {
-            let function_ty = build_function_type(cx, base_ty, params);
+            let function_ty = build_function_type(cx, base_ty, params, direct.span);
             apply_direct_declarator(cx, function_ty, inner)
         }
     }
@@ -763,10 +834,13 @@ fn apply_direct_declarator(
 /// Build function type from return type and parsed parameter list.
 fn build_function_type(
     cx: &mut SemaContext<'_>,
-    ret_ty: TypeId,
+    mut ret_ty: TypeId,
     params: &FunctionParams,
+    span: SourceSpan,
 ) -> TypeId {
     use crate::frontend::sema::types::{FunctionStyle, FunctionType};
+
+    ret_ty = validate_function_return_type(cx, ret_ty, span);
 
     match params {
         FunctionParams::NonPrototype => cx.types.intern(Type {
@@ -1635,6 +1709,22 @@ fn lower_enum_variants(
             continue;
         };
 
+        if !enum_value_representable_as_int(value) {
+            cx.emit(
+                SemaDiagnostic::new(
+                    SemaDiagnosticCode::TypeMismatch,
+                    format!(
+                        "enumerator '{}' value {value} is not representable as int",
+                        variant.name
+                    ),
+                    variant.span,
+                )
+                .with_note("V1 models enum underlying type as 'int'"),
+            );
+            next_value = advance_enum_value(cx, value, variant.span);
+            continue;
+        }
+
         // Check for duplicate enumerator names.
         if cx.lookup_ordinary_in_current_scope(&variant.name).is_some() {
             cx.emit(SemaDiagnostic::new(
@@ -1679,6 +1769,10 @@ fn advance_enum_value(cx: &mut SemaContext<'_>, current: i64, span: SourceSpan) 
         ));
         current
     })
+}
+
+fn enum_value_representable_as_int(value: i64) -> bool {
+    (i32::MIN as i64..=i32::MAX as i64).contains(&value)
 }
 
 /// Register one tag (`struct`/`union`/`enum`) in current scope.
