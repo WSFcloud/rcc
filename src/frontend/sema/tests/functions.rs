@@ -184,6 +184,20 @@ fn rejects_dereferencing_void_pointer() {
 }
 
 #[test]
+fn reports_constant_integer_division_by_zero_in_runtime_expr() {
+    let src = "int main(void) { int x = 1; return x / 0; }";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::ConstantDivisionByZero);
+}
+
+#[test]
+fn reports_constant_integer_modulo_by_zero_in_compound_assignment() {
+    let src = "int main(void) { int x = 7; x %= 0; return x; }";
+    let diagnostics = analyze_source(src).expect_err("sema should fail");
+    assert_has_code(&diagnostics, SemaDiagnosticCode::ConstantDivisionByZero);
+}
+
+#[test]
 fn rejects_dropping_pointee_const_qualification() {
     let src = r#"
         int main(void) {

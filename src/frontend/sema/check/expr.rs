@@ -352,6 +352,12 @@ fn lower_binary_expr(
             let common = usual_arithmetic_conversions(left.ty, right.ty, &mut cx.types);
             left = cast_if_needed(left, common);
             right = cast_if_needed(right, common);
+            if matches!(op, AstBinaryOp::Div | AstBinaryOp::Mod)
+                && is_integer(&cx.types.get(common).kind)
+                && integer_constant_value(cx, &right) == Some(0)
+            {
+                return emit_constant_division_by_zero(cx, right.span);
+            }
             (map_binary_op(op), common)
         }
         AstBinaryOp::Add => {
@@ -606,6 +612,13 @@ fn lower_assign_expr(
             span,
             "compound assignment result is not assignable to left operand",
         );
+    }
+
+    if matches!(op, AstAssignOp::DivAssign | AstAssignOp::ModAssign)
+        && is_integer(&cx.types.get(compound_result_ty).kind)
+        && integer_constant_value(cx, &rhs) == Some(0)
+    {
+        return emit_constant_division_by_zero(cx, rhs.span);
     }
 
     TypedExpr {
@@ -1543,6 +1556,15 @@ fn emit_type_mismatch(
     cx.emit(SemaDiagnostic::new(
         SemaDiagnosticCode::TypeMismatch,
         message,
+        span,
+    ));
+    TypedExpr::opaque(span, cx.error_type())
+}
+
+fn emit_constant_division_by_zero(cx: &mut SemaContext<'_>, span: SourceSpan) -> TypedExpr {
+    cx.emit(SemaDiagnostic::new(
+        SemaDiagnosticCode::ConstantDivisionByZero,
+        "division by zero in expression with constant divisor",
         span,
     ));
     TypedExpr::opaque(span, cx.error_type())
