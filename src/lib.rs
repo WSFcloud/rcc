@@ -1,6 +1,7 @@
 pub mod common;
 pub mod driver;
 pub mod frontend;
+pub mod mir;
 
 use crate::driver::{cli, pipeline};
 
