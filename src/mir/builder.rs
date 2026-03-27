@@ -1452,14 +1452,21 @@ impl<'a> MirBuildContext<'a> {
     /// Complex expressions are recursively lowered into MIR instructions and
     /// return either a vreg-backed operand or an immediate constant.
     fn lower_rvalue(&mut self, expr: &TypedExpr) -> Operand {
-        if let Some(const_value) = expr.const_value
-            && !matches!(
-                (const_value, expr.value_category),
-                (ConstValue::Addr { .. }, ValueCategory::LValue)
-            )
-            && let Some(operand) = self.lower_const_operand(const_value)
-        {
-            return operand;
+        if let Some(const_value) = expr.const_value {
+            let can_lower_const = match const_value {
+                ConstValue::Addr { .. } => {
+                    // Address payloads from sema can also appear on scalar
+                    // rvalues derived from lvalues (e.g. array indexing after
+                    // implicit casts). Those must still be lowered via memory
+                    // access, not as immediate pointer values.
+                    self.map_type(expr.ty) == MirType::Ptr
+                        && !matches!(expr.value_category, ValueCategory::LValue)
+                }
+                _ => true,
+            };
+            if can_lower_const && let Some(operand) = self.lower_const_operand(const_value) {
+                return operand;
+            }
         }
 
         match &expr.kind {
@@ -4007,6 +4014,83 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn array_index_arithmetic_uses_loaded_values_not_addresses() {
+        let sema = analyze_source(
+            r#"
+            int main(void) {
+                int b[2] = {1, 5};
+                int x = b[1] + 2;
+                return x + b[0];
+            }
+        "#,
+        );
+        let program = lower_to_mir(&sema);
+        let func = program
+            .functions
+            .iter()
+            .find(|func| func.name == "main")
+            .expect("function main should be lowered");
+
+        let instructions: Vec<&Instruction> = func
+            .blocks
+            .iter()
+            .flat_map(|block| block.instructions.iter())
+            .collect();
+
+        let ptr_load_count = instructions
+            .iter()
+            .filter(|inst| {
+                matches!(
+                    inst,
+                    Instruction::PtrLoad {
+                        ty: MirType::I32,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            ptr_load_count >= 2,
+            "expected ptr_load for both b[1] and b[0] rvalue uses"
+        );
+
+        let mut pointer_regs = std::collections::HashSet::new();
+        for inst in &instructions {
+            match inst {
+                Instruction::SlotAddr { dst, .. }
+                | Instruction::GlobalAddr { dst, .. }
+                | Instruction::PtrAdd { dst, .. } => {
+                    pointer_regs.insert(dst.reg);
+                }
+                _ => {}
+            }
+        }
+
+        for inst in &instructions {
+            if let Instruction::Binary {
+                ty: MirType::I32,
+                lhs,
+                rhs,
+                ..
+            } = inst
+            {
+                if let Operand::VReg(reg) = lhs {
+                    assert!(
+                        !pointer_regs.contains(reg),
+                        "i32 binary op should not consume pointer-producing vreg on lhs"
+                    );
+                }
+                if let Operand::VReg(reg) = rhs {
+                    assert!(
+                        !pointer_regs.contains(reg),
+                        "i32 binary op should not consume pointer-producing vreg on rhs"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
