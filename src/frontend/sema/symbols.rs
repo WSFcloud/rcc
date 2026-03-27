@@ -50,6 +50,22 @@ pub enum DefinitionStatus {
     Defined,
 }
 
+/// Storage category for object symbols needed by MIR lowering.
+///
+/// This metadata preserves where an object came from in source:
+/// - `FileScope`: any file-scope object declaration/definition
+/// - `Extern`: block-scope `extern` object declaration
+/// - `Static`: block-scope `static` object
+/// - `Auto` / `Register`: block-scope automatic objects
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectStorageClass {
+    Auto,
+    Register,
+    Static,
+    Extern,
+    FileScope,
+}
+
 /// A symbol in the ordinary namespace.
 ///
 /// Symbols are stored in a `SymbolArena` and referenced by `SymbolId`.
@@ -62,6 +78,7 @@ pub struct Symbol {
     linkage: Linkage,
     status: DefinitionStatus,
     decl_span: SourceSpan,
+    object_storage_class: Option<ObjectStorageClass>,
 }
 
 impl Symbol {
@@ -81,6 +98,7 @@ impl Symbol {
             linkage,
             status,
             decl_span,
+            object_storage_class: None,
         }
     }
 
@@ -114,6 +132,11 @@ impl Symbol {
         self.decl_span
     }
 
+    /// Returns the object storage category if this is an object symbol.
+    pub fn object_storage_class(&self) -> Option<ObjectStorageClass> {
+        self.object_storage_class
+    }
+
     /// Updates the symbol's type.
     ///
     /// Used when merging declarations to update to the composite type.
@@ -131,6 +154,11 @@ impl Symbol {
     /// Updates the symbol's declaration span.
     pub fn set_decl_span(&mut self, span: SourceSpan) {
         self.decl_span = span;
+    }
+
+    /// Updates the symbol's object storage category metadata.
+    pub fn set_object_storage_class(&mut self, storage: Option<ObjectStorageClass>) {
+        self.object_storage_class = storage;
     }
 }
 
@@ -205,7 +233,34 @@ pub struct DeclInfo<'a> {
     pub ty: TypeId,
     pub linkage: Linkage,
     pub status: DefinitionStatus,
+    pub object_storage_class: Option<ObjectStorageClass>,
     pub span: SourceSpan,
+}
+
+/// Infers object storage category from scope + storage-class specifier.
+///
+/// This is independent from linkage. It preserves enough information for
+/// MIR lowering to distinguish file-scope objects, block-scope static, and
+/// automatic objects.
+pub fn infer_object_storage_class(
+    scope_level: ScopeLevel,
+    storage_class: Option<StorageClass>,
+) -> Result<ObjectStorageClass, LinkageError> {
+    match scope_level {
+        ScopeLevel::File => match storage_class {
+            None | Some(StorageClass::Extern | StorageClass::Static) => {
+                Ok(ObjectStorageClass::FileScope)
+            }
+            Some(other) => Err(LinkageError::InvalidStorageClass(other)),
+        },
+        ScopeLevel::Block => match storage_class {
+            None | Some(StorageClass::Auto) => Ok(ObjectStorageClass::Auto),
+            Some(StorageClass::Register) => Ok(ObjectStorageClass::Register),
+            Some(StorageClass::Static) => Ok(ObjectStorageClass::Static),
+            Some(StorageClass::Extern) => Ok(ObjectStorageClass::Extern),
+            Some(other) => Err(LinkageError::InvalidStorageClass(other)),
+        },
+    }
 }
 
 /// Infers the linkage of a declaration based on scope and storage class.
@@ -349,6 +404,13 @@ pub fn merge_declarations(
     existing.set_ty(merged_ty);
     existing.set_status(merge_definition_status(existing.status(), new_decl.status));
     existing.set_decl_span(new_decl.span);
+    if existing.kind() == SymbolKind::Object {
+        let merged_storage = merge_object_storage_class(
+            existing.object_storage_class(),
+            new_decl.object_storage_class,
+        );
+        existing.set_object_storage_class(merged_storage);
+    }
 
     Ok(merged_ty)
 }
@@ -368,6 +430,19 @@ fn merge_definition_status(
             DefinitionStatus::Tentative
         }
         _ => DefinitionStatus::Declared,
+    }
+}
+
+fn merge_object_storage_class(
+    existing: Option<ObjectStorageClass>,
+    incoming: Option<ObjectStorageClass>,
+) -> Option<ObjectStorageClass> {
+    match (existing, incoming) {
+        (Some(ObjectStorageClass::FileScope), _) | (_, Some(ObjectStorageClass::FileScope)) => {
+            Some(ObjectStorageClass::FileScope)
+        }
+        (Some(current), _) => Some(current),
+        (None, next) => next,
     }
 }
 
@@ -413,6 +488,7 @@ mod tests {
             ty: known_array,
             linkage: Linkage::External,
             status: DefinitionStatus::Tentative,
+            object_storage_class: Some(ObjectStorageClass::FileScope),
             span: SourceSpan::new(4, 7),
         };
 
@@ -473,11 +549,63 @@ mod tests {
             ty: int_ty,
             linkage: Linkage::External,
             status: DefinitionStatus::Defined,
+            object_storage_class: Some(ObjectStorageClass::FileScope),
             span: SourceSpan::new(20, 25),
         };
 
         let _ = merge_declarations(&mut existing, &incoming, &mut type_arena)
             .expect("compatible redeclaration should merge");
         assert_eq!(existing.decl_span(), incoming.span);
+    }
+
+    #[test]
+    fn infer_object_storage_class_distinguishes_file_and_block_cases() {
+        assert_eq!(
+            infer_object_storage_class(ScopeLevel::File, None),
+            Ok(ObjectStorageClass::FileScope)
+        );
+        assert_eq!(
+            infer_object_storage_class(ScopeLevel::Block, None),
+            Ok(ObjectStorageClass::Auto)
+        );
+        assert_eq!(
+            infer_object_storage_class(ScopeLevel::Block, Some(StorageClass::Register)),
+            Ok(ObjectStorageClass::Register)
+        );
+        assert_eq!(
+            infer_object_storage_class(ScopeLevel::Block, Some(StorageClass::Static)),
+            Ok(ObjectStorageClass::Static)
+        );
+        assert_eq!(
+            infer_object_storage_class(ScopeLevel::Block, Some(StorageClass::Extern)),
+            Ok(ObjectStorageClass::Extern)
+        );
+    }
+
+    #[test]
+    fn merge_object_storage_class_prefers_filescope_and_keeps_existing_non_filescope() {
+        assert_eq!(
+            merge_object_storage_class(Some(ObjectStorageClass::FileScope), None),
+            Some(ObjectStorageClass::FileScope)
+        );
+        assert_eq!(
+            merge_object_storage_class(
+                Some(ObjectStorageClass::Extern),
+                Some(ObjectStorageClass::FileScope)
+            ),
+            Some(ObjectStorageClass::FileScope)
+        );
+        assert_eq!(
+            merge_object_storage_class(None, Some(ObjectStorageClass::Static)),
+            Some(ObjectStorageClass::Static)
+        );
+        assert_eq!(
+            merge_object_storage_class(
+                Some(ObjectStorageClass::Register),
+                Some(ObjectStorageClass::Auto)
+            ),
+            Some(ObjectStorageClass::Register)
+        );
+        assert_eq!(merge_object_storage_class(None, None), None);
     }
 }

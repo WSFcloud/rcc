@@ -18,6 +18,8 @@ pub struct MirFunction {
     pub params: Vec<MirType>,
     /// ABI-normalized return type.
     pub return_type: MirType,
+    /// Whether this function accepts variadic arguments.
+    pub variadic: bool,
     /// Function-local stack slots.
     pub stack_slots: Vec<StackSlot>,
     /// Basic blocks. `blocks[0]` is the entry block.

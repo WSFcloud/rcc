@@ -1,4 +1,18 @@
 use super::*;
+use crate::frontend::sema::symbols::ObjectStorageClass;
+
+fn find_symbol<'a>(
+    result: &'a sema::SemaResult,
+    name: &str,
+) -> &'a crate::frontend::sema::symbols::Symbol {
+    for idx in 0..result.symbols.len() {
+        let symbol = result.symbols.get(SymbolId(idx as u32));
+        if symbol.name() == name {
+            return symbol;
+        }
+    }
+    panic!("symbol '{name}' not found");
+}
 
 #[test]
 fn reports_extern_after_static_linkage_conflict() {
@@ -333,4 +347,54 @@ fn rejects_empty_record_definitions() {
     let src = "struct EmptyS { }; union EmptyU { };";
     let diagnostics = analyze_source(src).expect_err("sema should fail");
     assert_has_code(&diagnostics, SemaDiagnosticCode::TypeMismatch);
+}
+
+#[test]
+fn tracks_file_scope_object_storage_class_metadata() {
+    let src = "int g; static int sg; extern int eg;";
+    let result = analyze_source(src).expect("sema should succeed");
+
+    assert_eq!(
+        find_symbol(&result, "g").object_storage_class(),
+        Some(ObjectStorageClass::FileScope)
+    );
+    assert_eq!(
+        find_symbol(&result, "sg").object_storage_class(),
+        Some(ObjectStorageClass::FileScope)
+    );
+    assert_eq!(
+        find_symbol(&result, "eg").object_storage_class(),
+        Some(ObjectStorageClass::FileScope)
+    );
+}
+
+#[test]
+fn tracks_block_scope_object_storage_class_metadata() {
+    let src = r#"
+        int f(void) {
+            int a = 0;
+            register int r = 0;
+            static int s = 0;
+            extern int ext_only;
+            return a + r + s;
+        }
+    "#;
+    let result = analyze_source(src).expect("sema should succeed");
+
+    assert_eq!(
+        find_symbol(&result, "a").object_storage_class(),
+        Some(ObjectStorageClass::Auto)
+    );
+    assert_eq!(
+        find_symbol(&result, "r").object_storage_class(),
+        Some(ObjectStorageClass::Register)
+    );
+    assert_eq!(
+        find_symbol(&result, "s").object_storage_class(),
+        Some(ObjectStorageClass::Static)
+    );
+    assert_eq!(
+        find_symbol(&result, "ext_only").object_storage_class(),
+        Some(ObjectStorageClass::Extern)
+    );
 }

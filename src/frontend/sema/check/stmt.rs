@@ -6,7 +6,9 @@ use crate::frontend::parser::ast::{
 use crate::frontend::sema::check::{decl, expr};
 use crate::frontend::sema::context::SemaContext;
 use crate::frontend::sema::diagnostic::{SemaDiagnostic, SemaDiagnosticCode};
-use crate::frontend::sema::symbols::{DefinitionStatus, Linkage, Symbol, SymbolId, SymbolKind};
+use crate::frontend::sema::symbols::{
+    DefinitionStatus, Linkage, ObjectStorageClass, Symbol, SymbolId, SymbolKind,
+};
 use crate::frontend::sema::typed_ast::{
     CaseValue, ConstValue, LabelId, TypedBlockItem, TypedForInit, TypedFunctionDef, TypedStmt,
     TypedStmtKind,
@@ -438,7 +440,7 @@ fn declare_function_parameters(cx: &mut SemaContext<'_>, func: &FunctionDef) {
         }
         let ty = decl::normalize_function_parameter_type(cx, ty);
 
-        let sym = Symbol::new(
+        let mut sym = Symbol::new(
             name.to_string(),
             SymbolKind::Object,
             ty,
@@ -446,6 +448,7 @@ fn declare_function_parameters(cx: &mut SemaContext<'_>, func: &FunctionDef) {
             DefinitionStatus::Defined,
             param.span,
         );
+        sym.set_object_storage_class(Some(ObjectStorageClass::Auto));
         let sym_id = cx.insert_symbol(sym);
         if let Err((dup_name, _)) = cx.insert_ordinary(name.to_string(), sym_id) {
             cx.emit(SemaDiagnostic::new(

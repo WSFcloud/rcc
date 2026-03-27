@@ -10,6 +10,7 @@ use crate::frontend::sema::diagnostic::{SemaDiagnostic, SemaDiagnosticCode};
 use crate::frontend::sema::init;
 use crate::frontend::sema::symbols::{
     DefinitionStatus, Linkage, LinkageError, Symbol, SymbolId, SymbolKind, infer_linkage,
+    infer_object_storage_class,
 };
 use crate::frontend::sema::typed_ast::{TypedDeclInit, TypedDeclaration, TypedInitializer};
 use crate::frontend::sema::types::{
@@ -162,6 +163,7 @@ pub fn ensure_function_symbol(cx: &mut SemaContext<'_>, func: &FunctionDef) -> O
             ty,
             linkage,
             status: DefinitionStatus::Defined,
+            object_storage_class: None,
             span: func.declarator.direct.span,
         };
         if let Err(diag) = crate::frontend::sema::symbols::merge_declarations(
@@ -412,6 +414,17 @@ pub fn lower_local_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) -> 
         } else {
             DefinitionStatus::Declared
         };
+        let object_storage_class = if kind == SymbolKind::Object {
+            match infer_object_storage_class(cx.scope_level(), storage) {
+                Ok(storage_class) => Some(storage_class),
+                Err(err) => {
+                    cx.emit(linkage_error_to_diag(err, init_decl.declarator.direct.span));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
 
         if let Some(existing_id) = merge_target {
             let decl_info = crate::frontend::sema::symbols::DeclInfo {
@@ -420,6 +433,7 @@ pub fn lower_local_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) -> 
                 ty,
                 linkage,
                 status,
+                object_storage_class,
                 span: init_decl.declarator.direct.span,
             };
             if let Err(diag) = crate::frontend::sema::symbols::merge_declarations(
@@ -440,7 +454,7 @@ pub fn lower_local_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) -> 
             continue;
         }
 
-        let sym = Symbol::new(
+        let mut sym = Symbol::new(
             name.to_string(),
             kind,
             ty,
@@ -448,6 +462,7 @@ pub fn lower_local_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) -> 
             status,
             init_decl.declarator.direct.span,
         );
+        sym.set_object_storage_class(object_storage_class);
         let sym_id = cx.insert_symbol(sym);
         if let Err((dup_name, _)) = cx.insert_ordinary(name.to_string(), sym_id) {
             cx.emit(SemaDiagnostic::new(
@@ -655,6 +670,17 @@ fn declare_file_scope_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) 
         } else {
             DefinitionStatus::Declared
         };
+        let object_storage_class = if kind == SymbolKind::Object {
+            match infer_object_storage_class(cx.scope_level(), storage) {
+                Ok(storage_class) => Some(storage_class),
+                Err(err) => {
+                    cx.emit(linkage_error_to_diag(err, init_decl.declarator.direct.span));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
 
         // Check for existing symbol and merge if compatible.
         if let Some(existing_id) = existing_id {
@@ -664,6 +690,7 @@ fn declare_file_scope_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) 
                 ty,
                 linkage,
                 status,
+                object_storage_class,
                 span: init_decl.declarator.direct.span,
             };
             if let Err(diag) = crate::frontend::sema::symbols::merge_declarations(
@@ -674,7 +701,7 @@ fn declare_file_scope_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) 
                 cx.emit(diag);
             }
         } else {
-            let sym = Symbol::new(
+            let mut sym = Symbol::new(
                 name.to_string(),
                 kind,
                 ty,
@@ -682,6 +709,7 @@ fn declare_file_scope_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) 
                 status,
                 init_decl.declarator.direct.span,
             );
+            sym.set_object_storage_class(object_storage_class);
             let sym_id = cx.insert_symbol(sym);
             let _ = cx.insert_ordinary(name.to_string(), sym_id);
         }

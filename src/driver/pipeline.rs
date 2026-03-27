@@ -5,6 +5,8 @@ use crate::frontend::parser::diagnostic::emit_parse_diagnostics;
 use crate::frontend::parser::parse;
 use crate::frontend::sema;
 use crate::frontend::sema::diagnostic::emit_sema_diagnostics;
+use crate::mir::builder::lower_to_mir_with_optimization;
+use crate::mir::display::dump as dump_mir;
 use chumsky::input::{Input, Stream};
 use std::error::Error;
 use std::fmt;
@@ -80,6 +82,9 @@ pub fn run(config: CompilerConfig) -> Result<(), PipelineError> {
         }
     };
     println!("Typed AST: {:#?}", sema_result.typed_tu);
+
+    let mir_program = lower_to_mir_with_optimization(&sema_result, config.optimization);
+    println!("MIR:\n{}", dump_mir(&mir_program));
 
     Ok(())
 }

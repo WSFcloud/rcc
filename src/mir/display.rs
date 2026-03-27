@@ -129,7 +129,7 @@ impl fmt::Display for MirFunction {
             f,
             "fn @{}{} {{",
             self.name,
-            SignatureDisplay::from_parts(&self.params, self.return_type, false)
+            SignatureDisplay::from_parts(&self.params, self.return_type, self.variadic)
         )?;
 
         if !self.stack_slots.is_empty() {
@@ -170,11 +170,11 @@ impl fmt::Display for StackSlot {
 
 impl fmt::Display for BasicBlock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "{}:", self.id)?;
+        writeln!(f, "  {}:", self.id)?;
         for inst in &self.instructions {
-            writeln!(f, "  {inst}")?;
+            writeln!(f, "    {inst}")?;
         }
-        write!(f, "  {}", self.terminator)
+        write!(f, "    {}", self.terminator)
     }
 }
 
@@ -624,6 +624,7 @@ mod tests {
                 name: "add".to_string(),
                 params: vec![MirType::I32, MirType::I32],
                 return_type: MirType::I32,
+                variadic: false,
                 stack_slots: vec![StackSlot {
                     id: SlotId(0),
                     size: 4,
@@ -662,6 +663,7 @@ mod tests {
             name: "mem".to_string(),
             params: vec![],
             return_type: MirType::Void,
+            variadic: false,
             stack_slots: vec![],
             blocks: vec![BasicBlock {
                 id: BlockId(0),
