@@ -375,16 +375,11 @@ fn declare_function_parameters(cx: &mut SemaContext<'_>, func: &FunctionDef) {
         return;
     };
 
-    let FunctionParams::Prototype {
-        params: param_list, ..
-    } = params
-    else {
-        cx.emit(SemaDiagnostic::new(
-            SemaDiagnosticCode::UnsupportedKnrDefinition,
-            "K&R-style function definitions are not supported in sema V1",
-            func.span,
-        ));
-        return;
+    let param_list = match params {
+        FunctionParams::Prototype { params, .. } => params,
+        // `int f() { ... }` is a valid non-prototype function definition.
+        // It declares no named parameters in the function scope.
+        FunctionParams::NonPrototype => return,
     };
 
     // `int f(void)` declares no parameters.

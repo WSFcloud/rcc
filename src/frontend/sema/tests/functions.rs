@@ -8,6 +8,16 @@ fn analyzes_simple_function_successfully() {
 }
 
 #[test]
+fn accepts_nonprototype_function_definitions() {
+    let src = r#"
+        int f() { return 1; }
+        int main() { return f(); }
+    "#;
+    let result = analyze_source(src);
+    assert!(result.is_ok(), "unexpected diagnostics: {result:?}");
+}
+
+#[test]
 fn static_inline_function_uses_internal_linkage() {
     let src = "static inline int helper(void) { return 42; }";
     let result = analyze_source(src).expect("sema should succeed");
