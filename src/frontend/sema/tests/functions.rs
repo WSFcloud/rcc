@@ -18,6 +18,31 @@ fn accepts_nonprototype_function_definitions() {
 }
 
 #[test]
+fn accepts_call_with_prior_prototype_and_later_definition() {
+    let src = r#"
+        int sum(int n);
+        int main(void) { return sum(5); }
+        int sum(int n) { return n; }
+    "#;
+    let result = analyze_source(src);
+    assert!(result.is_ok(), "unexpected diagnostics: {result:?}");
+}
+
+#[test]
+fn accepts_block_const_integer_as_array_bound() {
+    let src = r#"
+        int main(void) {
+            const int size = 10;
+            int fixed_arr[size];
+            fixed_arr[0] = 1;
+            return fixed_arr[0];
+        }
+    "#;
+    let result = analyze_source(src);
+    assert!(result.is_ok(), "unexpected diagnostics: {result:?}");
+}
+
+#[test]
 fn static_inline_function_uses_internal_linkage() {
     let src = "static inline int helper(void) { return 42; }";
     let result = analyze_source(src).expect("sema should succeed");

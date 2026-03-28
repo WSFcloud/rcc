@@ -38,6 +38,8 @@ pub struct SemaContext<'a> {
     symbol_table: SymbolTable<SymbolId, TagId, LabelId>,
     /// Enum constant values (separate from symbols for efficient lookup).
     enum_const_values: HashMap<SymbolId, i64>,
+    /// Integer constant values for const-qualified object symbols.
+    object_const_values: HashMap<SymbolId, i64>,
     /// Current scope depth (0 = file scope, >0 = block scope).
     scope_depth: usize,
     /// Cached error type ID for error recovery.
@@ -61,6 +63,7 @@ impl<'a> SemaContext<'a> {
             enums: EnumArena::default(),
             symbol_table: SymbolTable::new(),
             enum_const_values: HashMap::new(),
+            object_const_values: HashMap::new(),
             scope_depth: 0,
             error_type,
         }
@@ -177,6 +180,16 @@ impl<'a> SemaContext<'a> {
     /// Retrieves the value of an enum constant.
     pub fn lookup_enum_const_value(&self, id: SymbolId) -> Option<i64> {
         self.enum_const_values.get(&id).copied()
+    }
+
+    /// Associates a const-qualified object symbol with its integer constant value.
+    pub fn set_object_const_value(&mut self, id: SymbolId, value: i64) {
+        self.object_const_values.insert(id, value);
+    }
+
+    /// Retrieves an integer constant value for a const-qualified object symbol.
+    pub fn lookup_object_const_value(&self, id: SymbolId) -> Option<i64> {
+        self.object_const_values.get(&id).copied()
     }
 
     /// Enters a new block scope.

@@ -12,7 +12,9 @@ use crate::frontend::sema::symbols::{
     DefinitionStatus, Linkage, LinkageError, Symbol, SymbolId, SymbolKind, infer_linkage,
     infer_object_storage_class,
 };
-use crate::frontend::sema::typed_ast::{TypedDeclInit, TypedDeclaration, TypedInitializer};
+use crate::frontend::sema::typed_ast::{
+    ConstValue, TypedDeclInit, TypedDeclaration, TypedInitializer,
+};
 use crate::frontend::sema::types::{
     ArrayLen, EnumConstant, EnumDef, FieldDef, Qualifiers, RecordDef, TagId, Type, TypeId,
     TypeKind, type_size_of,
@@ -446,6 +448,7 @@ pub fn lower_local_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) -> 
             }
             symbols.push(existing_id);
             if let Some(init) = typed_initializer.take() {
+                maybe_record_const_integer_object(cx, existing_id, &init);
                 initializers.push(TypedDeclInit {
                     symbol: existing_id,
                     init,
@@ -474,6 +477,7 @@ pub fn lower_local_declaration(cx: &mut SemaContext<'_>, decl: &Declaration) -> 
         }
         symbols.push(sym_id);
         if let Some(init) = typed_initializer.take() {
+            maybe_record_const_integer_object(cx, sym_id, &init);
             initializers.push(TypedDeclInit {
                 symbol: sym_id,
                 init,
@@ -1297,16 +1301,24 @@ fn evaluate_integer_constant_expr(
         },
         ExprKind::Literal(Literal::Char(c)) => Ok(*c as i64),
         ExprKind::Var(name) => {
-            // Look up enum constants by name.
+            // Look up compile-time integer symbols by name.
             let sym_id = cx
                 .resolve_ordinary(name, expr.span)
                 .ok_or_else(|| IceEvalError::non_constant(expr.span))?;
             let sym = cx.symbol(sym_id);
-            if sym.kind() != SymbolKind::EnumConst {
-                return Err(IceEvalError::non_constant(expr.span));
+            match sym.kind() {
+                SymbolKind::EnumConst => cx
+                    .lookup_enum_const_value(sym_id)
+                    .ok_or_else(|| IceEvalError::non_constant(expr.span)),
+                SymbolKind::Object
+                    if cx.types.get(sym.ty()).quals.is_const
+                        && is_integer_ice_type(cx, sym.ty()) =>
+                {
+                    cx.lookup_object_const_value(sym_id)
+                        .ok_or_else(|| IceEvalError::non_constant(expr.span))
+                }
+                _ => Err(IceEvalError::non_constant(expr.span)),
             }
-            cx.lookup_enum_const_value(sym_id)
-                .ok_or_else(|| IceEvalError::non_constant(expr.span))
         }
         ExprKind::Unary { op, expr: inner } => {
             let val = evaluate_integer_constant_expr(cx, inner)?;
@@ -2087,6 +2099,36 @@ pub(crate) fn build_type_from_type_name(
         apply_declarator_with_base(cx, base_ty, declarator)
     } else {
         base_ty
+    }
+}
+
+fn maybe_record_const_integer_object(
+    cx: &mut SemaContext<'_>,
+    symbol_id: SymbolId,
+    init: &TypedInitializer,
+) {
+    let symbol = cx.symbol(symbol_id);
+    let symbol_ty = symbol.ty();
+    let is_const_integer_object = symbol.kind() == SymbolKind::Object
+        && cx.types.get(symbol_ty).quals.is_const
+        && is_integer_ice_type(cx, symbol_ty);
+    if !is_const_integer_object {
+        return;
+    }
+    let Some(value) = integer_const_from_initializer(init) else {
+        return;
+    };
+    cx.set_object_const_value(symbol_id, value);
+}
+
+fn integer_const_from_initializer(init: &TypedInitializer) -> Option<i64> {
+    match init {
+        TypedInitializer::Expr(expr) => match expr.const_value {
+            Some(ConstValue::Int(value)) => Some(value),
+            Some(ConstValue::UInt(value)) => Some(value as i64),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
