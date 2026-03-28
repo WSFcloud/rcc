@@ -1,10 +1,10 @@
 use std::fmt::{self, Write};
 
 use crate::mir::ir::{
-    BasicBlock, BinaryOp, BlockId, CastKind, CmpDomain, CmpKind, Instruction, MirConst,
-    MirExternFunction, MirFunction, MirFunctionSig, MirGlobal, MirGlobalInit, MirLinkage,
-    MirProgram, MirRelocation, MirRelocationTarget, MirType, Operand, SlotId, StackSlot,
-    SwitchCase, Terminator, TypedVReg, UnaryOp, VReg,
+    BasicBlock, BinaryOp, BlockId, CastKind, CmpDomain, CmpKind, Instruction, MirAbiParam,
+    MirAbiParamPurpose, MirConst, MirExternFunction, MirFunction, MirFunctionSig, MirGlobal,
+    MirGlobalInit, MirLinkage, MirProgram, MirRelocation, MirRelocationTarget, MirType, Operand,
+    SlotId, StackSlot, SwitchCase, Terminator, TypedVReg, UnaryOp, VReg,
 };
 
 /// Dump MIR program into a deterministic textual form.
@@ -151,6 +151,17 @@ impl fmt::Display for MirFunction {
         }
 
         write!(f, "\n}}")
+    }
+}
+
+impl fmt::Display for MirAbiParam {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.ty)?;
+        match self.purpose {
+            MirAbiParamPurpose::Normal => Ok(()),
+            MirAbiParamPurpose::StructArgument { size } => write!(f, " sarg({size})"),
+            MirAbiParamPurpose::StructReturn => write!(f, " sret"),
+        }
     }
 }
 
@@ -307,6 +318,7 @@ impl fmt::Display for Instruction {
                 callee_ptr,
                 args,
                 sig,
+                boundary_sig: _,
                 fixed_arg_count,
             } => {
                 if let Some(dst) = dst {
@@ -488,8 +500,10 @@ impl CastKind {
             Self::Trunc => "trunc",
             Self::ZExt => "zext",
             Self::SExt => "sext",
-            Self::IToF => "itof",
-            Self::FToI => "ftoi",
+            Self::SIToF => "sitof",
+            Self::UIToF => "uitof",
+            Self::FToSI => "ftosi",
+            Self::FToUI => "ftoui",
             Self::FExt => "fext",
             Self::FTrunc => "ftrunc",
             Self::PToI => "ptoi",
@@ -562,14 +576,14 @@ fn write_args(f: &mut fmt::Formatter<'_>, args: &[Operand]) -> fmt::Result {
 struct SignatureDisplay<'a>(&'a MirFunctionSig);
 
 impl<'a> SignatureDisplay<'a> {
-    fn from_parts(params: &'a [MirType], return_type: MirType, variadic: bool) -> String {
+    fn from_parts(params: &'a [MirAbiParam], return_type: MirType, variadic: bool) -> String {
         let mut sig = String::new();
         sig.push('(');
-        for (idx, ty) in params.iter().enumerate() {
+        for (idx, param) in params.iter().enumerate() {
             if idx > 0 {
                 sig.push_str(", ");
             }
-            let _ = write!(sig, "{ty}");
+            let _ = write!(sig, "{param}");
         }
         if variadic {
             if !params.is_empty() {
@@ -597,9 +611,9 @@ impl fmt::Display for SignatureDisplay<'_> {
 mod tests {
     use super::dump;
     use crate::mir::ir::{
-        BasicBlock, BinaryOp, BlockId, Instruction, MirExternFunction, MirFunction, MirFunctionSig,
-        MirGlobal, MirGlobalInit, MirLinkage, MirProgram, MirType, Operand, SlotId, StackSlot,
-        Terminator, TypedVReg, VReg,
+        BasicBlock, BinaryOp, BlockId, Instruction, MirAbiParam, MirBoundarySignature,
+        MirExternFunction, MirFunction, MirFunctionSig, MirGlobal, MirGlobalInit, MirLinkage,
+        MirProgram, MirType, Operand, SlotId, StackSlot, Terminator, TypedVReg, VReg,
     };
 
     #[test]
@@ -615,15 +629,32 @@ mod tests {
             extern_functions: vec![MirExternFunction {
                 name: "printf".to_string(),
                 sig: MirFunctionSig {
-                    params: vec![MirType::Ptr],
+                    params: vec![MirAbiParam::new(MirType::Ptr)],
                     return_type: MirType::I32,
                     variadic: true,
                 },
+                boundary_sig: MirBoundarySignature::from_internal(
+                    &[MirAbiParam::new(MirType::Ptr)],
+                    MirType::I32,
+                    true,
+                ),
             }],
             functions: vec![MirFunction {
                 name: "add".to_string(),
-                params: vec![MirType::I32, MirType::I32],
+                linkage: MirLinkage::External,
+                params: vec![
+                    MirAbiParam::new(MirType::I32),
+                    MirAbiParam::new(MirType::I32),
+                ],
                 return_type: MirType::I32,
+                boundary_sig: MirBoundarySignature::from_internal(
+                    &[
+                        MirAbiParam::new(MirType::I32),
+                        MirAbiParam::new(MirType::I32),
+                    ],
+                    MirType::I32,
+                    false,
+                ),
                 variadic: false,
                 stack_slots: vec![StackSlot {
                     id: SlotId(0),
@@ -661,8 +692,10 @@ mod tests {
     fn volatile_and_addresses_are_formatted() {
         let func = MirFunction {
             name: "mem".to_string(),
+            linkage: MirLinkage::Internal,
             params: vec![],
             return_type: MirType::Void,
+            boundary_sig: MirBoundarySignature::from_internal(&[], MirType::Void, false),
             variadic: false,
             stack_slots: vec![],
             blocks: vec![BasicBlock {

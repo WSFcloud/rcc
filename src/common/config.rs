@@ -2,6 +2,11 @@ use std::fs::File;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmitKind {
+    Obj,
+}
+
 /// Compiler configuration derived from CLI arguments.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompilerConfig {
@@ -34,6 +39,15 @@ pub struct CompilerConfig {
 
     /// Compile only (no assemble, link)
     pub assemble_only: bool,
+
+    /// Emitted artifact kind
+    pub emit_kind: EmitKind,
+
+    /// Print MIR after MIR lowering
+    pub emit_mir: bool,
+
+    /// Print backend debugging information
+    pub debug_backend: bool,
 }
 
 impl CompilerConfig {
@@ -178,6 +192,9 @@ mod tests {
             compile_only: true,
             preprocess_only: false,
             assemble_only: false,
+            emit_kind: EmitKind::Obj,
+            emit_mir: false,
+            debug_backend: false,
         };
 
         assert!(config.check_config().is_ok());
@@ -198,6 +215,9 @@ mod tests {
             compile_only: true,
             preprocess_only: true,
             assemble_only: false,
+            emit_kind: EmitKind::Obj,
+            emit_mir: false,
+            debug_backend: false,
         };
 
         let err = config.check_config().unwrap_err();
@@ -219,6 +239,9 @@ mod tests {
             compile_only: false,
             preprocess_only: false,
             assemble_only: false,
+            emit_kind: EmitKind::Obj,
+            emit_mir: false,
+            debug_backend: false,
         };
 
         let err = config.check_config().unwrap_err();
@@ -240,6 +263,9 @@ mod tests {
             compile_only: false,
             preprocess_only: false,
             assemble_only: false,
+            emit_kind: EmitKind::Obj,
+            emit_mir: false,
+            debug_backend: false,
         };
 
         let err = config.check_config().unwrap_err();
@@ -270,6 +296,9 @@ mod tests {
             compile_only: false,
             preprocess_only: false,
             assemble_only: false,
+            emit_kind: EmitKind::Obj,
+            emit_mir: false,
+            debug_backend: false,
         };
 
         let err = config.check_config().unwrap_err();
@@ -301,6 +330,9 @@ mod tests {
             compile_only: false,
             preprocess_only: false,
             assemble_only: false,
+            emit_kind: EmitKind::Obj,
+            emit_mir: false,
+            debug_backend: false,
         };
 
         let err = config.check_config().unwrap_err();

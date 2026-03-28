@@ -2,6 +2,11 @@ use crate::common::config;
 use clap::Parser;
 use std::path::PathBuf;
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CliEmitKind {
+    Obj,
+}
+
 /// CLI arguments parsed from command line.
 #[derive(Parser, Debug)]
 #[command(name = "rcc", version = "0.1.0", disable_help_flag = true)]
@@ -53,6 +58,18 @@ pub struct Cli {
     /// Compile only; do not assemble or link.
     #[arg(short = 'S')]
     pub assemble_only: bool,
+
+    /// Emit artifact kind (currently only object file).
+    #[arg(long = "emit", value_enum, default_value_t = CliEmitKind::Obj)]
+    pub emit: CliEmitKind,
+
+    /// Print MIR after lowering.
+    #[arg(long = "emit-mir")]
+    pub emit_mir: bool,
+
+    /// Print backend debugging information.
+    #[arg(long = "debug-backend")]
+    pub debug_backend: bool,
 }
 
 impl Cli {
@@ -76,6 +93,11 @@ impl Cli {
             compile_only: self.compile_only,
             preprocess_only: self.preprocess_only,
             assemble_only: self.assemble_only,
+            emit_kind: match self.emit {
+                CliEmitKind::Obj => config::EmitKind::Obj,
+            },
+            emit_mir: self.emit_mir,
+            debug_backend: self.debug_backend,
         }
     }
 }
@@ -132,6 +154,9 @@ mod tests {
         assert_eq!(config.warnings, vec!["all"]);
         assert!(!config.compile_only);
         assert!(!config.preprocess_only);
+        assert_eq!(config.emit_kind, config::EmitKind::Obj);
+        assert!(!config.emit_mir);
+        assert!(!config.debug_backend);
     }
 
     #[test]
@@ -145,5 +170,25 @@ mod tests {
         let cli = Cli::try_parse_from(["rcc", "test.c"]).expect("cli parse should succeed");
         let config = cli.to_config();
         assert_eq!(config.optimization, 0);
+        assert_eq!(config.emit_kind, config::EmitKind::Obj);
+        assert!(!config.emit_mir);
+        assert!(!config.debug_backend);
+    }
+
+    #[test]
+    fn test_cli_parse_emit_mir_and_debug_backend_flags() {
+        let cli = Cli::try_parse_from(["rcc", "--emit-mir", "--debug-backend", "test.c"])
+            .expect("cli parse should succeed");
+        let config = cli.to_config();
+        assert!(config.emit_mir);
+        assert!(config.debug_backend);
+    }
+
+    #[test]
+    fn test_cli_parse_emit_obj() {
+        let cli =
+            Cli::try_parse_from(["rcc", "--emit=obj", "test.c"]).expect("cli parse should succeed");
+        let config = cli.to_config();
+        assert_eq!(config.emit_kind, config::EmitKind::Obj);
     }
 }

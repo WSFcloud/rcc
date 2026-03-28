@@ -183,15 +183,17 @@ fn remap_block_id(block_id: BlockId, old_to_new: &HashMap<BlockId, BlockId>) -> 
 mod tests {
     use super::*;
     use crate::mir::ir::{
-        BasicBlock, Instruction, MirConst, MirFunction, MirProgram, MirType, Operand, TypedVReg,
-        VReg,
+        BasicBlock, Instruction, MirBoundarySignature, MirConst, MirFunction, MirLinkage, MirType,
+        Operand, TypedVReg, VReg,
     };
 
     fn empty_function(blocks: Vec<BasicBlock>) -> MirFunction {
         MirFunction {
             name: "f".to_string(),
+            linkage: MirLinkage::External,
             params: Vec::new(),
             return_type: MirType::I32,
+            boundary_sig: MirBoundarySignature::from_internal(&[], MirType::I32, false),
             variadic: false,
             stack_slots: Vec::new(),
             blocks,

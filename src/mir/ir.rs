@@ -14,10 +14,14 @@ pub struct MirProgram {
 pub struct MirFunction {
     /// Function symbol name.
     pub name: String,
-    /// ABI-normalized parameter types.
-    pub params: Vec<MirType>,
+    /// Linkage kind visible at MIR layer.
+    pub linkage: MirLinkage,
+    /// ABI-normalized parameter descriptors.
+    pub params: Vec<MirAbiParam>,
     /// ABI-normalized return type.
     pub return_type: MirType,
+    /// Source-level boundary ABI used when this function crosses the C ABI.
+    pub boundary_sig: MirBoundarySignature,
     /// Whether this function accepts variadic arguments.
     pub variadic: bool,
     /// Function-local stack slots.
@@ -42,14 +46,141 @@ impl MirFunction {
 pub struct MirExternFunction {
     pub name: String,
     pub sig: MirFunctionSig,
+    pub boundary_sig: MirBoundarySignature,
 }
 
 /// Function signature information used by extern decls / indirect calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MirFunctionSig {
-    pub params: Vec<MirType>,
+    pub params: Vec<MirAbiParam>,
     pub return_type: MirType,
     pub variadic: bool,
+}
+
+/// Source-level ABI used at the object boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirBoundarySignature {
+    pub params: Vec<MirBoundaryParam>,
+    pub return_type: MirBoundaryReturn,
+    pub variadic: bool,
+}
+
+impl MirBoundarySignature {
+    #[must_use]
+    pub fn from_internal(params: &[MirAbiParam], return_type: MirType, variadic: bool) -> Self {
+        let mut boundary_params = Vec::with_capacity(params.len());
+        for &param in params {
+            let boundary = match param.purpose {
+                MirAbiParamPurpose::Normal => MirBoundaryParam::Scalar(param.ty),
+                MirAbiParamPurpose::StructArgument { size } => MirBoundaryParam::AggregateMemory {
+                    size,
+                    abi_size: size,
+                },
+                MirAbiParamPurpose::StructReturn => continue,
+            };
+            boundary_params.push(boundary);
+        }
+
+        let boundary_return = if let Some(param) = params
+            .iter()
+            .find(|param| param.purpose == MirAbiParamPurpose::StructReturn)
+        {
+            let _ = param;
+            MirBoundaryReturn::AggregateMemory { size: 0 }
+        } else if return_type == MirType::Void {
+            MirBoundaryReturn::Void
+        } else {
+            MirBoundaryReturn::Scalar(return_type)
+        };
+
+        Self {
+            params: boundary_params,
+            return_type: boundary_return,
+            variadic,
+        }
+    }
+
+    #[must_use]
+    pub fn requires_wrapper(&self) -> bool {
+        self.params
+            .iter()
+            .any(|param| matches!(param, MirBoundaryParam::AggregateScalarized { .. }))
+            || matches!(
+                self.return_type,
+                MirBoundaryReturn::AggregateScalarized { .. }
+            )
+    }
+
+    #[must_use]
+    pub fn has_unsupported_aggregate(&self) -> bool {
+        self.params
+            .iter()
+            .any(|param| matches!(param, MirBoundaryParam::AggregateUnsupported { .. }))
+            || matches!(
+                self.return_type,
+                MirBoundaryReturn::AggregateUnsupported { .. }
+            )
+    }
+}
+
+/// One source-level boundary ABI parameter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MirBoundaryParam {
+    Scalar(MirType),
+    AggregateScalarized { parts: Vec<MirType>, size: u32 },
+    AggregateMemory { size: u32, abi_size: u32 },
+    AggregateUnsupported { size: u32 },
+}
+
+/// Source-level boundary ABI return.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MirBoundaryReturn {
+    Void,
+    Scalar(MirType),
+    AggregateScalarized { parts: Vec<MirType>, size: u32 },
+    AggregateMemory { size: u32 },
+    AggregateUnsupported { size: u32 },
+}
+
+/// One ABI-normalized function parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MirAbiParam {
+    pub ty: MirType,
+    pub purpose: MirAbiParamPurpose,
+}
+
+impl MirAbiParam {
+    #[must_use]
+    pub const fn new(ty: MirType) -> Self {
+        Self {
+            ty,
+            purpose: MirAbiParamPurpose::Normal,
+        }
+    }
+
+    #[must_use]
+    pub const fn struct_argument(size: u32) -> Self {
+        Self {
+            ty: MirType::Ptr,
+            purpose: MirAbiParamPurpose::StructArgument { size },
+        }
+    }
+
+    #[must_use]
+    pub const fn struct_return() -> Self {
+        Self {
+            ty: MirType::Ptr,
+            purpose: MirAbiParamPurpose::StructReturn,
+        }
+    }
+}
+
+/// Special ABI handling for one function parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MirAbiParamPurpose {
+    Normal,
+    StructArgument { size: u32 },
+    StructReturn,
 }
 
 /// A global variable declaration/definition.
@@ -274,6 +405,7 @@ pub enum Instruction {
         callee_ptr: Operand,
         args: Vec<Operand>,
         sig: MirFunctionSig,
+        boundary_sig: Option<MirBoundarySignature>,
         /// Present for variadic calls.
         fixed_arg_count: Option<usize>,
     },
@@ -387,8 +519,10 @@ pub enum CastKind {
     Trunc,
     ZExt,
     SExt,
-    IToF,
-    FToI,
+    SIToF,
+    UIToF,
+    FToSI,
+    FToUI,
     FExt,
     FTrunc,
     PToI,

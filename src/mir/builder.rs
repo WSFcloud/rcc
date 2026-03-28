@@ -13,10 +13,11 @@ use crate::frontend::sema::typed_ast::{
 };
 use crate::frontend::sema::types::{TypeId, TypeKind, type_size_of};
 use crate::mir::ir::{
-    BasicBlock, BinaryOp, BlockId, CastKind, CmpDomain, CmpKind, Instruction, MirConst,
-    MirExternFunction, MirFunction, MirFunctionSig, MirGlobal, MirGlobalInit, MirLinkage,
-    MirProgram, MirRelocation, MirRelocationTarget, MirType, Operand, SlotId, StackSlot,
-    Terminator, TypedVReg, UnaryOp as MirUnaryOp,
+    BasicBlock, BinaryOp, BlockId, CastKind, CmpDomain, CmpKind, Instruction, MirAbiParam,
+    MirBoundaryParam, MirBoundaryReturn, MirBoundarySignature, MirConst, MirExternFunction,
+    MirFunction, MirFunctionSig, MirGlobal, MirGlobalInit, MirLinkage, MirProgram, MirRelocation,
+    MirRelocationTarget, MirType, Operand, SlotId, StackSlot, Terminator, TypedVReg,
+    UnaryOp as MirUnaryOp,
 };
 use crate::mir::passes::run_pass_pipeline;
 
@@ -55,6 +56,18 @@ struct SwitchContext {
 enum ControlContext {
     Loop { break_target: BlockId },
     Switch { break_target: BlockId },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SysvAggregateLaneClass {
+    Integer,
+    Sse,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SysvAggregateLane {
+    class: Option<SysvAggregateLaneClass>,
+    bytes_used: u32,
 }
 
 /// A lowered write/read location.
@@ -169,12 +182,208 @@ impl<'a> MirBuildContext<'a> {
         })
     }
 
+    /// Map a sema function type to the source-level x64 SysV boundary ABI.
+    pub fn map_boundary_sig(&mut self, ty: TypeId) -> Option<MirBoundarySignature> {
+        let fn_ty = self.extract_function_type(ty)?;
+        Some(MirBoundarySignature {
+            params: fn_ty
+                .params
+                .iter()
+                .map(|&param_ty| self.classify_boundary_param(param_ty))
+                .collect(),
+            return_type: self.classify_boundary_return(fn_ty.ret),
+            variadic: fn_ty.variadic,
+        })
+    }
+
+    fn classify_boundary_param(&mut self, ty: TypeId) -> MirBoundaryParam {
+        if !self.is_aggregate_type(ty) {
+            return MirBoundaryParam::Scalar(self.map_type(ty));
+        }
+
+        let (size, _) = self.stack_layout_of(ty);
+        if size > 16 {
+            return MirBoundaryParam::AggregateMemory {
+                size,
+                abi_size: abi_struct_stack_size(size),
+            };
+        }
+
+        match self.classify_small_sysv_aggregate(ty, size) {
+            Some(parts) => MirBoundaryParam::AggregateScalarized { parts, size },
+            None => MirBoundaryParam::AggregateUnsupported { size },
+        }
+    }
+
+    fn classify_boundary_return(&mut self, ty: TypeId) -> MirBoundaryReturn {
+        if !self.is_aggregate_type(ty) {
+            if self.map_type(ty) == MirType::Void {
+                return MirBoundaryReturn::Void;
+            }
+            return MirBoundaryReturn::Scalar(self.map_type(ty));
+        }
+
+        let (size, _) = self.stack_layout_of(ty);
+        if size > 16 {
+            return MirBoundaryReturn::AggregateMemory { size };
+        }
+
+        match self.classify_small_sysv_aggregate(ty, size) {
+            Some(parts) => MirBoundaryReturn::AggregateScalarized { parts, size },
+            None => MirBoundaryReturn::AggregateUnsupported { size },
+        }
+    }
+
+    fn classify_small_sysv_aggregate(&self, ty: TypeId, size: u32) -> Option<Vec<MirType>> {
+        let mut lanes = [SysvAggregateLane::default(), SysvAggregateLane::default()];
+        self.classify_type_into_sysv_lanes(ty, 0, &mut lanes)?;
+
+        let lane_count = if size > 8 { 2 } else { 1 };
+        let mut parts = Vec::with_capacity(lane_count);
+        for lane in lanes.into_iter().take(lane_count) {
+            let class = lane.class?;
+            let part = match class {
+                SysvAggregateLaneClass::Integer => MirType::I64,
+                SysvAggregateLaneClass::Sse => MirType::F64,
+            };
+            parts.push(part);
+        }
+        Some(parts)
+    }
+
+    fn classify_type_into_sysv_lanes(
+        &self,
+        ty: TypeId,
+        byte_offset: u32,
+        lanes: &mut [SysvAggregateLane; 2],
+    ) -> Option<()> {
+        let ty_def = self.sema.types.get(ty);
+        match &ty_def.kind {
+            TypeKind::Bool
+            | TypeKind::Char
+            | TypeKind::SignedChar
+            | TypeKind::UnsignedChar
+            | TypeKind::Short { .. }
+            | TypeKind::Int { .. }
+            | TypeKind::Long { .. }
+            | TypeKind::LongLong { .. }
+            | TypeKind::Pointer { .. }
+            | TypeKind::Enum(_) => {
+                let size =
+                    u32::try_from(type_size_of(ty, &self.sema.types, &self.sema.records)?).ok()?;
+                self.mark_sysv_lanes(byte_offset, size, SysvAggregateLaneClass::Integer, lanes)
+            }
+            TypeKind::Float | TypeKind::Double => {
+                let size =
+                    u32::try_from(type_size_of(ty, &self.sema.types, &self.sema.records)?).ok()?;
+                let lane_offset = byte_offset % 8;
+                if lane_offset + size > 8 {
+                    return None;
+                }
+                self.mark_sysv_lanes(byte_offset, size, SysvAggregateLaneClass::Sse, lanes)
+            }
+            TypeKind::Array { elem, len } => {
+                let elem_size =
+                    u32::try_from(type_size_of(*elem, &self.sema.types, &self.sema.records)?)
+                        .ok()?;
+                let len = match len {
+                    crate::frontend::sema::types::ArrayLen::Known(len) => *len,
+                    _ => return None,
+                };
+                for index in 0..len {
+                    let index = u32::try_from(index).ok()?;
+                    self.classify_type_into_sysv_lanes(
+                        *elem,
+                        byte_offset.checked_add(index.checked_mul(elem_size)?)?,
+                        lanes,
+                    )?;
+                }
+                Some(())
+            }
+            TypeKind::Record(record_id) => {
+                let record = self.sema.records.get(*record_id);
+                if !record.is_complete {
+                    return None;
+                }
+                match record.kind {
+                    crate::frontend::parser::ast::RecordKind::Struct => {
+                        let mut field_offset = byte_offset;
+                        for field in &record.fields {
+                            if field.bit_width.is_some() {
+                                return None;
+                            }
+                            self.classify_type_into_sysv_lanes(field.ty, field_offset, lanes)?;
+                            let field_size = u32::try_from(type_size_of(
+                                field.ty,
+                                &self.sema.types,
+                                &self.sema.records,
+                            )?)
+                            .ok()?;
+                            field_offset = field_offset.checked_add(field_size)?;
+                        }
+                        Some(())
+                    }
+                    crate::frontend::parser::ast::RecordKind::Union => {
+                        for field in &record.fields {
+                            if field.bit_width.is_some() {
+                                return None;
+                            }
+                            self.classify_type_into_sysv_lanes(field.ty, byte_offset, lanes)?;
+                        }
+                        Some(())
+                    }
+                }
+            }
+            TypeKind::Function(_) | TypeKind::Void | TypeKind::Error => None,
+        }
+    }
+
+    fn mark_sysv_lanes(
+        &self,
+        byte_offset: u32,
+        size: u32,
+        class: SysvAggregateLaneClass,
+        lanes: &mut [SysvAggregateLane; 2],
+    ) -> Option<()> {
+        if size == 0 {
+            return Some(());
+        }
+        let end = byte_offset.checked_add(size)?;
+        if end > 16 {
+            return None;
+        }
+
+        let first_lane = usize::try_from(byte_offset / 8).ok()?;
+        let last_lane = usize::try_from((end - 1) / 8).ok()?;
+        for lane_index in first_lane..=last_lane {
+            let lane_start = (lane_index as u32) * 8;
+            let covered_end = end.min(lane_start + 8);
+            let bytes_used = covered_end.checked_sub(lane_start)?;
+            let lane = &mut lanes[lane_index];
+            lane.bytes_used = lane.bytes_used.max(bytes_used);
+            lane.class = Some(match (lane.class, class) {
+                (None, new_class) => new_class,
+                (Some(existing), new_class) if existing == new_class => existing,
+                (Some(SysvAggregateLaneClass::Integer), _) => SysvAggregateLaneClass::Integer,
+                (Some(SysvAggregateLaneClass::Sse), SysvAggregateLaneClass::Integer) => {
+                    SysvAggregateLaneClass::Integer
+                }
+                (Some(SysvAggregateLaneClass::Sse), SysvAggregateLaneClass::Sse) => {
+                    SysvAggregateLaneClass::Sse
+                }
+            });
+        }
+        Some(())
+    }
+
     /// Enter one function lowering session.
     pub fn begin_function(
         &mut self,
         name: String,
-        params: Vec<MirType>,
+        linkage: MirLinkage,
+        params: Vec<MirAbiParam>,
         return_type: MirType,
+        boundary_sig: MirBoundarySignature,
         variadic: bool,
         source_return_ty: TypeId,
     ) {
@@ -184,8 +393,10 @@ impl<'a> MirBuildContext<'a> {
         );
         self.current_function = Some(MirFunctionBuilder::new(
             name,
+            linkage,
             params,
             return_type,
+            boundary_sig,
             variadic,
             source_return_ty,
         ));
@@ -409,9 +620,14 @@ impl<'a> MirBuildContext<'a> {
             let Some(sig) = self.map_function_sig(ty) else {
                 continue;
             };
-            self.program
-                .extern_functions
-                .push(MirExternFunction { name, sig });
+            let Some(boundary_sig) = self.map_boundary_sig(ty) else {
+                continue;
+            };
+            self.program.extern_functions.push(MirExternFunction {
+                name,
+                sig,
+                boundary_sig,
+            });
         }
     }
 
@@ -485,9 +701,14 @@ impl<'a> MirBuildContext<'a> {
 
     /// Lower one function definition, including ABI canonicalization and body CFG.
     fn lower_function_skeleton(&mut self, function: &TypedFunctionDef) {
-        let (name, symbol_ty, status) = {
+        let (name, symbol_ty, status, linkage) = {
             let symbol = self.symbol(function.symbol);
-            (symbol.name().to_string(), symbol.ty(), symbol.status())
+            (
+                symbol.name().to_string(),
+                symbol.ty(),
+                symbol.status(),
+                map_linkage(symbol.linkage()),
+            )
         };
         if status != DefinitionStatus::Defined {
             return;
@@ -497,12 +718,23 @@ impl<'a> MirBuildContext<'a> {
             return;
         };
         let (params, return_type, has_sret) = self.canonicalize_function_abi(&function_ty);
+        let boundary_sig = MirBoundarySignature {
+            params: function_ty
+                .params
+                .iter()
+                .map(|&param_ty| self.classify_boundary_param(param_ty))
+                .collect(),
+            return_type: self.classify_boundary_return(function_ty.ret),
+            variadic: function_ty.variadic,
+        };
         let param_symbols = self.collect_function_param_symbols(function, function_ty.params.len());
 
         self.begin_function(
             name,
+            linkage,
             params,
             return_type,
+            boundary_sig,
             function_ty.variadic,
             function_ty.ret,
         );
@@ -971,7 +1203,18 @@ impl<'a> MirBuildContext<'a> {
             return name.clone();
         }
 
-        let name = self.fresh_synthetic_global_name("str");
+        let name = loop {
+            let candidate = format!(".str.{}", self.next_synthetic_global_id);
+            self.next_synthetic_global_id += 1;
+            if !self
+                .program
+                .globals
+                .iter()
+                .any(|global| global.name == candidate)
+            {
+                break candidate;
+            }
+        };
         let mut bytes = text.as_bytes().to_vec();
         bytes.push(0);
         self.program.globals.push(MirGlobal {
@@ -1606,6 +1849,7 @@ impl<'a> MirBuildContext<'a> {
                     MirType::I8,
                     false,
                     result_mir_ty,
+                    false,
                 )
             }
             TypedUnaryOp::BitwiseNot => {
@@ -1970,6 +2214,7 @@ impl<'a> MirBuildContext<'a> {
             MirType::I8,
             false,
             result_mir_ty,
+            false,
         )
     }
 
@@ -2000,6 +2245,7 @@ impl<'a> MirBuildContext<'a> {
             MirType::I8,
             false,
             result_mir_ty,
+            false,
         );
         self.emit_current_instruction(Instruction::Store {
             slot: result_slot,
@@ -2017,6 +2263,7 @@ impl<'a> MirBuildContext<'a> {
             MirType::I8,
             false,
             result_mir_ty,
+            false,
         );
         self.emit_current_instruction(Instruction::Store {
             slot: result_slot,
@@ -2065,6 +2312,7 @@ impl<'a> MirBuildContext<'a> {
             MirType::I8,
             false,
             result_mir_ty,
+            false,
         );
         self.emit_current_instruction(Instruction::Store {
             slot: result_slot,
@@ -2082,6 +2330,7 @@ impl<'a> MirBuildContext<'a> {
             MirType::I8,
             false,
             result_mir_ty,
+            false,
         );
         self.emit_current_instruction(Instruction::Store {
             slot: result_slot,
@@ -2216,12 +2465,14 @@ impl<'a> MirBuildContext<'a> {
     ) -> Operand {
         let function_ty = self.extract_function_type(func.ty);
         let function_sig = self.map_function_sig(func.ty);
+        let boundary_sig = self.map_boundary_sig(func.ty);
         let function_param_tys = function_ty.as_ref().map(|fn_ty| fn_ty.params.clone());
         let function_ret_ty = function_ty.as_ref().map(|fn_ty| fn_ty.ret);
         let function_variadic = function_ty
             .as_ref()
             .map(|fn_ty| fn_ty.variadic)
             .unwrap_or(false);
+        let fixed_param_count = function_param_tys.as_ref().map_or(0, std::vec::Vec::len);
         let mut lowered_args = Vec::with_capacity(args.len() + 1);
         for (idx, arg) in args.iter().enumerate() {
             let param_ty = function_param_tys
@@ -2239,7 +2490,8 @@ impl<'a> MirBuildContext<'a> {
                     .lower_expr_address(arg)
                     .unwrap_or_else(|| self.lower_expr_to_operand(arg));
                 let (size, alignment) = self.stack_layout_of(agg_ty);
-                let slot = self.alloc_slot(size, alignment);
+                let abi_size = abi_struct_stack_size(size);
+                let slot = self.alloc_slot(abi_size, alignment.max(8));
                 let dst_ptr = self.address_of_place(MirPlace::Stack { slot, offset: 0 });
                 self.emit_current_instruction(Instruction::Memcpy {
                     dst_ptr: dst_ptr.clone(),
@@ -2248,12 +2500,18 @@ impl<'a> MirBuildContext<'a> {
                 });
                 lowered_args.push(dst_ptr);
             } else {
-                lowered_args.push(self.lower_expr_to_operand(arg));
+                let mut lowered = self.lower_expr_to_operand(arg);
+                if function_variadic && idx >= fixed_param_count {
+                    lowered = self.promote_variadic_arg(arg, lowered);
+                    let promoted_ty = self.variadic_promoted_mir_type(arg.ty);
+                    let promoted = self.lower_operand_to_vreg(lowered, promoted_ty);
+                    lowered = Operand::VReg(promoted.reg);
+                }
+                lowered_args.push(lowered);
             }
         }
 
-        let mut fixed_arg_count =
-            function_variadic.then_some(function_param_tys.as_ref().map_or(0, std::vec::Vec::len));
+        let mut fixed_arg_count = function_variadic.then_some(fixed_param_count);
         let aggregate_ret_ty = function_ret_ty.unwrap_or(result_ty);
         let returns_aggregate = self.is_aggregate_type(aggregate_ret_ty);
         let result_mir_ty = self.map_type(result_ty);
@@ -2288,7 +2546,7 @@ impl<'a> MirBuildContext<'a> {
                     let mut params =
                         Vec::with_capacity(args.len() + usize::from(returns_aggregate));
                     if returns_aggregate {
-                        params.push(MirType::Ptr);
+                        params.push(MirAbiParam::struct_return());
                     }
                     for (idx, arg) in args.iter().enumerate() {
                         let param_ty = function_param_tys
@@ -2299,9 +2557,12 @@ impl<'a> MirBuildContext<'a> {
                             .map(|ty| self.is_aggregate_type(ty))
                             .unwrap_or_else(|| self.is_aggregate_type(arg.ty))
                         {
-                            params.push(MirType::Ptr);
+                            let agg_ty = param_ty.unwrap_or(arg.ty);
+                            let (size, _) = self.stack_layout_of(agg_ty);
+                            params.push(MirAbiParam::struct_argument(abi_struct_stack_size(size)));
                         } else {
-                            params.push(self.map_type(param_ty.unwrap_or(arg.ty)));
+                            params
+                                .push(MirAbiParam::new(self.map_type(param_ty.unwrap_or(arg.ty))));
                         }
                     }
                     params
@@ -2318,6 +2579,7 @@ impl<'a> MirBuildContext<'a> {
                 callee_ptr,
                 args: lowered_args,
                 sig,
+                boundary_sig,
                 fixed_arg_count,
             });
         }
@@ -2329,6 +2591,21 @@ impl<'a> MirBuildContext<'a> {
         } else {
             Operand::Const(MirConst::IntConst(0))
         }
+    }
+
+    fn variadic_promoted_mir_type(&mut self, ty: TypeId) -> MirType {
+        match self.map_type(ty) {
+            MirType::I8 | MirType::I16 => MirType::I32,
+            MirType::F32 => MirType::F64,
+            other => other,
+        }
+    }
+
+    fn promote_variadic_arg(&mut self, arg: &TypedExpr, value: Operand) -> Operand {
+        let from_mir = self.map_type(arg.ty);
+        let to_mir = self.variadic_promoted_mir_type(arg.ty);
+        let from_signed = self.is_signed_integer(arg.ty);
+        self.cast_operand_between_mir(value, from_mir, from_signed, to_mir, false)
     }
 
     fn try_get_direct_callee_name(&self, expr: &TypedExpr) -> Option<String> {
@@ -2390,8 +2667,10 @@ impl<'a> MirBuildContext<'a> {
     ) -> Operand {
         let lhs_ptr = self.lower_expr_to_operand(left);
         let rhs_ptr = self.lower_expr_to_operand(right);
-        let lhs_i64 = self.cast_operand_between_mir(lhs_ptr, MirType::Ptr, false, MirType::I64);
-        let rhs_i64 = self.cast_operand_between_mir(rhs_ptr, MirType::Ptr, false, MirType::I64);
+        let lhs_i64 =
+            self.cast_operand_between_mir(lhs_ptr, MirType::Ptr, false, MirType::I64, false);
+        let rhs_i64 =
+            self.cast_operand_between_mir(rhs_ptr, MirType::Ptr, false, MirType::I64, false);
         let diff_bytes_dst = self.alloc_vreg(MirType::I64);
         self.emit_current_instruction(Instruction::Binary {
             dst: diff_bytes_dst,
@@ -2418,7 +2697,7 @@ impl<'a> MirBuildContext<'a> {
             Operand::VReg(diff_bytes_dst.reg)
         };
         let result_mir_ty = self.map_type(result_ty);
-        self.cast_operand_between_mir(diff_elems, MirType::I64, true, result_mir_ty)
+        self.cast_operand_between_mir(diff_elems, MirType::I64, true, result_mir_ty, false)
     }
 
     fn scale_index_operand(
@@ -2428,7 +2707,8 @@ impl<'a> MirBuildContext<'a> {
         index_signed: bool,
         pointee: TypeId,
     ) -> Operand {
-        let idx64 = self.cast_operand_between_mir(index, index_mir_ty, index_signed, MirType::I64);
+        let idx64 =
+            self.cast_operand_between_mir(index, index_mir_ty, index_signed, MirType::I64, false);
         let elem_size = type_size_of(pointee, &self.sema.types, &self.sema.records)
             .and_then(|n| i64::try_from(n).ok())
             .unwrap_or(1);
@@ -2742,7 +3022,8 @@ impl<'a> MirBuildContext<'a> {
         }
 
         let from_signed = self.is_signed_integer(from_ty);
-        self.cast_operand_between_mir(src, from_mir, from_signed, to_mir)
+        let to_signed = self.is_signed_integer(to_ty);
+        self.cast_operand_between_mir(src, from_mir, from_signed, to_mir, to_signed)
     }
 
     /// Emit an explicit MIR cast between primitive MIR types when needed.
@@ -2752,6 +3033,7 @@ impl<'a> MirBuildContext<'a> {
         from_mir: MirType,
         from_signed: bool,
         to_mir: MirType,
+        to_signed: bool,
     ) -> Operand {
         if from_mir == to_mir {
             return src;
@@ -2778,8 +3060,20 @@ impl<'a> MirBuildContext<'a> {
                     CastKind::ZExt
                 }
             }
-            (from, to) if from.is_integer() && to.is_float() => CastKind::IToF,
-            (from, to) if from.is_float() && to.is_integer() => CastKind::FToI,
+            (from, to) if from.is_integer() && to.is_float() => {
+                if from_signed {
+                    CastKind::SIToF
+                } else {
+                    CastKind::UIToF
+                }
+            }
+            (from, to) if from.is_float() && to.is_integer() => {
+                if to_signed {
+                    CastKind::FToSI
+                } else {
+                    CastKind::FToUI
+                }
+            }
             (MirType::F32, MirType::F64) => CastKind::FExt,
             (MirType::F64, MirType::F32) => CastKind::FTrunc,
             (MirType::Ptr, to) if to.is_integer() => CastKind::PToI,
@@ -3265,17 +3559,18 @@ impl<'a> MirBuildContext<'a> {
     fn canonicalize_function_abi(
         &mut self,
         fn_ty: &crate::frontend::sema::types::FunctionType,
-    ) -> (Vec<MirType>, MirType, bool) {
+    ) -> (Vec<MirAbiParam>, MirType, bool) {
         let has_sret = self.is_aggregate_type(fn_ty.ret);
         let mut params = Vec::with_capacity(fn_ty.params.len() + usize::from(has_sret));
         if has_sret {
-            params.push(MirType::Ptr);
+            params.push(MirAbiParam::struct_return());
         }
         for param_ty in &fn_ty.params {
             if self.is_aggregate_type(*param_ty) {
-                params.push(MirType::Ptr);
+                let (size, _) = self.stack_layout_of(*param_ty);
+                params.push(MirAbiParam::struct_argument(abi_struct_stack_size(size)));
             } else {
-                params.push(self.map_type(*param_ty));
+                params.push(MirAbiParam::new(self.map_type(*param_ty)));
             }
         }
         let return_type = if has_sret {
@@ -3325,6 +3620,10 @@ impl<'a> MirBuildContext<'a> {
     }
 }
 
+fn abi_struct_stack_size(size: u32) -> u32 {
+    size.max(1).next_multiple_of(8)
+}
+
 fn map_linkage(linkage: Linkage) -> MirLinkage {
     match linkage {
         Linkage::Internal => MirLinkage::Internal,
@@ -3354,16 +3653,20 @@ impl MirFunctionBuilder {
     /// Create a new function builder with an initialized entry block (`bb0`).
     fn new(
         name: String,
-        params: Vec<MirType>,
+        linkage: MirLinkage,
+        params: Vec<MirAbiParam>,
         return_type: MirType,
+        boundary_sig: MirBoundarySignature,
         variadic: bool,
         source_return_ty: TypeId,
     ) -> Self {
         let mut builder = Self {
             function: MirFunction {
                 name,
+                linkage,
                 params,
                 return_type,
+                boundary_sig,
                 variadic,
                 stack_slots: Vec::new(),
                 blocks: Vec::new(),
@@ -3559,7 +3862,15 @@ mod tests {
         });
         let mut cx = MirBuildContext::new(&sema);
 
-        cx.begin_function("f".to_string(), Vec::new(), MirType::Void, false, void_ty);
+        cx.begin_function(
+            "f".to_string(),
+            MirLinkage::Internal,
+            Vec::new(),
+            MirType::Void,
+            MirBoundarySignature::from_internal(&[], MirType::Void, false),
+            false,
+            void_ty,
+        );
         let bb1 = cx.alloc_block();
         let bb2 = cx.alloc_block();
         let slot0 = cx.alloc_slot(4, 4);
@@ -3592,7 +3903,15 @@ mod tests {
             quals: Qualifiers::default(),
         });
         let mut cx = MirBuildContext::new(&sema);
-        cx.begin_function("f".to_string(), Vec::new(), MirType::Void, false, void_ty);
+        cx.begin_function(
+            "f".to_string(),
+            MirLinkage::Internal,
+            Vec::new(),
+            MirType::Void,
+            MirBoundarySignature::from_internal(&[], MirType::Void, false),
+            false,
+            void_ty,
+        );
 
         cx.push_loop_context(BlockId(10), BlockId(11));
         cx.push_switch_context(BlockId(20), Some(BlockId(21)));
@@ -3648,13 +3967,20 @@ mod tests {
         let program = lower_to_mir(&sema);
         assert_eq!(program.functions.len(), 1);
         assert_eq!(program.functions[0].name, "defined_fn");
-        assert_eq!(program.functions[0].params, vec![MirType::I32]);
+        assert_eq!(program.functions[0].linkage, MirLinkage::External);
+        assert_eq!(
+            program.functions[0].params,
+            vec![MirAbiParam::new(MirType::I32)]
+        );
         assert_eq!(program.functions[0].return_type, MirType::I32);
         assert!(!program.functions[0].variadic);
         assert_eq!(program.functions[0].stack_slots.len(), 1);
         assert_eq!(program.extern_functions.len(), 1);
         assert_eq!(program.extern_functions[0].name, "printf");
-        assert_eq!(program.extern_functions[0].sig.params, vec![MirType::Ptr]);
+        assert_eq!(
+            program.extern_functions[0].sig.params,
+            vec![MirAbiParam::new(MirType::Ptr)]
+        );
         assert_eq!(program.extern_functions[0].sig.return_type, MirType::I32);
         assert!(program.extern_functions[0].sig.variadic);
 
@@ -3689,6 +4015,22 @@ mod tests {
         assert_eq!(eg.alignment, 4);
         assert_eq!(eg.linkage, MirLinkage::External);
         assert!(eg.init.is_none());
+    }
+
+    #[test]
+    fn lowers_static_function_with_internal_linkage() {
+        let sema = analyze_source(
+            r#"
+            static int hidden(int x) { return x + 1; }
+        "#,
+        );
+        let program = lower_to_mir(&sema);
+        let hidden = program
+            .functions
+            .iter()
+            .find(|func| func.name == "hidden")
+            .expect("missing hidden function");
+        assert_eq!(hidden.linkage, MirLinkage::Internal);
     }
 
     #[test]
@@ -4206,7 +4548,7 @@ mod tests {
             .find(|func| func.name == "f")
             .expect("function f should be lowered");
 
-        assert_eq!(func.params, vec![MirType::I32]);
+        assert_eq!(func.params, vec![MirAbiParam::new(MirType::I32)]);
         assert_eq!(func.return_type, MirType::I32);
         assert!(func.variadic);
 
@@ -4228,7 +4570,13 @@ mod tests {
             .map_function_sig(f_symbol_ty)
             .expect("function type should map to MIR signature");
 
-        assert_eq!(sig.params, vec![MirType::I16, MirType::I64]);
+        assert_eq!(
+            sig.params,
+            vec![
+                MirAbiParam::new(MirType::I16),
+                MirAbiParam::new(MirType::I64)
+            ]
+        );
         assert_eq!(sig.return_type, MirType::F64);
         assert!(sig.variadic);
     }
@@ -4252,7 +4600,13 @@ mod tests {
             .map_function_sig(f_symbol_ty)
             .expect("function type should map to MIR signature");
 
-        assert_eq!(sig.params, vec![MirType::Ptr, MirType::Ptr]);
+        assert_eq!(
+            sig.params,
+            vec![
+                MirAbiParam::struct_return(),
+                MirAbiParam::struct_argument(8)
+            ]
+        );
         assert_eq!(sig.return_type, MirType::Void);
         assert!(!sig.variadic);
     }
@@ -4284,9 +4638,21 @@ mod tests {
             .find(|func| func.name == "wrap")
             .expect("wrap should be lowered");
 
-        assert_eq!(id.params, vec![MirType::Ptr, MirType::Ptr]);
+        assert_eq!(
+            id.params,
+            vec![
+                MirAbiParam::struct_return(),
+                MirAbiParam::struct_argument(8)
+            ]
+        );
         assert_eq!(id.return_type, MirType::Void);
-        assert_eq!(wrap.params, vec![MirType::Ptr, MirType::Ptr]);
+        assert_eq!(
+            wrap.params,
+            vec![
+                MirAbiParam::struct_return(),
+                MirAbiParam::struct_argument(8)
+            ]
+        );
         assert_eq!(wrap.return_type, MirType::Void);
 
         let id_memcpy_count = id
@@ -4348,7 +4714,11 @@ mod tests {
 
         assert_eq!(
             invoke.params,
-            vec![MirType::Ptr, MirType::Ptr, MirType::Ptr]
+            vec![
+                MirAbiParam::struct_return(),
+                MirAbiParam::new(MirType::Ptr),
+                MirAbiParam::struct_argument(8),
+            ]
         );
         assert_eq!(invoke.return_type, MirType::Void);
 
@@ -4362,6 +4732,7 @@ mod tests {
                 dst,
                 args,
                 sig,
+                boundary_sig,
                 fixed_arg_count,
                 ..
             } = inst
@@ -4369,9 +4740,29 @@ mod tests {
                 saw_call_indirect = true;
                 assert!(dst.is_none());
                 assert_eq!(args.len(), 2);
-                assert_eq!(sig.params, vec![MirType::Ptr, MirType::Ptr]);
+                assert_eq!(
+                    sig.params,
+                    vec![
+                        MirAbiParam::struct_return(),
+                        MirAbiParam::struct_argument(8)
+                    ]
+                );
                 assert_eq!(sig.return_type, MirType::Void);
                 assert!(!sig.variadic);
+                assert_eq!(
+                    boundary_sig.as_ref(),
+                    Some(&MirBoundarySignature {
+                        params: vec![MirBoundaryParam::AggregateScalarized {
+                            parts: vec![MirType::I64],
+                            size: 8,
+                        }],
+                        return_type: MirBoundaryReturn::AggregateScalarized {
+                            parts: vec![MirType::I64],
+                            size: 8,
+                        },
+                        variadic: false,
+                    })
+                );
                 assert!(fixed_arg_count.is_none());
             }
         }
@@ -4386,7 +4777,15 @@ mod tests {
             quals: Qualifiers::default(),
         });
         let mut cx = MirBuildContext::new(&sema);
-        cx.begin_function("f".to_string(), Vec::new(), MirType::Void, false, void_ty);
+        cx.begin_function(
+            "f".to_string(),
+            MirLinkage::Internal,
+            Vec::new(),
+            MirType::Void,
+            MirBoundarySignature::from_internal(&[], MirType::Void, false),
+            false,
+            void_ty,
+        );
 
         cx.push_switch_context(BlockId(20), None);
         cx.push_loop_context(BlockId(10), BlockId(11));
@@ -4408,11 +4807,17 @@ mod tests {
         );
         let program = lower_to_mir(&sema);
 
-        let string_global = program
+        let string_globals: Vec<_> = program
             .globals
             .iter()
-            .find(|global| global.name.starts_with("__str_"))
-            .expect("missing lowered string literal global");
+            .filter(|global| global.name.starts_with(".str."))
+            .collect();
+        assert_eq!(
+            string_globals.len(),
+            1,
+            "string literal globals should be deduplicated by literal content"
+        );
+        let string_global = string_globals[0];
         assert_eq!(string_global.linkage, MirLinkage::Internal);
         assert!(matches!(
             string_global.init,
