@@ -403,7 +403,13 @@ pub fn merge_declarations(
 
     existing.set_ty(merged_ty);
     existing.set_status(merge_definition_status(existing.status(), new_decl.status));
-    existing.set_decl_span(new_decl.span);
+    if existing.kind() == SymbolKind::Function {
+        if new_decl.span.start < existing.decl_span().start {
+            existing.set_decl_span(new_decl.span);
+        }
+    } else {
+        existing.set_decl_span(new_decl.span);
+    }
     if existing.kind() == SymbolKind::Object {
         let merged_storage = merge_object_storage_class(
             existing.object_storage_class(),
