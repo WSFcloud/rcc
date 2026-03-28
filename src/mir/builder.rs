@@ -800,9 +800,17 @@ impl<'a> MirBuildContext<'a> {
         self.allocate_local_slots_from_stmt(&function.body);
         self.lower_stmt(&function.body);
         if !self.current_function_mut().is_current_block_terminated() {
-            let return_type = self.current_function_mut().function.return_type;
+            let (function_name, return_type) = {
+                let function = &self.current_function_mut().function;
+                (function.name.clone(), function.return_type)
+            };
             if return_type == MirType::Void {
                 self.emit_current_terminator(Terminator::Ret(None));
+            } else if function_name == "main" && return_type == MirType::I32 {
+                // reaching the end of `main` is equivalent to `return 0;`.
+                self.emit_current_terminator(Terminator::Ret(Some(Operand::Const(
+                    MirConst::IntConst(0),
+                ))));
             }
         }
         self.end_function();
@@ -4927,6 +4935,22 @@ mod tests {
         assert!(f.blocks.iter().any(|block| matches!(
             block.terminator,
             Terminator::Ret(Some(Operand::VReg(reg))) if reg == cast_dst.reg
+        )));
+    }
+
+    #[test]
+    fn implicit_fallthrough_in_main_returns_zero() {
+        let sema = analyze_source("int main(void) { int x = 1; x = x + 1; }");
+        let program = lower_to_mir(&sema);
+        let main = program
+            .functions
+            .iter()
+            .find(|func| func.name == "main")
+            .expect("missing function main");
+
+        assert!(main.blocks.iter().any(|block| matches!(
+            block.terminator,
+            Terminator::Ret(Some(Operand::Const(MirConst::IntConst(0))))
         )));
     }
 
